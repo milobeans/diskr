@@ -1,0 +1,23 @@
+[package]
+name = "diskr"
+version = "0.1.0"
+edition = "2021"
+authors = ["Milo Evans"]
+description = "Lightweight terminal file explorer and disk/storage manager for macOS"
+license = "MIT"
+repository = "https://github.com/milobeans/diskr"
+homepage = "https://github.com/milobeans/diskr"
+readme = "README.md"
+keywords = ["disk", "storage", "tui", "filesystem"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+ratatui = "0.28"
+crossterm = "0.28"
+anyhow = "1"
+sysinfo = "0.32"           # disk/mount info
+humansize = "2"            # byte -> "1.2 GiB"
+trash = "5"                # move-to-trash instead of hard delete (safer on macOS)
+rayon = "1"                # thread pool
+crossbeam-channel = "0.5"  # scan -> UI messaging
+libc = "0.2"               # macOS getattrlistbulk/open/close FFI

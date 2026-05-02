@@ -1,0 +1,205 @@
+mod app;
+mod bulkstat;
+mod fs_ops;
+mod scanner;
+mod ui;
+
+use anyhow::{bail, Result};
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::{
+    ffi::OsString,
+    io::{self, IsTerminal},
+    path::PathBuf,
+    time::Duration,
+};
+
+use app::{App, Focus};
+
+fn main() -> Result<()> {
+    match parse_args(std::env::args_os().skip(1))? {
+        CliAction::Help => {
+            print_help();
+            Ok(())
+        }
+        CliAction::Version => {
+            println!("diskr {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        CliAction::Run(start) => run_app(start),
+    }
+}
+
+fn run_app(start: PathBuf) -> Result<()> {
+    if !start.exists() {
+        bail!("path does not exist: {}", start.display());
+    }
+    if !start.is_dir() {
+        bail!("path is not a directory: {}", start.display());
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("diskr requires an interactive terminal");
+    }
+
+    let mut app = App::new(start)?;
+
+    let _terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+
+    let res = run(&mut terminal, &mut app);
+    let cursor_res = terminal.show_cursor();
+
+    res?;
+    cursor_res?;
+    Ok(())
+}
+
+enum CliAction {
+    Run(PathBuf),
+    Help,
+    Version,
+}
+
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
+    let mut args = args.into_iter();
+    let Some(first) = args.next() else {
+        return Ok(CliAction::Run(dirs_home()));
+    };
+
+    if args.next().is_some() {
+        bail!("usage: diskr [PATH]");
+    }
+
+    match first.to_string_lossy().as_ref() {
+        "-h" | "--help" => Ok(CliAction::Help),
+        "-V" | "--version" => Ok(CliAction::Version),
+        _ => Ok(CliAction::Run(PathBuf::from(first))),
+    }
+}
+
+fn print_help() {
+    println!(
+        "\
+diskr {}
+
+Lightweight terminal file explorer and disk/storage manager for macOS.
+
+Usage:
+  diskr [PATH]
+
+Keys:
+  Up/Down, j/k    Move selection
+  Enter           Open selected directory
+  Backspace       Go to parent directory
+  r               Rescan directory sizes
+  o               Cycle sort mode
+  .               Toggle hidden files
+  d               Move selected item to Trash
+  Tab             Switch panes
+  q, Esc          Quit
+",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    }
+}
+
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
+fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+    loop {
+        app.drain_scan_results();
+        terminal.draw(|f| ui::draw(f, app))?;
+
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
+                    KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
+                    KeyCode::Enter => app.enter()?,
+                    KeyCode::Backspace => app.go_up()?,
+                    KeyCode::Char('r') => app.force_rescan(),
+                    KeyCode::Char('d') => app.request_delete(),
+                    KeyCode::Char('y') if app.confirming_delete => app.confirm_delete()?,
+                    KeyCode::Char('n') if app.confirming_delete => app.cancel_delete(),
+                    KeyCode::Char('o') => app.cycle_sort(),
+                    KeyCode::Char('.') => app.toggle_hidden()?,
+                    KeyCode::Tab => {
+                        app.focus = match app.focus {
+                            Focus::Files => Focus::Disks,
+                            Focus::Disks => Focus::Files,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(parts: &[&str]) -> Result<CliAction> {
+        parse_args(parts.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn defaults_to_home_without_args() {
+        assert!(matches!(parse(&[]).unwrap(), CliAction::Run(_)));
+    }
+
+    #[test]
+    fn parses_help_and_version_flags() {
+        assert!(matches!(parse(&["--help"]).unwrap(), CliAction::Help));
+        assert!(matches!(parse(&["-h"]).unwrap(), CliAction::Help));
+        assert!(matches!(parse(&["--version"]).unwrap(), CliAction::Version));
+        assert!(matches!(parse(&["-V"]).unwrap(), CliAction::Version));
+    }
+
+    #[test]
+    fn accepts_one_path() {
+        match parse(&["/tmp"]).unwrap() {
+            CliAction::Run(path) => assert_eq!(path, PathBuf::from("/tmp")),
+            _ => panic!("expected run action"),
+        }
+    }
+
+    #[test]
+    fn rejects_extra_args() {
+        assert!(parse(&["/tmp", "/var"]).is_err());
+    }
+}
