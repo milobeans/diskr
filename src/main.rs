@@ -135,34 +135,82 @@ fn dirs_home() -> std::path::PathBuf {
 }
 
 fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
-    loop {
-        app.drain_scan_results();
-        terminal.draw(|f| ui::draw(f, app))?;
+    let mut needs_draw = true;
 
-        if event::poll(Duration::from_millis(100))? {
+    loop {
+        if app.drain_scan_results() {
+            needs_draw = true;
+        }
+
+        if needs_draw {
+            terminal.draw(|f| ui::draw(f, app))?;
+            needs_draw = false;
+        }
+
+        let timeout = if app.has_pending_scan_work() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(1)
+        };
+
+        if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                match key.code {
+                let handled = match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
-                    KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
-                    KeyCode::Enter => app.enter()?,
-                    KeyCode::Backspace => app.go_up()?,
-                    KeyCode::Char('r') => app.force_rescan(),
-                    KeyCode::Char('d') => app.request_delete(),
-                    KeyCode::Char('y') if app.confirming_delete => app.confirm_delete()?,
-                    KeyCode::Char('n') if app.confirming_delete => app.cancel_delete(),
-                    KeyCode::Char('o') => app.cycle_sort(),
-                    KeyCode::Char('.') => app.toggle_hidden()?,
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.move_cursor(1);
+                        true
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.move_cursor(-1);
+                        true
+                    }
+                    KeyCode::Enter => {
+                        app.enter()?;
+                        true
+                    }
+                    KeyCode::Backspace => {
+                        app.go_up()?;
+                        true
+                    }
+                    KeyCode::Char('r') => {
+                        app.force_rescan();
+                        true
+                    }
+                    KeyCode::Char('d') => {
+                        app.request_delete();
+                        true
+                    }
+                    KeyCode::Char('y') if app.confirming_delete => {
+                        app.confirm_delete()?;
+                        true
+                    }
+                    KeyCode::Char('n') if app.confirming_delete => {
+                        app.cancel_delete();
+                        true
+                    }
+                    KeyCode::Char('o') => {
+                        app.cycle_sort();
+                        true
+                    }
+                    KeyCode::Char('.') => {
+                        app.toggle_hidden()?;
+                        true
+                    }
                     KeyCode::Tab => {
                         app.focus = match app.focus {
                             Focus::Files => Focus::Disks,
                             Focus::Disks => Focus::Files,
-                        }
+                        };
+                        true
                     }
-                    _ => {}
+                    _ => false,
+                };
+                if handled {
+                    needs_draw = true;
                 }
             }
         }

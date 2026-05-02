@@ -1,4 +1,3 @@
-use humansize::{format_size, BINARY};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -7,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Focus};
+use crate::app::{human, App, Focus};
 
 pub fn draw(f: &mut Frame, app: &App) {
     let root = Layout::default()
@@ -67,9 +66,9 @@ fn draw_files(f: &mut Frame, area: Rect, app: &App) {
         .map(|e| {
             let size_str = match (e.is_dir, e.size, e.scanning) {
                 (true, _, true) => String::from("scanning…"),
-                (true, Some(n), _) => format_size(n, BINARY),
+                (true, Some(n), _) => human(n),
                 (true, None, _) => String::from("—"),
-                (false, Some(n), _) => format_size(n, BINARY),
+                (false, Some(n), _) => human(n),
                 (false, None, _) => String::from("?"),
             };
             let icon = if e.is_dir { "▸ " } else { "  " };
@@ -153,12 +152,7 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
         } else {
             format!("{}  {}", d.name, d.mount.display())
         };
-        let label = format!(
-            "{}  {} / {}",
-            disk_name,
-            format_size(used, BINARY),
-            format_size(d.total, BINARY)
-        );
+        let label = format!("{}  {} / {}", disk_name, human(used), human(d.total));
         let color = if pct > 90 {
             Color::Red
         } else if pct > 75 {

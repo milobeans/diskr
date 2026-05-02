@@ -1,6 +1,5 @@
-use crossbeam_channel::Sender;
-use rayon::prelude::*;
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 
 use crate::bulkstat;
 
@@ -31,16 +30,18 @@ impl Scanner {
     /// Must NOT block the UI thread.
     pub fn scan_all(&self, scan_id: ScanId, dirs: Vec<PathBuf>) {
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            dirs.into_par_iter().for_each(|dir| {
-                let size = bulkstat::size_of_dir(&dir);
-                let _ = tx.send(ScanMsg::DirSize {
-                    scan_id,
-                    path: dir,
-                    size,
-                });
+        let _ = std::thread::Builder::new()
+            .name(String::from("diskr-scan"))
+            .spawn(move || {
+                for dir in dirs {
+                    let size = bulkstat::size_of_dir(&dir);
+                    let _ = tx.send(ScanMsg::DirSize {
+                        scan_id,
+                        path: dir,
+                        size,
+                    });
+                }
+                let _ = tx.send(ScanMsg::AllDone { scan_id });
             });
-            let _ = tx.send(ScanMsg::AllDone { scan_id });
-        });
     }
 }

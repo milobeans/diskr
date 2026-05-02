@@ -1,10 +1,10 @@
 use anyhow::Result;
-use crossbeam_channel::Receiver;
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
-use sysinfo::Disks;
 
 use crate::scanner::{ScanId, ScanMsg, Scanner};
 
@@ -72,7 +72,7 @@ pub struct App {
 
 impl App {
     pub fn new(cwd: PathBuf) -> Result<Self> {
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App {
             cwd,
             entries: Vec::new(),
@@ -258,7 +258,8 @@ impl App {
         self.scanner.scan_all(scan_id, dirs);
     }
 
-    pub fn drain_scan_results(&mut self) {
+    pub fn drain_scan_results(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(msg) = self.scan_rx.try_recv() {
             match msg {
                 ScanMsg::DirSize {
@@ -270,6 +271,7 @@ impl App {
                     if let Some(e) = self.entries.iter_mut().find(|e| e.path == path) {
                         e.size = Some(size);
                         e.scanning = false;
+                        changed = true;
                     }
                     if self.sort == SortMode::SizeDesc {
                         self.sort_dirty = true;
@@ -280,13 +282,20 @@ impl App {
                         self.apply_sort_preserving_selection();
                     }
                     self.status = String::from("scan complete");
+                    changed = true;
                 }
                 _ => {}
             }
         }
         if self.sort_dirty && self.last_sort.elapsed() >= SORT_DEBOUNCE {
             self.apply_sort_preserving_selection();
+            changed = true;
         }
+        changed
+    }
+
+    pub fn has_pending_scan_work(&self) -> bool {
+        self.sort_dirty || self.entries.iter().any(|entry| entry.scanning)
     }
 
     pub fn request_delete(&mut self) {
@@ -334,22 +343,72 @@ impl App {
     }
 
     pub fn refresh_disks(&mut self) {
-        let disks = Disks::new_with_refreshed_list();
-        self.disks = disks
-            .iter()
-            .map(|d| DiskInfo {
-                name: d.name().to_string_lossy().into_owned(),
-                mount: d.mount_point().to_path_buf(),
-                total: d.total_space(),
-                available: d.available_space(),
-            })
-            .collect();
+        self.disks = disk_info();
     }
 }
 
-#[allow(dead_code)]
 pub fn human(bytes: u64) -> String {
-    humansize::format_size(bytes, humansize::BINARY)
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn disk_info() -> Vec<DiskInfo> {
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count <= 0 {
+        return Vec::new();
+    }
+
+    let mut stats = Vec::<libc::statfs>::with_capacity(count as usize);
+    let bytes = (stats.capacity() * std::mem::size_of::<libc::statfs>()) as libc::c_int;
+    let actual = unsafe { libc::getfsstat(stats.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+    if actual <= 0 {
+        return Vec::new();
+    }
+
+    unsafe {
+        stats.set_len(actual as usize);
+    }
+
+    stats
+        .into_iter()
+        .filter_map(|stat| {
+            let mount = c_char_array_to_string(&stat.f_mntonname);
+            if mount.is_empty() {
+                return None;
+            }
+            let block_size = u64::from(stat.f_bsize);
+            let total = stat.f_blocks.saturating_mul(block_size);
+            let available = stat.f_bavail.saturating_mul(block_size);
+            Some(DiskInfo {
+                name: c_char_array_to_string(&stat.f_mntfromname),
+                mount: PathBuf::from(mount),
+                total,
+                available,
+            })
+        })
+        .collect()
+}
+
+fn c_char_array_to_string(chars: &[libc::c_char]) -> String {
+    if chars.is_empty() || chars[0] == 0 {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(chars.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[allow(dead_code)]
