@@ -6,6 +6,12 @@ It shows a navigable file list, recursive directory sizes, disk usage gauges, hi
 
 ## Install
 
+From crates.io:
+
+```sh
+cargo install diskr
+```
+
 From a local checkout:
 
 ```sh
