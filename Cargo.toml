@@ -1,7 +1,8 @@
 [package]
 name = "diskr"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
+rust-version = "1.86"
 authors = ["Milo Evans"]
 description = "Lightweight terminal file explorer and disk/storage manager for macOS"
 license = "MIT"
@@ -12,8 +13,14 @@ keywords = ["disk", "storage", "tui", "filesystem"]
 categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
-ratatui = "0.28"
-crossterm = "0.28"
+ratatui-core = { version = "0.1", features = ["std"] }
+ratatui-widgets = { version = "0.3", default-features = false }
+crossterm = { version = "0.28", default-features = false, features = ["events"] }
 anyhow = "1"
-trash = "5"                # move-to-trash instead of hard delete (safer on macOS)
-libc = "0.2"               # macOS getattrlistbulk/open/close FFI
+libc = "0.2" # macOS getattrlistbulk/open/close FFI
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+panic = "abort"

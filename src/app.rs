@@ -54,6 +54,7 @@ pub struct App {
     pub cwd: PathBuf,
     pub entries: Vec<Entry>,
     pub selected: usize,
+    pub selected_disk: usize,
     pub show_hidden: bool,
     pub sort: SortMode,
     pub focus: Focus,
@@ -61,6 +62,7 @@ pub struct App {
     pub status: String,
     pub confirming_delete: bool,
 
+    pending_delete: Option<Entry>,
     size_cache: HashMap<PathBuf, u64>,
     last_sort: Instant,
     sort_dirty: bool,
@@ -77,12 +79,14 @@ impl App {
             cwd,
             entries: Vec::new(),
             selected: 0,
+            selected_disk: 0,
             show_hidden: false,
             sort: SortMode::SizeDesc,
             focus: Focus::Files,
             disks: Vec::new(),
             status: String::from("q to quit · r to rescan · d to trash"),
             confirming_delete: false,
+            pending_delete: None,
             size_cache: HashMap::new(),
             last_sort: Instant::now(),
             sort_dirty: false,
@@ -167,6 +171,9 @@ impl App {
     }
 
     pub fn cycle_sort(&mut self) {
+        if self.confirming_delete {
+            return;
+        }
         self.sort = match self.sort {
             SortMode::Name => SortMode::SizeDesc,
             SortMode::SizeDesc => SortMode::Modified,
@@ -177,26 +184,59 @@ impl App {
     }
 
     pub fn move_cursor(&mut self, delta: i32) {
-        if self.entries.is_empty() {
+        if self.confirming_delete {
             return;
         }
-        let n = self.entries.len() as i32;
-        let s = self.selected as i32 + delta;
-        self.selected = s.rem_euclid(n) as usize;
+        match self.focus {
+            Focus::Files => {
+                if self.entries.is_empty() {
+                    return;
+                }
+                let n = self.entries.len() as i32;
+                let s = self.selected as i32 + delta;
+                self.selected = s.rem_euclid(n) as usize;
+            }
+            Focus::Disks => {
+                if self.disks.is_empty() {
+                    return;
+                }
+                let n = self.disks.len() as i32;
+                let s = self.selected_disk as i32 + delta;
+                self.selected_disk = s.rem_euclid(n) as usize;
+            }
+        }
     }
 
     pub fn enter(&mut self) -> Result<()> {
-        if let Some(entry) = self.entries.get(self.selected).cloned() {
-            if entry.is_dir {
-                self.cwd = entry.path;
-                self.selected = 0;
-                self.reload()?;
+        if self.confirming_delete {
+            return Ok(());
+        }
+        match self.focus {
+            Focus::Files => {
+                if let Some(entry) = self.entries.get(self.selected).cloned() {
+                    if entry.is_dir {
+                        self.cwd = entry.path;
+                        self.selected = 0;
+                        self.reload()?;
+                    }
+                }
+            }
+            Focus::Disks => {
+                if let Some(disk) = self.disks.get(self.selected_disk) {
+                    self.cwd = disk.mount.clone();
+                    self.focus = Focus::Files;
+                    self.selected = 0;
+                    self.reload()?;
+                }
             }
         }
         Ok(())
     }
 
     pub fn go_up(&mut self) -> Result<()> {
+        if self.confirming_delete {
+            return Ok(());
+        }
         if let Some(parent) = self.cwd.parent().map(|p| p.to_path_buf()) {
             self.cwd = parent;
             self.selected = 0;
@@ -206,6 +246,9 @@ impl App {
     }
 
     pub fn toggle_hidden(&mut self) -> Result<()> {
+        if self.confirming_delete {
+            return Ok(());
+        }
         self.show_hidden = !self.show_hidden;
         self.reload()
     }
@@ -236,6 +279,9 @@ impl App {
 
     /// Invoked by the `r` key. Invalidates cache for everything in view, rescans all.
     pub fn force_rescan(&mut self) {
+        if self.confirming_delete {
+            return;
+        }
         let scan_id = self.next_scan_id();
         for e in self.entries.iter().filter(|e| e.is_dir) {
             self.size_cache.remove(&e.path);
@@ -299,18 +345,27 @@ impl App {
     }
 
     pub fn request_delete(&mut self) {
-        if self.entries.get(self.selected).is_some() {
+        if self.confirming_delete {
+            return;
+        }
+        if self.focus != Focus::Files {
+            self.status = String::from("switch to files pane to trash items");
+            return;
+        }
+        if let Some(entry) = self.entries.get(self.selected).cloned() {
+            self.pending_delete = Some(entry);
             self.confirming_delete = true;
         }
     }
 
     pub fn cancel_delete(&mut self) {
         self.confirming_delete = false;
+        self.pending_delete = None;
     }
 
     pub fn confirm_delete(&mut self) -> Result<()> {
         self.confirming_delete = false;
-        if let Some(entry) = self.entries.get(self.selected).cloned() {
+        if let Some(entry) = self.pending_delete.take() {
             match crate::fs_ops::delete_to_trash(&entry.path) {
                 Ok(()) => {
                     self.status = format!("moved to trash: {}", entry.name);
@@ -324,6 +379,13 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    pub fn pending_delete_name(&self) -> &str {
+        self.pending_delete
+            .as_ref()
+            .map(|entry| entry.name.as_str())
+            .unwrap_or("?")
     }
 
     /// When a path changes (deletion, write), its own cache entry and every
@@ -344,6 +406,7 @@ impl App {
 
     pub fn refresh_disks(&mut self) {
         self.disks = disk_info();
+        self.selected_disk = self.selected_disk.min(self.disks.len().saturating_sub(1));
     }
 }
 
@@ -389,8 +452,15 @@ fn disk_info() -> Vec<DiskInfo> {
             if mount.is_empty() {
                 return None;
             }
+            let fs_type = c_char_array_to_string(&stat.f_fstypename);
+            if matches!(fs_type.as_str(), "autofs" | "devfs") {
+                return None;
+            }
             let block_size = u64::from(stat.f_bsize);
             let total = stat.f_blocks.saturating_mul(block_size);
+            if total == 0 {
+                return None;
+            }
             let available = stat.f_bavail.saturating_mul(block_size);
             Some(DiskInfo {
                 name: c_char_array_to_string(&stat.f_mntfromname),
@@ -414,4 +484,89 @@ fn c_char_array_to_string(chars: &[libc::c_char]) -> String {
 #[allow(dead_code)]
 pub fn is_under(p: &Path, root: &Path) -> bool {
     p.starts_with(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn delete_request_is_pinned_to_original_entry() {
+        let root = test_root("delete_modal");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        fs::write(root.join("b.txt"), b"bb").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        let target = app.entries[0].path.clone();
+        app.request_delete();
+
+        assert!(app.confirming_delete);
+        assert_eq!(app.pending_delete.as_ref().unwrap().path, target);
+        app.move_cursor(1);
+        assert_eq!(app.pending_delete.as_ref().unwrap().path, target);
+
+        app.cancel_delete();
+        assert!(!app.confirming_delete);
+        assert!(app.pending_delete.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_request_only_applies_to_files_pane() {
+        let root = test_root("delete_focus");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Disks;
+        app.request_delete();
+
+        assert!(!app.confirming_delete);
+        assert!(app.pending_delete.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disk_pane_selection_can_open_mounts() {
+        let root = test_root("disk_pane");
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.disks = vec![
+            DiskInfo {
+                name: String::from("first"),
+                mount: first,
+                total: 100,
+                available: 50,
+            },
+            DiskInfo {
+                name: String::from("second"),
+                mount: second.clone(),
+                total: 100,
+                available: 25,
+            },
+        ];
+        app.focus = Focus::Disks;
+
+        app.move_cursor(1);
+        assert_eq!(app.selected_disk, 1);
+        app.enter().unwrap();
+
+        assert_eq!(app.cwd, second);
+        assert!(app.focus == Focus::Files);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("diskr_app_{name}_{}_{}", std::process::id(), nanos))
+    }
 }

@@ -2,6 +2,7 @@ mod app;
 mod bulkstat;
 mod fs_ops;
 mod scanner;
+mod terminal_backend;
 mod ui;
 
 use anyhow::{bail, Result};
@@ -10,7 +11,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui_core::terminal::Terminal;
 use std::{
     ffi::OsString,
     io::{self, IsTerminal},
@@ -19,6 +20,7 @@ use std::{
 };
 
 use app::{App, Focus};
+use terminal_backend::CrosstermBackend;
 
 fn main() -> Result<()> {
     match parse_args(std::env::args_os().skip(1))? {
@@ -94,13 +96,13 @@ Usage:
 
 Keys:
   Up/Down, j/k    Move selection
-  Enter           Open selected directory
+  Enter           Open selected directory or disk
   Backspace       Go to parent directory
   r               Rescan directory sizes
   o               Cycle sort mode
   .               Toggle hidden files
   d               Move selected item to Trash
-  Tab             Switch panes
+  Tab             Switch files/disks pane
   q, Esc          Quit
 ",
         env!("CARGO_PKG_VERSION")
@@ -134,7 +136,10 @@ fn dirs_home() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
-fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+fn run<B>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
+where
+    B: ratatui_core::backend::Backend<Error = io::Error>,
+{
     let mut needs_draw = true;
 
     loop {
@@ -156,6 +161,23 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) 
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if app.confirming_delete {
+                    let handled = match key.code {
+                        KeyCode::Char('y') => {
+                            app.confirm_delete()?;
+                            true
+                        }
+                        KeyCode::Char('n') | KeyCode::Esc => {
+                            app.cancel_delete();
+                            true
+                        }
+                        _ => false,
+                    };
+                    if handled {
+                        needs_draw = true;
+                    }
                     continue;
                 }
                 let handled = match key.code {
@@ -182,14 +204,6 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) 
                     }
                     KeyCode::Char('d') => {
                         app.request_delete();
-                        true
-                    }
-                    KeyCode::Char('y') if app.confirming_delete => {
-                        app.confirm_delete()?;
-                        true
-                    }
-                    KeyCode::Char('n') if app.confirming_delete => {
-                        app.cancel_delete();
                         true
                     }
                     KeyCode::Char('o') => {

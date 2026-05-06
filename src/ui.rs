@@ -1,9 +1,16 @@
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+use ratatui_core::{
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    terminal::Frame,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
-    Frame,
+};
+use ratatui_widgets::{
+    block::Block,
+    borders::Borders,
+    clear::Clear,
+    gauge::Gauge,
+    list::{List, ListItem, ListState},
+    paragraph::{Paragraph, Wrap},
 };
 
 use crate::app::{human, App, Focus};
@@ -141,6 +148,7 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
         if i >= rows.len() {
             break;
         }
+        let selected = app.focus == Focus::Disks && i == app.selected_disk;
         let used = d.total.saturating_sub(d.available);
         let pct = if d.total > 0 {
             (used as f64 / d.total as f64 * 100.0) as u16
@@ -152,7 +160,11 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
         } else {
             format!("{}  {}", d.name, d.mount.display())
         };
-        let label = format!("{}  {} / {}", disk_name, human(used), human(d.total));
+        let label = if selected {
+            format!("> {}  {} / {}", disk_name, human(used), human(d.total))
+        } else {
+            format!("{}  {} / {}", disk_name, human(used), human(d.total))
+        };
         let color = if pct > 90 {
             Color::Red
         } else if pct > 75 {
@@ -160,9 +172,13 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
         } else {
             Color::Green
         };
+        let mut gauge_style = Style::default().fg(color);
+        if selected {
+            gauge_style = gauge_style.add_modifier(Modifier::BOLD);
+        }
         let gauge = Gauge::default()
             .block(Block::default().title(label))
-            .gauge_style(Style::default().fg(color))
+            .gauge_style(gauge_style)
             .percent(pct.min(100));
         f.render_widget(gauge, rows[i]);
     }
@@ -219,11 +235,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
 fn draw_confirm(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 20, f.area());
     f.render_widget(Clear, area);
-    let name = app
-        .entries
-        .get(app.selected)
-        .map(|e| e.name.as_str())
-        .unwrap_or("?");
+    let name = app.pending_delete_name();
     let body = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -240,7 +252,7 @@ fn draw_confirm(f: &mut Frame, app: &App) {
     f.render_widget(
         Paragraph::new(body)
             .block(block)
-            .alignment(ratatui::layout::Alignment::Center),
+            .alignment(Alignment::Center),
         area,
     );
 }
