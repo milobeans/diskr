@@ -67,6 +67,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Color::DarkGray
     };
+    let (name_width, size_width) = file_columns(area.width.saturating_sub(2));
     let items: Vec<ListItem> = app
         .entries
         .iter()
@@ -86,15 +87,25 @@ fn draw_files(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 Style::default()
             };
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(icon, Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<40}", truncate(&e.name, 40)), name_style),
-                Span::raw("  "),
                 Span::styled(
-                    format!("{:>12}", size_str),
-                    Style::default().fg(Color::Green),
+                    format!(
+                        "{:<width$}",
+                        truncate(&e.name, name_width),
+                        width = name_width
+                    ),
+                    name_style,
                 ),
-            ]);
+            ];
+            if size_width > 0 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("{:>width$}", size_str, width = size_width),
+                    Style::default().fg(Color::Green),
+                ));
+            }
+            let line = Line::from(spans);
             ListItem::new(line)
         })
         .collect();
@@ -277,6 +288,9 @@ fn centered_rect(px: u16, py: u16, area: Rect) -> Rect {
 }
 
 fn truncate(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -284,6 +298,27 @@ fn truncate(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+fn file_columns(inner_width: u16) -> (usize, usize) {
+    const ICON_WIDTH: usize = 2;
+    const GAP_WIDTH: usize = 2;
+    const MIN_NAME_WIDTH: usize = 8;
+    const MIN_SIZE_WIDTH: usize = 4;
+    const PREFERRED_SIZE_WIDTH: usize = 12;
+
+    let inner_width = inner_width as usize;
+    let bare_name_width = inner_width.saturating_sub(ICON_WIDTH).max(1);
+    let room_for_size = inner_width.saturating_sub(ICON_WIDTH + GAP_WIDTH + MIN_NAME_WIDTH);
+    if room_for_size < MIN_SIZE_WIDTH {
+        return (bare_name_width, 0);
+    }
+
+    let size_width = room_for_size.min(PREFERRED_SIZE_WIDTH);
+    let name_width = inner_width
+        .saturating_sub(ICON_WIDTH + GAP_WIDTH + size_width)
+        .max(1);
+    (name_width, size_width)
 }
 
 #[cfg(test)]
@@ -305,5 +340,15 @@ mod tests {
         let area = Rect::new(0, 0, 100, 40);
         let got = centered_rect(60, 20, area);
         assert_eq!(got, Rect::new(20, 16, 60, 8));
+    }
+
+    #[test]
+    fn file_columns_hide_size_on_narrow_widths() {
+        assert_eq!(file_columns(10), (8, 0));
+    }
+
+    #[test]
+    fn file_columns_keep_size_when_space_allows() {
+        assert_eq!(file_columns(30), (14, 12));
     }
 }

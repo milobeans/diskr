@@ -159,18 +159,70 @@ where
         };
 
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            match event::read()? {
+                Event::Resize(_, _) => {
+                    needs_draw = true;
                 }
-                if app.confirming_delete {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if app.confirming_delete {
+                        let handled = match key.code {
+                            KeyCode::Char('y') => {
+                                app.confirm_delete()?;
+                                true
+                            }
+                            KeyCode::Char('n') | KeyCode::Esc => {
+                                app.cancel_delete();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
                     let handled = match key.code {
-                        KeyCode::Char('y') => {
-                            app.confirm_delete()?;
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.move_cursor(1);
                             true
                         }
-                        KeyCode::Char('n') | KeyCode::Esc => {
-                            app.cancel_delete();
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.move_cursor(-1);
+                            true
+                        }
+                        KeyCode::Enter => {
+                            app.enter()?;
+                            true
+                        }
+                        KeyCode::Backspace => {
+                            app.go_up()?;
+                            true
+                        }
+                        KeyCode::Char('r') => {
+                            app.force_rescan();
+                            true
+                        }
+                        KeyCode::Char('d') => {
+                            app.request_delete();
+                            true
+                        }
+                        KeyCode::Char('o') => {
+                            app.cycle_sort();
+                            true
+                        }
+                        KeyCode::Char('.') => {
+                            app.toggle_hidden()?;
+                            true
+                        }
+                        KeyCode::Tab => {
+                            app.focus = match app.focus {
+                                Focus::Files => Focus::Disks,
+                                Focus::Disks => Focus::Files,
+                            };
                             true
                         }
                         _ => false,
@@ -178,54 +230,8 @@ where
                     if handled {
                         needs_draw = true;
                     }
-                    continue;
                 }
-                let handled = match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        app.move_cursor(1);
-                        true
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        app.move_cursor(-1);
-                        true
-                    }
-                    KeyCode::Enter => {
-                        app.enter()?;
-                        true
-                    }
-                    KeyCode::Backspace => {
-                        app.go_up()?;
-                        true
-                    }
-                    KeyCode::Char('r') => {
-                        app.force_rescan();
-                        true
-                    }
-                    KeyCode::Char('d') => {
-                        app.request_delete();
-                        true
-                    }
-                    KeyCode::Char('o') => {
-                        app.cycle_sort();
-                        true
-                    }
-                    KeyCode::Char('.') => {
-                        app.toggle_hidden()?;
-                        true
-                    }
-                    KeyCode::Tab => {
-                        app.focus = match app.focus {
-                            Focus::Files => Focus::Disks,
-                            Focus::Disks => Focus::Files,
-                        };
-                        true
-                    }
-                    _ => false,
-                };
-                if handled {
-                    needs_draw = true;
-                }
+                _ => {}
             }
         }
     }
