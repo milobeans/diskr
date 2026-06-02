@@ -285,3 +285,25 @@ fn truncate(s: &str, max: usize) -> String {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_preserves_short_names() {
+        assert_eq!(truncate("Downloads", 40), "Downloads");
+    }
+
+    #[test]
+    fn truncate_keeps_unicode_boundary() {
+        assert_eq!(truncate("résumé.txt", 7), "résumé…");
+    }
+
+    #[test]
+    fn centered_rect_uses_expected_percent_area() {
+        let area = Rect::new(0, 0, 100, 40);
+        let got = centered_rect(60, 20, area);
+        assert_eq!(got, Rect::new(20, 16, 60, 8));
+    }
+}

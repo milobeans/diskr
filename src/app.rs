@@ -273,8 +273,8 @@ impl App {
         {
             e.scanning = true;
         }
-        self.status = format!("scanning {} directories…", dirs.len());
-        self.scanner.scan_all(scan_id, dirs);
+        let dir_count = dirs.len();
+        self.start_scan(scan_id, dirs, format!("scanning {dir_count} directories…"));
     }
 
     /// Invoked by the `r` key. Invalidates cache for everything in view, rescans all.
@@ -300,8 +300,8 @@ impl App {
             self.status = String::from("no directories to rescan");
             return;
         }
-        self.status = format!("rescan: {} directories…", dirs.len());
-        self.scanner.scan_all(scan_id, dirs);
+        let dir_count = dirs.len();
+        self.start_scan(scan_id, dirs, format!("rescan: {dir_count} directories…"));
     }
 
     pub fn drain_scan_results(&mut self) -> bool {
@@ -404,6 +404,19 @@ impl App {
         self.active_scan_id
     }
 
+    fn start_scan(&mut self, scan_id: ScanId, dirs: Vec<PathBuf>, status: String) {
+        match self.scanner.scan_all(scan_id, dirs) {
+            Ok(()) => self.status = status,
+            Err(err) => {
+                for entry in &mut self.entries {
+                    entry.scanning = false;
+                }
+                self.sort_dirty = false;
+                self.status = format!("could not start scanner: {err}");
+            }
+        }
+    }
+
     pub fn refresh_disks(&mut self) {
         self.disks = disk_info();
         self.selected_disk = self.selected_disk.min(self.disks.len().saturating_sub(1));
@@ -481,11 +494,6 @@ fn c_char_array_to_string(chars: &[libc::c_char]) -> String {
         .into_owned()
 }
 
-#[allow(dead_code)]
-pub fn is_under(p: &Path, root: &Path) -> bool {
-    p.starts_with(root)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,6 +568,45 @@ mod tests {
         assert_eq!(app.cwd, second);
         assert!(app.focus == Focus::Files);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hidden_toggle_filters_dotfiles() {
+        let root = test_root("hidden");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("visible.txt"), b"visible").unwrap();
+        fs::write(root.join(".hidden.txt"), b"hidden").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        assert!(app.entries.iter().any(|entry| entry.name == "visible.txt"));
+        assert!(!app.entries.iter().any(|entry| entry.name == ".hidden.txt"));
+
+        app.toggle_hidden().unwrap();
+        assert!(app.entries.iter().any(|entry| entry.name == ".hidden.txt"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn human_formats_binary_units() {
+        assert_eq!(human(0), "0 B");
+        assert_eq!(human(1023), "1023 B");
+        assert_eq!(human(1024), "1.0 KiB");
+        assert_eq!(human(10 * 1024), "10 KiB");
+        assert_eq!(human(5 * 1024 * 1024), "5.0 MiB");
+    }
+
+    #[test]
+    fn c_char_array_to_string_stops_at_nul() {
+        let bytes = [
+            b'a' as libc::c_char,
+            b'b' as libc::c_char,
+            0,
+            b'c' as libc::c_char,
+        ];
+        assert_eq!(c_char_array_to_string(&bytes), "ab");
+        assert_eq!(c_char_array_to_string(&[]), "");
+        assert_eq!(c_char_array_to_string(&[0]), "");
     }
 
     fn test_root(name: &str) -> PathBuf {

@@ -28,9 +28,9 @@ impl Scanner {
 
     /// Scan each directory in `dirs` for its TOTAL recursive size on disk.
     /// Must NOT block the UI thread.
-    pub fn scan_all(&self, scan_id: ScanId, dirs: Vec<PathBuf>) {
+    pub fn scan_all(&self, scan_id: ScanId, dirs: Vec<PathBuf>) -> std::io::Result<()> {
         let tx = self.tx.clone();
-        let _ = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name(String::from("diskr-scan"))
             .spawn(move || {
                 for dir in dirs {
@@ -42,6 +42,7 @@ impl Scanner {
                     });
                 }
                 let _ = tx.send(ScanMsg::AllDone { scan_id });
-            });
+            })
+            .map(|_| ())
     }
 }
