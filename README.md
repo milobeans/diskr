@@ -48,7 +48,7 @@ diskr ~/Downloads
 
 `diskr` is macOS-only. Directory sizing uses `getattrlistbulk(2)` for fast local scans, and deletion uses the macOS Trash rather than permanent removal.
 
-The minimum supported Rust version is 1.86.0.
+The minimum supported Rust version is 1.88.0.
 
 ## Release Checks
 

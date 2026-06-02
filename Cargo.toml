@@ -2,7 +2,7 @@
 name = "diskr"
 version = "0.1.2"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.88"
 authors = ["Milo Evans"]
 description = "Lightweight terminal file explorer and disk/storage manager for macOS"
 license = "MIT"
