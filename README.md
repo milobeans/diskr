@@ -30,6 +30,12 @@ To start in a specific directory:
 diskr ~/Downloads
 ```
 
+If the path starts with `-`, use the conventional argument separator:
+
+```sh
+diskr -- -scratch
+```
+
 ## Keys
 
 | Key | Action |

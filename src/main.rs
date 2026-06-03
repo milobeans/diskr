@@ -73,14 +73,24 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
         return Ok(CliAction::Run(dirs_home()));
     };
 
-    if args.next().is_some() {
-        bail!("usage: diskr [PATH]");
-    }
-
     match first.to_string_lossy().as_ref() {
         "-h" | "--help" => Ok(CliAction::Help),
         "-V" | "--version" => Ok(CliAction::Version),
-        _ => Ok(CliAction::Run(PathBuf::from(first))),
+        "--" => {
+            let Some(path) = args.next() else {
+                bail!("usage: diskr [PATH]");
+            };
+            if args.next().is_some() {
+                bail!("usage: diskr [PATH]");
+            }
+            Ok(CliAction::Run(PathBuf::from(path)))
+        }
+        _ => {
+            if args.next().is_some() {
+                bail!("usage: diskr [PATH]");
+            }
+            Ok(CliAction::Run(PathBuf::from(first)))
+        }
     }
 }
 
@@ -93,6 +103,7 @@ Lightweight terminal file explorer and disk/storage manager for macOS.
 
 Usage:
   diskr [PATH]
+  diskr -- PATH
 
 Keys:
   Up/Down, j/k    Move selection
@@ -251,6 +262,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_one_path() {
+        let action = parse(&["/tmp"]).unwrap();
+        assert!(matches!(action, CliAction::Run(path) if path == std::path::Path::new("/tmp")));
+    }
+
+    #[test]
+    fn accepts_dash_prefixed_path_after_separator() {
+        let action = parse(&["--", "-cache"]).unwrap();
+        assert!(matches!(action, CliAction::Run(path) if path == std::path::Path::new("-cache")));
+    }
+
+    #[test]
+    fn separator_requires_path() {
+        let err = parse(&["--"]).err().unwrap();
+        assert!(err.to_string().contains("usage: diskr [PATH]"));
+    }
+
+    #[test]
     fn parses_help_and_version_flags() {
         assert!(matches!(parse(&["--help"]).unwrap(), CliAction::Help));
         assert!(matches!(parse(&["-h"]).unwrap(), CliAction::Help));
@@ -259,15 +288,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_one_path() {
-        match parse(&["/tmp"]).unwrap() {
-            CliAction::Run(path) => assert_eq!(path, PathBuf::from("/tmp")),
-            _ => panic!("expected run action"),
-        }
-    }
-
-    #[test]
     fn rejects_extra_args() {
         assert!(parse(&["/tmp", "/var"]).is_err());
+        assert!(parse(&["--", "/tmp", "/var"]).is_err());
     }
 }
