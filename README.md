@@ -43,7 +43,7 @@ diskr -- -scratch
 | Up/Down, j/k | Move selection |
 | Enter | Open selected directory or disk |
 | Backspace | Go to parent directory |
-| r | Rescan directory sizes |
+| r | Refresh the current view and rescan directory sizes |
 | o | Cycle sort mode |
 | . | Toggle hidden files |
 | d | Move selected item to Trash |

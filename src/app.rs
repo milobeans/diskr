@@ -84,7 +84,7 @@ impl App {
             sort: SortMode::SizeDesc,
             focus: Focus::Files,
             disks: Vec::new(),
-            status: String::from("q to quit · r to rescan · d to trash"),
+            status: String::from("q to quit · r to refresh · d to trash"),
             confirming_delete: false,
             pending_delete: None,
             size_cache: HashMap::new(),
@@ -100,6 +100,18 @@ impl App {
     }
 
     pub fn reload(&mut self) -> Result<()> {
+        let previous_selected = self
+            .entries
+            .get(self.selected)
+            .map(|entry| entry.path.clone());
+        let previous_index = self.selected;
+        self.rebuild_entries()?;
+        self.restore_selection(previous_selected, previous_index);
+        self.auto_scan();
+        Ok(())
+    }
+
+    fn rebuild_entries(&mut self) -> Result<()> {
         self.entries.clear();
         let read = match std::fs::read_dir(&self.cwd) {
             Ok(r) => r,
@@ -141,8 +153,6 @@ impl App {
             });
         }
         self.apply_sort();
-        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
-        self.auto_scan();
         Ok(())
     }
 
@@ -277,16 +287,26 @@ impl App {
         self.start_scan(scan_id, dirs, format!("scanning {dir_count} directories…"));
     }
 
-    /// Invoked by the `r` key. Invalidates cache for everything in view, rescans all.
+    /// Invoked by the `r` key. Refreshes the directory view and rescans visible directories.
     pub fn force_rescan(&mut self) {
         if self.confirming_delete {
             return;
         }
         let scan_id = self.next_scan_id();
+        let previous_selected = self
+            .entries
+            .get(self.selected)
+            .map(|entry| entry.path.clone());
+        let previous_index = self.selected;
         for e in self.entries.iter().filter(|e| e.is_dir) {
             self.size_cache.remove(&e.path);
         }
-        for e in self.entries.iter_mut().filter(|e| e.is_dir) {
+        self.refresh_disks();
+        if self.rebuild_entries().is_err() {
+            return;
+        }
+        self.restore_selection(previous_selected, previous_index);
+        for e in self.entries.iter_mut().filter(|entry| entry.is_dir) {
             e.size = None;
             e.scanning = true;
         }
@@ -297,7 +317,7 @@ impl App {
             .map(|e| e.path.clone())
             .collect();
         if dirs.is_empty() {
-            self.status = String::from("no directories to rescan");
+            self.status = String::from("refresh complete · no directories to rescan");
             return;
         }
         let dir_count = dirs.len();
@@ -402,6 +422,12 @@ impl App {
     fn next_scan_id(&mut self) -> ScanId {
         self.active_scan_id = self.active_scan_id.saturating_add(1);
         self.active_scan_id
+    }
+
+    fn restore_selection(&mut self, previous_selected: Option<PathBuf>, previous_index: usize) {
+        self.selected = previous_selected
+            .and_then(|path| self.entries.iter().position(|entry| entry.path == path))
+            .unwrap_or_else(|| previous_index.min(self.entries.len().saturating_sub(1)));
     }
 
     fn start_scan(&mut self, scan_id: ScanId, dirs: Vec<PathBuf>, status: String) {
@@ -583,6 +609,28 @@ mod tests {
 
         app.toggle_hidden().unwrap();
         assert!(app.entries.iter().any(|entry| entry.name == ".hidden.txt"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn force_rescan_refreshes_entries_and_preserves_selection() {
+        let root = test_root("refresh");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        fs::write(root.join("c.txt"), b"ccc").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        app.move_cursor(1);
+        let selected_before = app.entries[app.selected].path.clone();
+
+        fs::write(root.join("b.txt"), b"bb").unwrap();
+        app.force_rescan();
+
+        assert!(app.entries.iter().any(|entry| entry.name == "b.txt"));
+        assert_eq!(app.entries[app.selected].path, selected_before);
 
         fs::remove_dir_all(root).unwrap();
     }

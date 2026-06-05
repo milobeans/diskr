@@ -223,7 +223,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         label(" up"),
         sep(),
         key("r"),
-        label(" reload"),
+        label(" refresh"),
         sep(),
         key("o"),
         label(" sort"),
