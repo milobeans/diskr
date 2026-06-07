@@ -105,6 +105,14 @@ impl App {
             .get(self.selected)
             .map(|entry| entry.path.clone());
         let previous_index = self.selected;
+        self.reload_with_selection(previous_selected, previous_index)
+    }
+
+    fn reload_with_selection(
+        &mut self,
+        previous_selected: Option<PathBuf>,
+        previous_index: usize,
+    ) -> Result<()> {
         self.rebuild_entries()?;
         self.restore_selection(previous_selected, previous_index);
         self.auto_scan();
@@ -247,10 +255,10 @@ impl App {
         if self.confirming_delete {
             return Ok(());
         }
+        let previous_cwd = self.cwd.clone();
         if let Some(parent) = self.cwd.parent().map(|p| p.to_path_buf()) {
             self.cwd = parent;
-            self.selected = 0;
-            self.reload()?;
+            self.reload_with_selection(Some(previous_cwd), self.selected)?;
         }
         Ok(())
     }
@@ -631,6 +639,34 @@ mod tests {
 
         assert!(app.entries.iter().any(|entry| entry.name == "b.txt"));
         assert_eq!(app.entries[app.selected].path, selected_before);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn go_up_reselects_previous_directory_in_parent() {
+        let root = test_root("go_up_selection");
+        let child = root.join("child");
+        let sibling = root.join("sibling");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(child.join("nested.txt"), b"x").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        let child_index = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == child)
+            .unwrap();
+        app.selected = child_index;
+
+        app.enter().unwrap();
+        app.go_up().unwrap();
+
+        assert_eq!(app.cwd, root);
+        assert_eq!(app.entries[app.selected].path, child);
 
         fs::remove_dir_all(root).unwrap();
     }
