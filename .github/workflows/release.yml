@@ -72,7 +72,12 @@ jobs:
           CRATE_NAME: ${{ steps.meta.outputs.name }}
           CRATE_VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          status_code="$(curl -s -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/$CRATE_NAME/$CRATE_VERSION")"
+          status_code="$(
+            curl -s -o /dev/null -w "%{http_code}" \
+              -H "User-Agent: diskr-release-workflow" \
+              -H "Accept: application/json" \
+              "https://crates.io/api/v1/crates/$CRATE_NAME/$CRATE_VERSION"
+          )"
           if [ "$status_code" = "200" ]; then
             echo "already_published=true" >> "$GITHUB_OUTPUT"
           elif [ "$status_code" = "404" ]; then
