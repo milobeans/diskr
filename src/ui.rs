@@ -45,18 +45,29 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
+    let path = truncate_start(
+        &app.cwd.display().to_string(),
+        area.width.saturating_sub(30) as usize,
+    );
     let text = Line::from(vec![
-        Span::styled("diskr ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("· "),
+        Span::styled("diskr", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" · "),
+        Span::styled(path, Style::default().fg(Color::Cyan)),
+        Span::raw(" · "),
         Span::styled(
-            app.cwd.display().to_string(),
-            Style::default().fg(Color::Cyan),
+            format!("{} items", app.entries.len()),
+            Style::default().fg(Color::White),
         ),
-        Span::raw(format!(
-            "   [sort: {}, hidden: {}]",
-            app.sort.label(),
-            if app.show_hidden { "on" } else { "off" }
-        )),
+        Span::raw(" · "),
+        Span::styled(
+            format!("sort {}", app.sort.label()),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::raw(" · "),
+        Span::styled(
+            format!("hidden {}", if app.show_hidden { "on" } else { "off" }),
+            Style::default().fg(Color::Gray),
+        ),
     ]);
     f.render_widget(Paragraph::new(text), area);
 }
@@ -68,6 +79,17 @@ fn draw_files(f: &mut Frame, area: Rect, app: &App) {
         Color::DarkGray
     };
     let (name_width, size_width) = file_columns(area.width.saturating_sub(2));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("files ({})", app.entries.len()))
+        .border_style(Style::default().fg(border_color));
+    if app.entries.is_empty() {
+        let empty = Paragraph::new("empty directory")
+            .block(block)
+            .alignment(Alignment::Center);
+        f.render_widget(empty, area);
+        return;
+    }
     let items: Vec<ListItem> = app
         .entries
         .iter()
@@ -101,7 +123,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &App) {
             if size_width > 0 {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
-                    format!("{:>width$}", size_str, width = size_width),
+                    format!("{size_str:>size_width$}"),
                     Style::default().fg(Color::Green),
                 ));
             }
@@ -111,12 +133,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("files")
-                .border_style(Style::default().fg(border_color)),
-        )
+        .block(block)
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -137,12 +154,16 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("disks")
+        .title(format!("disks ({})", app.disks.len()))
         .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if app.disks.is_empty() {
+        f.render_widget(
+            Paragraph::new("no disks detected").alignment(Alignment::Center),
+            inner,
+        );
         return;
     }
     let rows = Layout::default()
@@ -196,7 +217,15 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let text = Line::from(Span::styled(&app.status, Style::default().fg(Color::White)));
+    let mut spans = vec![Span::styled(
+        selection_status(app),
+        Style::default().fg(Color::White),
+    )];
+    if !app.status.is_empty() {
+        spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(&app.status, Style::default().fg(Color::Gray)));
+    }
+    let text = Line::from(spans);
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
 }
 
@@ -250,7 +279,7 @@ fn draw_confirm(f: &mut Frame, app: &App) {
     let body = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("Move to Trash: {}", name),
+            format!("Move to Trash: {name}"),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -300,6 +329,53 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn truncate_start(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+    if max == 1 {
+        return String::from("…");
+    }
+    let tail: String = s.chars().skip(len.saturating_sub(max - 1)).collect();
+    format!("…{tail}")
+}
+
+fn selection_status(app: &App) -> String {
+    match app.focus {
+        Focus::Files => match app.entries.get(app.selected) {
+            Some(entry) if entry.is_dir && entry.scanning => {
+                format!("dir {} · scanning size", truncate(&entry.name, 28))
+            }
+            Some(entry) if entry.is_dir => {
+                let size = entry.size.map(human).unwrap_or_else(|| String::from("—"));
+                format!("dir {} · {}", truncate(&entry.name, 28), size)
+            }
+            Some(entry) => {
+                let size = entry.size.map(human).unwrap_or_else(|| String::from("?"));
+                format!("file {} · {}", truncate(&entry.name, 28), size)
+            }
+            None => String::from("no files in view"),
+        },
+        Focus::Disks => match app.disks.get(app.selected_disk) {
+            Some(disk) => {
+                let free = human(disk.available);
+                let total = human(disk.total);
+                let label = if disk.name.is_empty() {
+                    disk.mount.display().to_string()
+                } else {
+                    disk.name.clone()
+                };
+                format!("disk {} · {} free of {}", truncate(&label, 28), free, total)
+            }
+            None => String::from("no disks available"),
+        },
+    }
+}
+
 fn file_columns(inner_width: u16) -> (usize, usize) {
     const ICON_WIDTH: usize = 2;
     const GAP_WIDTH: usize = 2;
@@ -333,6 +409,11 @@ mod tests {
     #[test]
     fn truncate_keeps_unicode_boundary() {
         assert_eq!(truncate("résumé.txt", 7), "résumé…");
+    }
+
+    #[test]
+    fn truncate_start_keeps_path_tail() {
+        assert_eq!(truncate_start("/Users/milo/Downloads", 10), "…Downloads");
     }
 
     #[test]
