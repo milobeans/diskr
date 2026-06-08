@@ -13,7 +13,7 @@ use ratatui_widgets::{
     paragraph::{Paragraph, Wrap},
 };
 
-use crate::app::{human, size_sort_key, App, Focus};
+use crate::app::{human, size_sort_key, App, Focus, PkgView};
 use crate::bulkstat::SizeInfo;
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -31,11 +31,17 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(root[1]);
 
+    let side = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(body[1]);
+
     draw_files(f, body[0], app);
-    draw_disks(f, body[1], app);
+    draw_disks(f, side[0], app);
+    draw_packages(f, side[1], app);
 
     draw_status(f, root[2], app);
     draw_help(f, root[3]);
@@ -217,6 +223,130 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
+    let border_color = if app.focus == Focus::Packages {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("packages ({})", app.pkg_view.label()))
+        .border_style(Style::default().fg(border_color));
+
+    if !app.packages_loaded {
+        let message = if app.packages_loading {
+            "scanning packages…"
+        } else {
+            "press p to scan packages"
+        };
+        let text = Paragraph::new(message)
+            .block(block)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+        f.render_widget(text, area);
+        return;
+    }
+
+    let items = match app.pkg_view {
+        PkgView::SystemManagers => package_items(app, area.width.saturating_sub(2)),
+        PkgView::ProjectDeps => project_dep_items(app, area.width.saturating_sub(2)),
+    };
+
+    if items.is_empty() {
+        let empty = Paragraph::new(match app.pkg_view {
+            PkgView::SystemManagers => "no supported packages found",
+            PkgView::ProjectDeps => "no project manifests found",
+        })
+        .block(block)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+        f.render_widget(empty, area);
+        return;
+    }
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    let mut state = ListState::default();
+    state.select(Some(
+        app.selected_pkg.min(app.pkg_item_count().saturating_sub(1)),
+    ));
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn package_items(app: &App, inner_width: u16) -> Vec<ListItem<'_>> {
+    let (name_width, size_width) = package_columns(inner_width);
+    let mut packages = app.flat_packages();
+    packages.sort_by(|(a, _), (b, _)| {
+        let a_size = a.size.map(|s| s.allocated).unwrap_or(0);
+        let b_size = b.size.map(|s| s.allocated).unwrap_or(0);
+        b_size.cmp(&a_size).then(a.name.cmp(&b.name))
+    });
+
+    packages
+        .into_iter()
+        .map(|(package, manager)| {
+            let size = package
+                .size
+                .map(|s| human(s.allocated))
+                .unwrap_or_else(|| String::from("?"));
+            let label = format!("{} {}", manager.label(), package.name);
+            package_line(&label, &size, name_width, size_width)
+        })
+        .collect()
+}
+
+fn project_dep_items(app: &App, inner_width: u16) -> Vec<ListItem<'_>> {
+    let (name_width, size_width) = package_columns(inner_width);
+    app.project_deps
+        .iter()
+        .map(|dep| {
+            let size = dep
+                .deps_size
+                .map(|s| human(s.allocated))
+                .unwrap_or_else(|| String::from("—"));
+            let label = format!(
+                "{} · {} deps · {}",
+                dep.manager_label,
+                dep.dep_count,
+                dep.path.display()
+            );
+            package_line(&label, &size, name_width, size_width)
+        })
+        .collect()
+}
+
+fn package_line(
+    label: &str,
+    size: &str,
+    name_width: usize,
+    size_width: usize,
+) -> ListItem<'static> {
+    let mut spans = vec![Span::styled(
+        format!(
+            "{:<width$}",
+            truncate(label, name_width),
+            width = name_width
+        ),
+        Style::default().fg(Color::White),
+    )];
+    if size_width > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("{size:>size_width$}"),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    ListItem::new(Line::from(spans))
+}
+
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![Span::styled(
         selection_status(app),
@@ -266,6 +396,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         sep(),
         key("o"),
         label(" sort"),
+        sep(),
+        key("p"),
+        label(" packages"),
         sep(),
         key("."),
         label(" hidden"),
@@ -389,6 +522,47 @@ fn selection_status(app: &App) -> String {
             }
             None => String::from("no disks available"),
         },
+        Focus::Packages => {
+            if !app.packages_loaded {
+                return String::from("packages not scanned");
+            }
+            if app.packages_loading {
+                return String::from("refreshing package data");
+            }
+            match app.pkg_view {
+                PkgView::SystemManagers => {
+                    let packages = app.flat_packages();
+                    match packages.get(app.selected_pkg) {
+                        Some((package, manager)) => {
+                            let size = package
+                                .size
+                                .map(size_detail)
+                                .unwrap_or_else(|| String::from("?"));
+                            format!(
+                                "{} package {} · {}",
+                                manager.label(),
+                                truncate(&package.name, 28),
+                                size
+                            )
+                        }
+                        None => String::from("no packages in view"),
+                    }
+                }
+                PkgView::ProjectDeps => match app.project_deps.get(app.selected_pkg) {
+                    Some(dep) => {
+                        let size = dep
+                            .deps_size
+                            .map(size_detail)
+                            .unwrap_or_else(|| String::from("—"));
+                        format!(
+                            "{} project · {} deps · {}",
+                            dep.manager_label, dep.dep_count, size
+                        )
+                    }
+                    None => String::from("no project dependencies in view"),
+                },
+            }
+        }
     }
 }
 
@@ -421,6 +595,23 @@ fn file_columns(inner_width: u16) -> (usize, usize) {
     let name_width = inner_width
         .saturating_sub(ICON_WIDTH + GAP_WIDTH + size_width)
         .max(1);
+    (name_width, size_width)
+}
+
+fn package_columns(inner_width: u16) -> (usize, usize) {
+    const GAP_WIDTH: usize = 2;
+    const MIN_NAME_WIDTH: usize = 10;
+    const MIN_SIZE_WIDTH: usize = 4;
+    const PREFERRED_SIZE_WIDTH: usize = 9;
+
+    let inner_width = inner_width as usize;
+    let room_for_size = inner_width.saturating_sub(GAP_WIDTH + MIN_NAME_WIDTH);
+    if room_for_size < MIN_SIZE_WIDTH {
+        return (inner_width.max(1), 0);
+    }
+
+    let size_width = room_for_size.min(PREFERRED_SIZE_WIDTH);
+    let name_width = inner_width.saturating_sub(GAP_WIDTH + size_width).max(1);
     (name_width, size_width)
 }
 
@@ -458,5 +649,10 @@ mod tests {
     #[test]
     fn file_columns_keep_size_when_space_allows() {
         assert_eq!(file_columns(30), (14, 12));
+    }
+
+    #[test]
+    fn package_columns_hide_size_when_narrow() {
+        assert_eq!(package_columns(12), (12, 0));
     }
 }

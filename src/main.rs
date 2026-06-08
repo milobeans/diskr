@@ -2,6 +2,7 @@ mod app;
 mod bulkstat;
 mod fs_ops;
 mod history;
+mod packages;
 mod reclaim;
 mod scanner;
 mod space;
@@ -41,6 +42,7 @@ fn main() -> Result<()> {
         CliAction::Save { path, json } => save_baseline(path, json),
         CliAction::Diff { path, json } => print_diff(path, json),
         CliAction::Space { path, json } => print_space(path, json),
+        CliAction::Packages { path, json } => print_packages(path, json),
         CliAction::ThinSnapshots {
             path,
             bytes,
@@ -98,6 +100,10 @@ enum CliAction {
         path: PathBuf,
         json: bool,
     },
+    Packages {
+        path: PathBuf,
+        json: bool,
+    },
     ThinSnapshots {
         path: PathBuf,
         bytes: u64,
@@ -115,6 +121,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
     let mut save_baseline = false;
     let mut diff_baseline = false;
     let mut space_report = false;
+    let mut packages_report = false;
     let mut thin_snapshots: Option<u64> = None;
     let mut confirmed = false;
     let mut json = false;
@@ -151,6 +158,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
             "--space" => {
                 space_report = true;
             }
+            "--packages" => {
+                packages_report = true;
+            }
             "--thin-snapshots" => {
                 let Some(size) = args.next() else {
                     bail!("usage: diskr --thin-snapshots SIZE [--yes] [PATH]");
@@ -183,8 +193,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
         && !save_baseline
         && !diff_baseline
         && !space_report
+        && !packages_report
     {
-        bail!("--json requires --top, --reclaim, --save, --diff, or --space");
+        bail!("--json requires --top, --reclaim, --save, --diff, --space, or --packages");
     }
     if confirmed && thin_snapshots.is_none() {
         bail!("--yes requires --thin-snapshots");
@@ -197,9 +208,10 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
         + usize::from(save_baseline)
         + usize::from(diff_baseline)
         + usize::from(space_report)
+        + usize::from(packages_report)
         + usize::from(thin_snapshots.is_some());
     if mode_count > 1 {
-        bail!("choose only one of --top, --reclaim, --save, --diff, --space, or --thin-snapshots");
+        bail!("choose only one of --top, --reclaim, --save, --diff, --space, --packages, or --thin-snapshots");
     }
 
     match top_limit {
@@ -221,6 +233,10 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
             json,
         }),
         None if space_report => Ok(CliAction::Space {
+            path: path.unwrap_or_else(dirs_home),
+            json,
+        }),
+        None if packages_report => Ok(CliAction::Packages {
             path: path.unwrap_or_else(dirs_home),
             json,
         }),
@@ -265,20 +281,22 @@ Usage:
   diskr --save [--json] [PATH]
   diskr --diff [--json] [PATH]
   diskr --space [--json] [PATH]
+  diskr --packages [--json] [PATH]
   diskr --thin-snapshots SIZE [--yes] [PATH]
 
 Keys:
   Up/Down, j/k    Move selection
-  Enter           Open selected directory or disk
+  Enter           Open selected directory or disk/package path
   Backspace       Go to parent directory
   Space           Quick Look selected item
   f               Reveal selected item in Finder
   O               Open selected item with default app
   r               Refresh view and rescan directory sizes
   o               Cycle sort mode
+  p               Open packages pane / switch package view
   .               Toggle hidden files
   d               Move selected item to Trash
-  Tab             Switch files/disks pane
+  Tab             Switch files/disks/packages pane
   q, Esc          Quit
 ",
         env!("CARGO_PKG_VERSION")
@@ -640,6 +658,117 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_packages(path: PathBuf, json: bool) -> Result<()> {
+    let reports = packages::scan_managers();
+    let project_deps = packages::find_project_deps(&path, 5);
+
+    if json {
+        let managers: Vec<_> = reports
+            .iter()
+            .filter(|r| r.available)
+            .map(|r| {
+                let pkgs: Vec<_> = r
+                    .packages
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "name": p.name,
+                            "version": p.version,
+                            "logical": p.size.map(|s| s.logical),
+                            "allocated": p.size.map(|s| s.allocated),
+                            "path": p.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "manager": r.manager.label(),
+                    "count": r.packages.len(),
+                    "total_logical": r.total_size.logical,
+                    "total_allocated": r.total_size.allocated,
+                    "packages": pkgs,
+                })
+            })
+            .collect();
+        let projects: Vec<_> = project_deps
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "path": d.path.to_string_lossy(),
+                    "manager": d.manager_label,
+                    "manifest": d.manifest,
+                    "dep_count": d.dep_count,
+                    "deps_logical": d.deps_size.map(|s| s.logical),
+                    "deps_allocated": d.deps_size.map(|s| s.allocated),
+                })
+            })
+            .collect();
+        let value = serde_json::json!({
+            "system_packages": managers,
+            "project_dependencies": projects,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!("Package report");
+    println!();
+
+    let mut any_manager = false;
+    for report in &reports {
+        if !report.available {
+            continue;
+        }
+        any_manager = true;
+        println!(
+            "{}: {} packages · {}",
+            report.manager.label(),
+            report.packages.len(),
+            human(report.total_size.allocated)
+        );
+        let mut sorted: Vec<_> = report.packages.iter().collect();
+        sorted.sort_by(|a, b| {
+            let a_size = a.size.map(|s| s.allocated).unwrap_or(0);
+            let b_size = b.size.map(|s| s.allocated).unwrap_or(0);
+            b_size.cmp(&a_size)
+        });
+        for pkg in sorted.iter().take(10) {
+            let size_str = pkg
+                .size
+                .map(|s| human(s.allocated))
+                .unwrap_or_else(|| String::from("?"));
+            println!("  {:>10}  {} {}", size_str, pkg.name, pkg.version);
+        }
+        if report.packages.len() > 10 {
+            println!("  … and {} more", report.packages.len() - 10);
+        }
+        println!();
+    }
+
+    if !any_manager {
+        println!("No supported package managers found.");
+        println!();
+    }
+
+    if !project_deps.is_empty() {
+        println!("Project dependencies under {}", path.display());
+        for dep in &project_deps {
+            let size_str = dep
+                .deps_size
+                .map(|s| human(s.allocated))
+                .unwrap_or_else(|| String::from("—"));
+            println!(
+                "  {:>10}  {} ({}, {} deps)",
+                size_str,
+                dep.path.display(),
+                dep.manager_label,
+                dep.dep_count
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn thin_snapshots(path: PathBuf, bytes: u64, confirmed: bool) -> Result<()> {
     if !path.exists() {
         bail!("path does not exist: {}", path.display());
@@ -721,6 +850,28 @@ fn selected_action_target(app: &App) -> Option<(PathBuf, String)> {
             };
             (disk.mount.clone(), label)
         }),
+        Focus::Packages => match app.pkg_view {
+            app::PkgView::SystemManagers => {
+                let packages = app.flat_packages();
+                packages
+                    .get(app.selected_pkg)
+                    .and_then(|(package, manager)| {
+                        package.path.as_ref().map(|path| {
+                            (
+                                path.clone(),
+                                format!("{} {}", manager.label(), package.name),
+                            )
+                        })
+                    })
+            }
+            app::PkgView::ProjectDeps => app.project_deps.get(app.selected_pkg).map(|dep| {
+                let path = dep.deps_dir.as_ref().unwrap_or(&dep.path).clone();
+                (
+                    path,
+                    format!("{} {}", dep.manager_label, dep.path.display()),
+                )
+            }),
+        },
     }
 }
 
@@ -838,7 +989,11 @@ where
                             true
                         }
                         KeyCode::Enter => {
-                            app.enter()?;
+                            if app.focus == Focus::Packages {
+                                launch_external_action(app, ExternalAction::Open);
+                            } else {
+                                app.enter()?;
+                            }
                             true
                         }
                         KeyCode::Backspace => {
@@ -858,7 +1013,11 @@ where
                             true
                         }
                         KeyCode::Char('r') => {
-                            app.force_rescan();
+                            if app.focus == Focus::Packages {
+                                app.refresh_packages();
+                            } else {
+                                app.force_rescan();
+                            }
                             true
                         }
                         KeyCode::Char('d') => {
@@ -869,6 +1028,15 @@ where
                             app.cycle_sort();
                             true
                         }
+                        KeyCode::Char('p') => {
+                            if app.focus == Focus::Packages {
+                                app.toggle_pkg_view();
+                            } else {
+                                app.focus = Focus::Packages;
+                                app.load_packages();
+                            }
+                            true
+                        }
                         KeyCode::Char('.') => {
                             app.toggle_hidden()?;
                             true
@@ -876,8 +1044,12 @@ where
                         KeyCode::Tab => {
                             app.focus = match app.focus {
                                 Focus::Files => Focus::Disks,
-                                Focus::Disks => Focus::Files,
+                                Focus::Disks => Focus::Packages,
+                                Focus::Packages => Focus::Files,
                             };
+                            if app.focus == Focus::Packages {
+                                app.load_packages();
+                            }
                             true
                         }
                         _ => false,
@@ -975,6 +1147,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_packages_report() {
+        let action = parse(&["--packages", "--json", "/tmp"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::Packages {
+                path,
+                json: true
+            } if path == std::path::Path::new("/tmp")
+        ));
+    }
+
+    #[test]
     fn parses_reclaim_report() {
         let action = parse(&["--reclaim", "--json", "/tmp"]).unwrap();
         assert!(matches!(
@@ -1023,7 +1207,7 @@ mod tests {
         let err = parse(&["--json"]).err().unwrap();
         assert!(err
             .to_string()
-            .contains("--json requires --top, --reclaim, --save, --diff, or --space"));
+            .contains("--json requires --top, --reclaim, --save, --diff, --space, or --packages"));
     }
 
     #[test]
@@ -1036,12 +1220,12 @@ mod tests {
     fn report_modes_are_mutually_exclusive() {
         let err = parse(&["--top", "5", "--space"]).err().unwrap();
         assert!(err.to_string().contains(
-            "choose only one of --top, --reclaim, --save, --diff, --space, or --thin-snapshots"
+            "choose only one of --top, --reclaim, --save, --diff, --space, --packages, or --thin-snapshots"
         ));
     }
 
     #[test]
-    fn external_action_target_uses_selected_file_or_disk() {
+    fn external_action_target_uses_selected_file_disk_or_package() {
         let root = test_root("external_target");
         let file = root.join("visible.txt");
         fs::create_dir_all(&root).unwrap();
@@ -1065,6 +1249,41 @@ mod tests {
         let target = selected_action_target(&app).unwrap();
         assert_eq!(target.0, mount);
         assert_eq!(target.1, "External");
+
+        let pkg_path = root.join("pkg-bin");
+        fs::write(&pkg_path, b"binary").unwrap();
+        app.pkg_reports = vec![packages::ManagerReport {
+            manager: packages::Manager::Cargo,
+            packages: vec![packages::Package {
+                name: String::from("diskr"),
+                version: String::from("0.1.5"),
+                size: None,
+                path: Some(pkg_path.clone()),
+            }],
+            total_size: crate::bulkstat::SizeInfo::default(),
+            available: true,
+        }];
+        app.project_deps = vec![packages::ProjectDeps {
+            path: root.clone(),
+            manager_label: "cargo",
+            manifest: "Cargo.toml",
+            dep_count: 3,
+            deps_size: None,
+            deps_dir: Some(root.join("target")),
+        }];
+        app.packages_loaded = true;
+        app.focus = Focus::Packages;
+        app.pkg_view = app::PkgView::SystemManagers;
+        app.selected_pkg = 0;
+
+        let target = selected_action_target(&app).unwrap();
+        assert_eq!(target.0, pkg_path);
+        assert_eq!(target.1, "cargo diskr");
+
+        app.pkg_view = app::PkgView::ProjectDeps;
+        let target = selected_action_target(&app).unwrap();
+        assert_eq!(target.0, root.join("target"));
+        assert_eq!(target.1, format!("cargo {}", root.display()));
         fs::remove_dir_all(root).unwrap();
     }
 

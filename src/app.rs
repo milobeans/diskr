@@ -4,10 +4,12 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::bulkstat::SizeInfo;
+use crate::packages::{self, ManagerReport, ProjectDeps};
 use crate::scanner::{ScanId, ScanMsg, Scanner};
 
 const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -16,6 +18,7 @@ const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
 pub enum Focus {
     Files,
     Disks,
+    Packages,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,12 +60,19 @@ pub struct App {
     pub entries: Vec<Entry>,
     pub selected: usize,
     pub selected_disk: usize,
+    pub selected_pkg: usize,
     pub show_hidden: bool,
     pub sort: SortMode,
     pub focus: Focus,
     pub disks: Vec<DiskInfo>,
     pub status: String,
     pub confirming_delete: bool,
+
+    pub pkg_reports: Vec<ManagerReport>,
+    pub project_deps: Vec<ProjectDeps>,
+    pub pkg_view: PkgView,
+    pub packages_loaded: bool,
+    pub packages_loading: bool,
 
     pending_delete: Option<Entry>,
     size_cache: HashMap<PathBuf, SizeInfo>,
@@ -72,6 +82,30 @@ pub struct App {
 
     scan_rx: Receiver<ScanMsg>,
     scanner: Scanner,
+    active_pkg_scan_id: ScanId,
+    pkg_scan_rx: Option<Receiver<PkgScanMsg>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PkgView {
+    SystemManagers,
+    ProjectDeps,
+}
+
+struct PkgScanMsg {
+    scan_id: ScanId,
+    reports: Vec<ManagerReport>,
+    project_deps: Vec<ProjectDeps>,
+    include_managers: bool,
+}
+
+impl PkgView {
+    pub fn label(self) -> &'static str {
+        match self {
+            PkgView::SystemManagers => "system",
+            PkgView::ProjectDeps => "projects",
+        }
+    }
 }
 
 impl App {
@@ -82,12 +116,18 @@ impl App {
             entries: Vec::new(),
             selected: 0,
             selected_disk: 0,
+            selected_pkg: 0,
             show_hidden: false,
             sort: SortMode::SizeDesc,
             focus: Focus::Files,
             disks: Vec::new(),
             status: String::from("Space preview · f Finder · O open"),
             confirming_delete: false,
+            pkg_reports: Vec::new(),
+            project_deps: Vec::new(),
+            pkg_view: PkgView::SystemManagers,
+            packages_loaded: false,
+            packages_loading: false,
             pending_delete: None,
             size_cache: HashMap::new(),
             last_sort: Instant::now(),
@@ -95,6 +135,8 @@ impl App {
             active_scan_id: 0,
             scanner: Scanner::new(tx.clone()),
             scan_rx: rx,
+            active_pkg_scan_id: 0,
+            pkg_scan_rx: None,
         };
         app.refresh_disks();
         app.reload()?;
@@ -226,6 +268,14 @@ impl App {
                 let s = self.selected_disk as i32 + delta;
                 self.selected_disk = s.rem_euclid(n) as usize;
             }
+            Focus::Packages => {
+                let n = self.pkg_item_count() as i32;
+                if n == 0 {
+                    return;
+                }
+                let s = self.selected_pkg as i32 + delta;
+                self.selected_pkg = s.rem_euclid(n) as usize;
+            }
         }
     }
 
@@ -251,6 +301,7 @@ impl App {
                     self.reload()?;
                 }
             }
+            Focus::Packages => {}
         }
         Ok(())
     }
@@ -369,11 +420,12 @@ impl App {
             self.apply_sort_preserving_selection();
             changed = true;
         }
+        changed |= self.drain_package_results();
         changed
     }
 
     pub fn has_pending_scan_work(&self) -> bool {
-        self.sort_dirty || self.entries.iter().any(|entry| entry.scanning)
+        self.sort_dirty || self.entries.iter().any(|entry| entry.scanning) || self.packages_loading
     }
 
     pub fn request_delete(&mut self) {
@@ -453,6 +505,133 @@ impl App {
                 self.status = format!("could not start scanner: {err}");
             }
         }
+    }
+
+    fn request_package_scan(&mut self, include_managers: bool) {
+        let scan_id = self.next_pkg_scan_id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cwd = self.cwd.clone();
+
+        self.packages_loading = true;
+        self.pkg_scan_rx = Some(rx);
+        self.status = if include_managers {
+            String::from("scanning packages…")
+        } else {
+            String::from("refreshing project dependencies…")
+        };
+
+        thread::spawn(move || {
+            let reports = if include_managers {
+                packages::scan_managers()
+            } else {
+                Vec::new()
+            };
+            let project_deps = packages::find_project_deps(&cwd, 5);
+            let _ = tx.send(PkgScanMsg {
+                scan_id,
+                reports,
+                project_deps,
+                include_managers,
+            });
+        });
+    }
+
+    fn next_pkg_scan_id(&mut self) -> ScanId {
+        self.active_pkg_scan_id = self.active_pkg_scan_id.saturating_add(1);
+        self.active_pkg_scan_id
+    }
+
+    fn drain_package_results(&mut self) -> bool {
+        loop {
+            let recv = match self.pkg_scan_rx.as_ref() {
+                Some(rx) => rx.try_recv(),
+                None => return false,
+            };
+
+            match recv {
+                Ok(msg) => {
+                    if msg.scan_id != self.active_pkg_scan_id {
+                        continue;
+                    }
+                    if msg.include_managers {
+                        self.pkg_reports = msg.reports;
+                        self.packages_loaded = true;
+                    }
+                    self.project_deps = msg.project_deps;
+                    self.selected_pkg = self
+                        .selected_pkg
+                        .min(self.pkg_item_count().saturating_sub(1));
+                    self.packages_loading = false;
+                    self.pkg_scan_rx = None;
+                    self.status = if msg.include_managers {
+                        let total: usize = self.pkg_reports.iter().map(|r| r.packages.len()).sum();
+                        format!(
+                            "{} packages across {} managers · {} projects",
+                            total,
+                            self.pkg_reports.iter().filter(|r| r.available).count(),
+                            self.project_deps.len()
+                        )
+                    } else {
+                        format!(
+                            "project dependencies refreshed · {} projects",
+                            self.project_deps.len()
+                        )
+                    };
+                    return true;
+                }
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => {
+                    self.packages_loading = false;
+                    self.pkg_scan_rx = None;
+                    self.status = String::from("package scan failed");
+                    return true;
+                }
+            }
+        }
+    }
+
+    pub fn load_packages(&mut self) {
+        if self.packages_loaded {
+            self.reload_project_deps();
+            return;
+        }
+        self.request_package_scan(true);
+    }
+
+    pub fn refresh_packages(&mut self) {
+        self.request_package_scan(true);
+    }
+
+    pub fn reload_project_deps(&mut self) {
+        self.request_package_scan(false);
+    }
+
+    pub fn toggle_pkg_view(&mut self) {
+        self.pkg_view = match self.pkg_view {
+            PkgView::SystemManagers => PkgView::ProjectDeps,
+            PkgView::ProjectDeps => PkgView::SystemManagers,
+        };
+        self.selected_pkg = 0;
+    }
+
+    pub fn pkg_item_count(&self) -> usize {
+        match self.pkg_view {
+            PkgView::SystemManagers => self.flat_packages().len(),
+            PkgView::ProjectDeps => self.project_deps.len(),
+        }
+    }
+
+    pub fn flat_packages(&self) -> Vec<(&packages::Package, packages::Manager)> {
+        let mut out = Vec::new();
+        for report in &self.pkg_reports {
+            if !report.available {
+                continue;
+            }
+            for pkg in &report.packages {
+                out.push((pkg, report.manager));
+            }
+        }
+        out
     }
 
     pub fn refresh_disks(&mut self) {

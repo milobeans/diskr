@@ -2,7 +2,7 @@
 
 `diskr` is a lightweight terminal file explorer and disk/storage manager for macOS.
 
-It shows a navigable file list, recursive directory sizes, allocated-vs-apparent size details, disk usage gauges, hidden-file toggling, sorting, largest-file reports, reclaimable-space detection, scan baselines with diffing, and safe deletion through the macOS Trash. The disk pane is selectable, so you can jump directly to mounted volumes.
+It shows a navigable file list, recursive directory sizes, allocated-vs-apparent size details, disk usage gauges, hidden-file toggling, sorting, largest-file reports, package/dependency inspection, reclaimable-space detection, scan baselines with diffing, and safe deletion through the macOS Trash. The disk and packages panes are selectable, so you can jump directly to mounted volumes and package paths.
 
 ## Install
 
@@ -69,6 +69,7 @@ diskr --top 20 --json ~/Downloads
 diskr --reclaim --json ~
 diskr --diff --json ~/Downloads
 diskr --space --json ~
+diskr --packages --json ~
 ```
 
 To preview a Time Machine local snapshot thinning request:
@@ -88,7 +89,8 @@ diskr --thin-snapshots 10G --yes ~
 | Key | Action |
 | --- | --- |
 | Up/Down, j/k | Move selection |
-| Enter | Open selected directory or disk |
+| Enter | Open selected directory, disk, or package path |
+| p | Open packages pane or switch package view |
 | Backspace | Go to parent directory |
 | Space | Quick Look selected item |
 | f | Reveal selected item in Finder |
@@ -97,7 +99,7 @@ diskr --thin-snapshots 10G --yes ~
 | o | Cycle sort mode |
 | . | Toggle hidden files |
 | d | Move selected item to Trash |
-| Tab | Switch files/disks pane |
+| Tab | Switch files/disks/packages pane |
 | q, Esc | Quit |
 
 ## Notes
