@@ -118,3 +118,30 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
 cargo package --locked
 ```
+
+## Releases
+
+Releases are automated through GitHub Actions and appear in the GitHub Releases tab.
+
+One-time setup:
+
+1. Add a repository secret named `CARGO_REGISTRY_TOKEN` with a crates.io API token that has publish access for `diskr`.
+
+Release flow:
+
+1. Update `Cargo.toml` to the new crate version.
+2. Refresh `Cargo.lock` if needed and push the version bump to `main`.
+3. Create and push a matching tag like `v0.1.11`.
+
+```sh
+git tag -a v0.1.11 -m "v0.1.11"
+git push origin v0.1.11
+```
+
+When that tag is pushed, the `Release` workflow will:
+
+1. Verify the tag matches the crate version.
+2. Verify the tagged commit is reachable from `main`.
+3. Run the full release validation set.
+4. Publish the crate to crates.io if that version is not already published.
+5. Create or update the matching GitHub release with generated notes.
