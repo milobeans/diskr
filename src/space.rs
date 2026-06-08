@@ -1,7 +1,5 @@
 use anyhow::{bail, Context, Result};
-use plist::Value;
 use std::ffi::CString;
-use std::io::Cursor;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -210,35 +208,7 @@ fn apfs_container_for_mount(mount: &Path) -> Result<Option<ApfsContainer>> {
         return Ok(None);
     }
 
-    let value = Value::from_reader(Cursor::new(output.stdout)).context("parse diskutil plist")?;
-    let Some(dict) = value.as_dictionary() else {
-        return Ok(None);
-    };
-
-    let Some(reference) = dict
-        .get("APFSContainerReference")
-        .and_then(Value::as_string)
-    else {
-        return Ok(None);
-    };
-    let Some(size) = dict
-        .get("APFSContainerSize")
-        .and_then(Value::as_unsigned_integer)
-    else {
-        return Ok(None);
-    };
-    let Some(free) = dict
-        .get("APFSContainerFree")
-        .and_then(Value::as_unsigned_integer)
-    else {
-        return Ok(None);
-    };
-
-    Ok(Some(ApfsContainer {
-        reference: reference.to_string(),
-        size,
-        free,
-    }))
+    parse_apfs_container_plist(&output.stdout)
 }
 
 fn parse_tmutil_snapshot_names(output: &str) -> Vec<String> {
@@ -258,6 +228,50 @@ fn c_char_array_to_string(chars: &[libc::c_char]) -> String {
     unsafe { std::ffi::CStr::from_ptr(chars.as_ptr()) }
         .to_string_lossy()
         .into_owned()
+}
+
+fn parse_apfs_container_plist(plist: &[u8]) -> Result<Option<ApfsContainer>> {
+    let plist = std::str::from_utf8(plist).context("diskutil plist was not utf-8")?;
+    let Some(reference) = extract_plist_string(plist, "APFSContainerReference") else {
+        return Ok(None);
+    };
+    let Some(size) = extract_plist_u64(plist, "APFSContainerSize")? else {
+        return Ok(None);
+    };
+    let Some(free) = extract_plist_u64(plist, "APFSContainerFree")? else {
+        return Ok(None);
+    };
+
+    Ok(Some(ApfsContainer {
+        reference,
+        size,
+        free,
+    }))
+}
+
+fn extract_plist_string(plist: &str, key: &str) -> Option<String> {
+    extract_plist_scalar(plist, key, "string").map(ToOwned::to_owned)
+}
+
+fn extract_plist_u64(plist: &str, key: &str) -> Result<Option<u64>> {
+    let Some(raw) = extract_plist_scalar(plist, key, "integer") else {
+        return Ok(None);
+    };
+    raw.parse::<u64>()
+        .with_context(|| format!("invalid integer value for plist key {key}"))
+        .map(Some)
+}
+
+fn extract_plist_scalar<'a>(plist: &'a str, key: &str, tag: &str) -> Option<&'a str> {
+    let key_marker = format!("<key>{key}</key>");
+    let start = plist.find(&key_marker)? + key_marker.len();
+    let tail = &plist[start..];
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let value_start = tail.find(&open)? + open.len();
+    let tail = &tail[value_start..];
+    let value_end = tail.find(&close)?;
+    Some(&tail[..value_end])
 }
 
 #[cfg(test)]
@@ -295,5 +309,58 @@ com.apple.os.update-MSUPrepareUpdate
                 "com.apple.os.update-MSUPrepareUpdate"
             ]
         );
+    }
+
+    #[test]
+    fn parse_apfs_container_plist_extracts_required_fields() {
+        let plist = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>APFSContainerFree</key>
+    <integer>123</integer>
+    <key>APFSContainerReference</key>
+    <string>disk3</string>
+    <key>APFSContainerSize</key>
+    <integer>456</integer>
+</dict>
+</plist>
+"#;
+
+        let container = parse_apfs_container_plist(plist).unwrap().unwrap();
+        assert_eq!(container.reference, "disk3");
+        assert_eq!(container.free, 123);
+        assert_eq!(container.size, 456);
+    }
+
+    #[test]
+    fn parse_apfs_container_plist_returns_none_when_fields_are_missing() {
+        let plist = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>FilesystemType</key>
+    <string>apfs</string>
+</dict>
+</plist>
+"#;
+
+        assert!(parse_apfs_container_plist(plist).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_apfs_container_plist_rejects_invalid_integer_fields() {
+        let plist = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>APFSContainerFree</key>
+    <integer>nope</integer>
+    <key>APFSContainerReference</key>
+    <string>disk3</string>
+    <key>APFSContainerSize</key>
+    <integer>456</integer>
+</dict>
+</plist>
+"#;
+
+        assert!(parse_apfs_container_plist(plist).is_err());
     }
 }
