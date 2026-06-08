@@ -254,16 +254,56 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(border_color));
 
     if !app.packages_loaded {
-        let message = if app.packages_loading {
-            format!("{} scanning packages…", spinner_char())
+        let block_inner = block.inner(area);
+        f.render_widget(block, area);
+
+        if app.packages_loading {
+            if block_inner.height >= 7 {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(1),
+                        Constraint::Length(1), // Title
+                        Constraint::Length(1), // Activity bar
+                        Constraint::Length(1), // Spacing
+                        Constraint::Length(1), // Subtitle 1
+                        Constraint::Length(1), // Subtitle 2
+                        Constraint::Min(1),
+                    ])
+                    .split(block_inner);
+
+                let title = Line::from(vec![
+                    Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled("Scanning Package Managers & Projects…", Style::default().add_modifier(Modifier::BOLD).fg(Color::White)),
+                ]);
+                f.render_widget(Paragraph::new(title).alignment(Alignment::Center), chunks[1]);
+
+                let act_bar = activity_bar(block_inner.width as usize);
+                let bar_line = Line::from(Span::styled(act_bar, Style::default().fg(Color::Cyan)));
+                f.render_widget(Paragraph::new(bar_line).alignment(Alignment::Center), chunks[2]);
+
+                let sub1 = Line::from(Span::styled("Locating global formula, casks, npm, cargo, pip, and bun.", Style::default().fg(Color::Gray)));
+                f.render_widget(Paragraph::new(sub1).alignment(Alignment::Center), chunks[4]);
+
+                let sub2 = Line::from(Span::styled("Searching node_modules, target, and virtualenv folders…", Style::default().fg(Color::Gray)));
+                f.render_widget(Paragraph::new(sub2).alignment(Alignment::Center), chunks[5]);
+            } else {
+                let message = Line::from(vec![
+                    Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled("Scanning packages…", Style::default().fg(Color::White)),
+                ]);
+                let text = Paragraph::new(message)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: true });
+                f.render_widget(text, block_inner);
+            }
         } else {
-            String::from("press p to scan packages")
-        };
-        let text = Paragraph::new(message)
-            .block(block)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true });
-        f.render_widget(text, area);
+            let message = "press p to scan packages";
+            let text = Paragraph::new(message)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true });
+            f.render_widget(text, block_inner);
+        }
         return;
     }
 
@@ -367,10 +407,7 @@ fn package_line(
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![Span::styled(
-        selection_status(app),
-        Style::default().fg(Color::White),
-    )];
+    let mut spans = selection_status(app);
     if !app.status.is_empty() {
         spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(&app.status, Style::default().fg(Color::Gray)));
@@ -509,27 +546,39 @@ fn truncate_start(s: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-fn selection_status(app: &App) -> String {
+fn selection_status(app: &App) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
     match app.focus {
         Focus::Files => match app.entries.get(app.selected) {
             Some(entry) if entry.is_dir && entry.scanning => {
-                format!("dir {} · scanning size", truncate(&entry.name, 28))
+                spans.push(Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled("dir ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(truncate(&entry.name, 28), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(" · scanning size", Style::default().fg(Color::Gray)));
             }
             Some(entry) if entry.is_dir => {
+                spans.push(Span::styled("dir ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(truncate(&entry.name, 28), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
                 let size = entry
                     .size
                     .map(size_detail)
                     .unwrap_or_else(|| String::from("—"));
-                format!("dir {} · {}", truncate(&entry.name, 28), size)
+                spans.push(Span::styled(size, Style::default().fg(Color::Green)));
             }
             Some(entry) => {
+                spans.push(Span::styled("file ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(truncate(&entry.name, 28), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
                 let size = entry
                     .size
                     .map(size_detail)
                     .unwrap_or_else(|| String::from("?"));
-                format!("file {} · {}", truncate(&entry.name, 28), size)
+                spans.push(Span::styled(size, Style::default().fg(Color::Green)));
             }
-            None => String::from("no files in view"),
+            None => {
+                spans.push(Span::styled("no files in view", Style::default().fg(Color::Gray)));
+            }
         },
         Focus::Disks => match app.disks.get(app.selected_disk) {
             Some(disk) => {
@@ -540,16 +589,23 @@ fn selection_status(app: &App) -> String {
                 } else {
                     disk.name.clone()
                 };
-                format!("disk {} · {} free of {}", truncate(&label, 28), free, total)
+                spans.push(Span::styled("disk ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(truncate(&label, 28), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(format!(" · {free} free of {total}"), Style::default().fg(Color::Gray)));
             }
-            None => String::from("no disks available"),
+            None => {
+                spans.push(Span::styled("no disks available", Style::default().fg(Color::Gray)));
+            }
         },
         Focus::Packages => {
             if app.packages_loading {
-                return format!("{} scanning packages", spinner_char());
+                spans.push(Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled("scanning packages", Style::default().fg(Color::White)));
+                return spans;
             }
             if !app.packages_loaded {
-                return String::from("packages not scanned");
+                spans.push(Span::styled("packages not scanned", Style::default().fg(Color::Gray)));
+                return spans;
             }
             match app.pkg_view {
                 PkgView::SystemManagers => {
@@ -560,14 +616,14 @@ fn selection_status(app: &App) -> String {
                                 .size
                                 .map(size_detail)
                                 .unwrap_or_else(|| String::from("?"));
-                            format!(
-                                "{} package {} · {}",
-                                manager.label(),
-                                truncate(&package.name, 28),
-                                size
-                            )
+                            spans.push(Span::styled(format!("{} package ", manager.label()), Style::default().fg(Color::DarkGray)));
+                            spans.push(Span::styled(truncate(&package.name, 28), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+                            spans.push(Span::styled(size, Style::default().fg(Color::Green)));
                         }
-                        None => String::from("no packages in view"),
+                        None => {
+                            spans.push(Span::styled("no packages in view", Style::default().fg(Color::Gray)));
+                        }
                     }
                 }
                 PkgView::ProjectDeps => match app.project_deps.get(app.selected_pkg) {
@@ -576,16 +632,17 @@ fn selection_status(app: &App) -> String {
                             .deps_size
                             .map(size_detail)
                             .unwrap_or_else(|| String::from("—"));
-                        format!(
-                            "{} project · {} deps · {}",
-                            dep.manager_label, dep.dep_count, size
-                        )
+                        spans.push(Span::styled(format!("{} project · {} deps · ", dep.manager_label, dep.dep_count), Style::default().fg(Color::Gray)));
+                        spans.push(Span::styled(size, Style::default().fg(Color::Green)));
                     }
-                    None => String::from("no project dependencies in view"),
+                    None => {
+                        spans.push(Span::styled("no project dependencies in view", Style::default().fg(Color::Gray)));
+                    }
                 },
             }
         }
     }
+    spans
 }
 
 fn size_detail(size: SizeInfo) -> String {
@@ -687,4 +744,29 @@ fn spinner_char() -> char {
         .unwrap_or(0);
     let index = ((ms / 80) % spinners.len() as u128) as usize;
     spinners[index]
+}
+
+fn activity_bar(width: usize) -> String {
+    let bar_width = 30.min(width.saturating_sub(10)).max(10);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    
+    let period = 1500; // 1.5 seconds back and forth
+    let pos_t = (ms % period) as f64 / period as f64; // 0.0 to 1.0
+    let pos = if pos_t < 0.5 { pos_t * 2.0 } else { 2.0 - pos_t * 2.0 };
+    
+    let active_pos = (pos * (bar_width - 1) as f64).round() as usize;
+    
+    let mut bar = vec![' '; bar_width];
+    if active_pos > 0 {
+        bar[active_pos - 1] = '░';
+    }
+    bar[active_pos] = '█';
+    if active_pos + 1 < bar_width {
+        bar[active_pos + 1] = '░';
+    }
+    
+    format!("▕{}▏", bar.into_iter().collect::<String>())
 }
