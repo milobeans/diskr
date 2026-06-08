@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 
 use crate::bulkstat::{self, SizeInfo};
 
@@ -72,7 +73,23 @@ pub struct ProjectDeps {
 }
 
 pub fn scan_managers() -> Vec<ManagerReport> {
-    Manager::ALL.iter().map(|m| scan_manager(*m)).collect()
+    let mut handles = Vec::with_capacity(Manager::ALL.len());
+    for (index, manager) in Manager::ALL.iter().copied().enumerate() {
+        handles.push((index, manager, thread::spawn(move || scan_manager(manager))));
+    }
+
+    let mut reports = vec![None; Manager::ALL.len()];
+    for (index, manager, handle) in handles {
+        let report = handle.join().unwrap_or_else(|_| ManagerReport {
+            manager,
+            packages: Vec::new(),
+            total_size: SizeInfo::default(),
+            available: false,
+        });
+        reports[index] = Some(report);
+    }
+
+    reports.into_iter().flatten().collect()
 }
 
 fn scan_manager(manager: Manager) -> ManagerReport {
@@ -566,13 +583,29 @@ fn count_composer_deps(content: &str) -> usize {
 }
 
 fn command_exists(cmd: &str) -> bool {
-    Command::new("which")
-        .arg(cmd)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    std::env::split_paths(&paths).any(|dir| is_executable(dir.join(cmd)))
+}
+
+fn is_executable(path: PathBuf) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn run_command(cmd: &str, args: &[&str]) -> String {

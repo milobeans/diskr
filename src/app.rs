@@ -1,9 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,6 +42,7 @@ impl SortMode {
 #[derive(Clone)]
 pub struct Entry {
     pub name: String,
+    pub name_lower: String,
     pub path: PathBuf,
     pub is_dir: bool,
     pub size: Option<SizeInfo>,
@@ -84,8 +86,20 @@ pub struct App {
     pub packages_loaded: bool,
     pub packages_loading: bool,
 
+    pub search_mode: bool,
+    pub search_query: String,
+    pub search_matches: Vec<usize>,
+
+    pub scan_total: usize,
+    pub scan_completed: usize,
+
+    pub files_area: ratatui_core::layout::Rect,
+    pub file_list_offset: usize,
+
     pending_delete: Option<DeleteTarget>,
     size_cache: HashMap<PathBuf, SizeInfo>,
+    entry_index: HashMap<PathBuf, usize>,
+    cached_flat_packages: Vec<(packages::Package, packages::Manager)>,
     last_sort: Instant,
     sort_dirty: bool,
     active_scan_id: ScanId,
@@ -133,8 +147,17 @@ impl App {
             pkg_view: PkgView::SystemManagers,
             packages_loaded: false,
             packages_loading: false,
+            search_mode: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            scan_total: 0,
+            scan_completed: 0,
+            files_area: ratatui_core::layout::Rect::default(),
+            file_list_offset: 0,
             pending_delete: None,
             size_cache: HashMap::new(),
+            entry_index: HashMap::new(),
+            cached_flat_packages: Vec::new(),
             last_sort: Instant::now(),
             sort_dirty: false,
             active_scan_id: 0,
@@ -170,6 +193,7 @@ impl App {
 
     fn rebuild_entries(&mut self) -> Result<()> {
         self.entries.clear();
+        self.entry_index.clear();
         let read = match std::fs::read_dir(&self.cwd) {
             Ok(r) => r,
             Err(e) => {
@@ -200,8 +224,12 @@ impl App {
                 })
             };
             let modified = meta.as_ref().and_then(|m| m.modified().ok());
+            let name_lower = name.to_lowercase();
+            let idx = self.entries.len();
+            self.entry_index.insert(path.clone(), idx);
             self.entries.push(Entry {
                 name,
+                name_lower,
                 path,
                 is_dir,
                 size,
@@ -210,7 +238,15 @@ impl App {
             });
         }
         self.apply_sort();
+        self.rebuild_entry_index();
         Ok(())
+    }
+
+    fn rebuild_entry_index(&mut self) {
+        self.entry_index.clear();
+        for (i, entry) in self.entries.iter().enumerate() {
+            self.entry_index.insert(entry.path.clone(), i);
+        }
     }
 
     pub fn apply_sort(&mut self) {
@@ -218,7 +254,7 @@ impl App {
             SortMode::Name => self.entries.sort_by(|a, b| {
                 b.is_dir
                     .cmp(&a.is_dir)
-                    .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                    .then(a.name_lower.cmp(&b.name_lower))
             }),
             SortMode::SizeDesc => self
                 .entries
@@ -258,10 +294,11 @@ impl App {
         }
         match self.focus {
             Focus::Files => {
-                if self.entries.is_empty() {
+                let item_count = self.visible_entry_count();
+                if item_count == 0 {
                     return;
                 }
-                let n = self.entries.len() as i32;
+                let n = item_count as i32;
                 let s = self.selected as i32 + delta;
                 self.selected = s.rem_euclid(n) as usize;
             }
@@ -284,17 +321,82 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn page_move(&mut self, pages: i32) {
+        let height = self.files_area.height.saturating_sub(2).max(1) as i32;
+        self.move_cursor(pages * height);
+    }
+
+    #[allow(dead_code)]
+    pub fn move_to_start(&mut self) {
+        match self.focus {
+            Focus::Files => self.selected = 0,
+            Focus::Disks => self.selected_disk = 0,
+            Focus::Packages => self.selected_pkg = 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn move_to_end(&mut self) {
+        match self.focus {
+            Focus::Files => {
+                let n = self.visible_entry_count();
+                if n > 0 {
+                    self.selected = n - 1;
+                }
+            }
+            Focus::Disks => {
+                let n = self.disks.len();
+                if n > 0 {
+                    self.selected_disk = n - 1;
+                }
+            }
+            Focus::Packages => {
+                let n = self.pkg_item_count();
+                if n > 0 {
+                    self.selected_pkg = n - 1;
+                }
+            }
+        }
+    }
+
+    pub fn visible_entry_count(&self) -> usize {
+        if self.search_mode && !self.search_query.is_empty() {
+            self.search_matches.len()
+        } else {
+            self.entries.len()
+        }
+    }
+
+    pub fn visible_entry_index(&self, visible_index: usize) -> Option<usize> {
+        if self.search_mode && !self.search_query.is_empty() {
+            self.search_matches.get(visible_index).copied()
+        } else if visible_index < self.entries.len() {
+            Some(visible_index)
+        } else {
+            None
+        }
+    }
+
+    pub fn visible_entry(&self, visible_index: usize) -> Option<&Entry> {
+        self.visible_entry_index(visible_index)
+            .and_then(|idx| self.entries.get(idx))
+    }
+
     pub fn enter(&mut self) -> Result<()> {
         if self.confirming_delete {
             return Ok(());
         }
         match self.focus {
             Focus::Files => {
-                if let Some(entry) = self.entries.get(self.selected).cloned() {
-                    if entry.is_dir {
-                        self.cwd = entry.path;
-                        self.selected = 0;
-                        self.reload()?;
+                if let Some(entry_idx) = self.visible_entry_index(self.selected) {
+                    if let Some(entry) = self.entries.get(entry_idx).cloned() {
+                        if entry.is_dir {
+                            self.exit_search();
+                            self.cwd = entry.path;
+                            self.selected = 0;
+                            self.reload()?;
+                        }
                     }
                 }
             }
@@ -402,11 +504,14 @@ impl App {
                     size,
                 } if scan_id == self.active_scan_id => {
                     self.size_cache.insert(path.clone(), size);
-                    if let Some(e) = self.entries.iter_mut().find(|e| e.path == path) {
-                        e.size = Some(size);
-                        e.scanning = false;
-                        changed = true;
+                    if let Some(&idx) = self.entry_index.get(&path) {
+                        if let Some(e) = self.entries.get_mut(idx) {
+                            e.size = Some(size);
+                            e.scanning = false;
+                            changed = true;
+                        }
                     }
+                    self.scan_completed += 1;
                     if self.sort == SortMode::SizeDesc {
                         self.sort_dirty = true;
                     }
@@ -439,9 +544,11 @@ impl App {
         }
         match self.focus {
             Focus::Files => {
-                if let Some(entry) = self.entries.get(self.selected).cloned() {
-                    self.pending_delete = Some(DeleteTarget::FileEntry(entry));
-                    self.confirming_delete = true;
+                if let Some(entry_idx) = self.visible_entry_index(self.selected) {
+                    if let Some(entry) = self.entries.get(entry_idx).cloned() {
+                        self.pending_delete = Some(DeleteTarget::FileEntry(entry));
+                        self.confirming_delete = true;
+                    }
                 }
             }
             Focus::Disks => {
@@ -449,7 +556,7 @@ impl App {
             }
             Focus::Packages => match self.pkg_view {
                 PkgView::SystemManagers => {
-                    let packages = self.flat_packages();
+                    let packages = &self.cached_flat_packages;
                     if let Some((package, manager)) = packages.get(self.selected_pkg) {
                         if let Some(path) = &package.path {
                             self.pending_delete = Some(DeleteTarget::Package {
@@ -563,6 +670,8 @@ impl App {
     }
 
     fn start_scan(&mut self, scan_id: ScanId, dirs: Vec<PathBuf>, status: String) {
+        self.scan_total = dirs.len();
+        self.scan_completed = 0;
         match self.scanner.scan_all(scan_id, dirs) {
             Ok(()) => self.status = status,
             Err(err) => {
@@ -629,13 +738,14 @@ impl App {
                         self.packages_loaded = true;
                     }
                     self.project_deps = msg.project_deps;
+                    self.rebuild_flat_packages();
                     self.selected_pkg = self
                         .selected_pkg
                         .min(self.pkg_item_count().saturating_sub(1));
                     self.packages_loading = false;
                     self.pkg_scan_rx = None;
                     self.status = if msg.include_managers {
-                        let total: usize = self.pkg_reports.iter().map(|r| r.packages.len()).sum();
+                        let total = self.cached_flat_packages.len();
                         format!(
                             "{} packages across {} managers · {} projects",
                             total,
@@ -687,27 +797,126 @@ impl App {
 
     pub fn pkg_item_count(&self) -> usize {
         match self.pkg_view {
-            PkgView::SystemManagers => self.flat_packages().len(),
+            PkgView::SystemManagers => self.cached_flat_packages.len(),
             PkgView::ProjectDeps => self.project_deps.len(),
         }
     }
 
-    pub fn flat_packages(&self) -> Vec<(&packages::Package, packages::Manager)> {
-        let mut out = Vec::new();
+    pub fn flat_packages(&self) -> &[(packages::Package, packages::Manager)] {
+        &self.cached_flat_packages
+    }
+
+    pub fn rebuild_flat_packages(&mut self) {
+        let mut pkgs: Vec<(packages::Package, packages::Manager)> = Vec::new();
         for report in &self.pkg_reports {
             if !report.available {
                 continue;
             }
             for pkg in &report.packages {
-                out.push((pkg, report.manager));
+                pkgs.push((pkg.clone(), report.manager));
             }
         }
-        out
+        pkgs.sort_by(|(a, _), (b, _)| {
+            let a_size = a.size.map(|s| s.allocated).unwrap_or(0);
+            let b_size = b.size.map(|s| s.allocated).unwrap_or(0);
+            b_size.cmp(&a_size).then(a.name.cmp(&b.name))
+        });
+        self.cached_flat_packages = pkgs;
     }
 
     pub fn refresh_disks(&mut self) {
         self.disks = disk_info();
         self.selected_disk = self.selected_disk.min(self.disks.len().saturating_sub(1));
+    }
+
+    #[allow(dead_code)]
+    pub fn enter_search(&mut self) {
+        self.search_mode = true;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.file_list_offset = 0;
+    }
+
+    pub fn exit_search(&mut self) {
+        self.search_mode = false;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.file_list_offset = 0;
+    }
+
+    #[allow(dead_code)]
+    pub fn search_push(&mut self, ch: char) {
+        self.search_query.push(ch);
+        self.update_search();
+    }
+
+    #[allow(dead_code)]
+    pub fn search_pop(&mut self) {
+        self.search_query.pop();
+        if self.search_query.is_empty() {
+            self.search_matches.clear();
+            self.selected = 0;
+            self.file_list_offset = 0;
+        } else {
+            self.update_search();
+        }
+    }
+
+    #[allow(dead_code)]
+    fn update_search(&mut self) {
+        let query = self.search_query.to_lowercase();
+        self.search_matches = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.name_lower.contains(&query))
+            .map(|(i, _)| i)
+            .collect();
+        self.selected = 0;
+        self.file_list_offset = 0;
+    }
+
+    #[allow(dead_code)]
+    pub fn copy_path_to_clipboard(&mut self) {
+        let Some(path) = self.selected_path() else {
+            self.status = String::from("nothing selected");
+            return;
+        };
+        match copy_to_clipboard(&path.display().to_string()) {
+            Ok(()) => self.status = format!("copied: {}", path.display()),
+            Err(e) => self.status = format!("copy failed: {e}"),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn open_shell(&mut self) -> Result<()> {
+        let shell = std::env::var_os("SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/bin/zsh"));
+        Command::new(&shell)
+            .current_dir(&self.cwd)
+            .spawn()
+            .context("open shell")?;
+        self.status = format!("opened {}", shell.display());
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn selected_path(&self) -> Option<PathBuf> {
+        match self.focus {
+            Focus::Files => self.visible_entry(self.selected).map(|e| e.path.clone()),
+            Focus::Disks => self.disks.get(self.selected_disk).map(|d| d.mount.clone()),
+            Focus::Packages => match self.pkg_view {
+                PkgView::SystemManagers => self
+                    .cached_flat_packages
+                    .get(self.selected_pkg)
+                    .and_then(|(p, _)| p.path.clone()),
+                PkgView::ProjectDeps => self
+                    .project_deps
+                    .get(self.selected_pkg)
+                    .map(|d| d.deps_dir.as_ref().unwrap_or(&d.path).clone()),
+            },
+        }
     }
 }
 
@@ -784,6 +993,23 @@ fn c_char_array_to_string(chars: &[libc::c_char]) -> String {
     unsafe { CStr::from_ptr(chars.as_ptr()) }
         .to_string_lossy()
         .into_owned()
+}
+
+#[allow(dead_code)]
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("spawn pbcopy")?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(text.as_bytes())
+            .context("write to pbcopy")?;
+    }
+    child.wait().context("wait for pbcopy")?;
+    Ok(())
 }
 
 #[cfg(test)]

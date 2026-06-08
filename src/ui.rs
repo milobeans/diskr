@@ -16,7 +16,7 @@ use ratatui_widgets::{
 use crate::app::{human, size_sort_key, App, Focus, PkgView};
 use crate::bulkstat::SizeInfo;
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -85,7 +85,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(text), area);
 }
 
-fn draw_files(f: &mut Frame, area: Rect, app: &App) {
+fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
+    app.files_area = area;
     let border_color = if app.focus == Focus::Files {
         Color::Yellow
     } else {
@@ -96,16 +97,26 @@ fn draw_files(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .title(format!("files ({})", app.entries.len()))
         .border_style(Style::default().fg(border_color));
-    if app.entries.is_empty() {
-        let empty = Paragraph::new("empty directory")
+    let visible_count = app.visible_entry_count();
+    if visible_count == 0 {
+        let message = if app.entries.is_empty() {
+            "empty directory"
+        } else {
+            "no matching entries"
+        };
+        let empty = Paragraph::new(message)
             .block(block)
             .alignment(Alignment::Center);
         f.render_widget(empty, area);
         return;
     }
-    let items: Vec<ListItem> = app
-        .entries
-        .iter()
+    let max_rows = area.height.saturating_sub(2).max(1) as usize;
+    let (offset, end) =
+        file_window_bounds(app.selected, visible_count, app.file_list_offset, max_rows);
+    app.file_list_offset = offset;
+
+    let items: Vec<ListItem> = (offset..end)
+        .filter_map(|visible_index| app.visible_entry(visible_index))
         .map(|e| {
             let size_str = match (e.is_dir, e.size, e.scanning) {
                 (true, _, true) => format!("{} scanning…", spinner_char()),
@@ -155,8 +166,33 @@ fn draw_files(f: &mut Frame, area: Rect, app: &App) {
         .highlight_symbol("▶ ");
 
     let mut state = ListState::default();
-    state.select(Some(app.selected));
+    state.select(Some(app.selected.saturating_sub(offset)));
     f.render_stateful_widget(list, area, &mut state);
+}
+
+fn file_window_bounds(
+    selected: usize,
+    total_items: usize,
+    current_offset: usize,
+    max_rows: usize,
+) -> (usize, usize) {
+    if total_items == 0 {
+        return (0, 0);
+    }
+
+    let max_rows = max_rows.max(1);
+    let max_offset = total_items.saturating_sub(max_rows);
+    let mut offset = current_offset.min(max_offset);
+    let selected = selected.min(total_items.saturating_sub(1));
+
+    if selected < offset {
+        offset = selected;
+    } else if selected >= offset + max_rows {
+        offset = selected + 1 - max_rows;
+    }
+
+    let end = (offset + max_rows).min(total_items);
+    (offset, end)
 }
 
 fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
@@ -377,15 +413,10 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
 
 fn package_items(app: &App, inner_width: u16) -> Vec<ListItem<'_>> {
     let (name_width, size_width) = package_columns(inner_width);
-    let mut packages = app.flat_packages();
-    packages.sort_by(|(a, _), (b, _)| {
-        let a_size = a.size.map(|s| s.allocated).unwrap_or(0);
-        let b_size = b.size.map(|s| s.allocated).unwrap_or(0);
-        b_size.cmp(&a_size).then(a.name.cmp(&b.name))
-    });
+    let packages = app.flat_packages();
 
     packages
-        .into_iter()
+        .iter()
         .map(|(package, manager)| {
             let size = package
                 .size
@@ -790,45 +821,7 @@ fn package_columns(inner_width: u16) -> (usize, usize) {
     (name_width, size_width)
 }
 
-fn spinner_char() -> char {
-    let spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let index = ((ms / 80) % spinners.len() as u128) as usize;
-    spinners[index]
-}
-
-fn activity_bar(width: usize) -> String {
-    let bar_width = 20.min(width.saturating_sub(10)).max(10);
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    let period = 2000; // 2 seconds back and forth
-    let pos_t = (ms % period) as f64 / period as f64; // 0.0 to 1.0
-    let pos = if pos_t < 0.5 {
-        pos_t * 2.0
-    } else {
-        2.0 - pos_t * 2.0
-    };
-
-    let active_pos = (pos * (bar_width - 1) as f64).round() as usize;
-
-    let mut bar = vec!['·'; bar_width];
-    bar[active_pos] = '●';
-
-    format!(
-        "  {}  ",
-        bar.into_iter()
-            .map(|c| format!("{c} "))
-            .collect::<String>()
-            .trim_end()
-    )
-}
-
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,4 +862,51 @@ mod tests {
     fn package_columns_hide_size_when_narrow() {
         assert_eq!(package_columns(12), (12, 0));
     }
+
+    #[test]
+    fn file_window_bounds_scrolls_to_keep_selection_visible() {
+        assert_eq!(file_window_bounds(0, 100, 0, 10), (0, 10));
+        assert_eq!(file_window_bounds(9, 100, 0, 10), (0, 10));
+        assert_eq!(file_window_bounds(10, 100, 0, 10), (1, 11));
+        assert_eq!(file_window_bounds(50, 100, 40, 10), (41, 51));
+    }
+}
+
+fn spinner_char() -> char {
+    let spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let index = ((ms / 80) % spinners.len() as u128) as usize;
+    spinners[index]
+}
+
+fn activity_bar(width: usize) -> String {
+    let bar_width = 20.min(width.saturating_sub(10)).max(10);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let period = 2000; // 2 seconds back and forth
+    let pos_t = (ms % period) as f64 / period as f64; // 0.0 to 1.0
+    let pos = if pos_t < 0.5 {
+        pos_t * 2.0
+    } else {
+        2.0 - pos_t * 2.0
+    };
+
+    let active_pos = (pos * (bar_width - 1) as f64).round() as usize;
+
+    let mut bar = vec!['·'; bar_width];
+    bar[active_pos] = '●';
+
+    format!(
+        "  {}  ",
+        bar.into_iter()
+            .map(|c| format!("{c} "))
+            .collect::<String>()
+            .trim_end()
+    )
 }

@@ -74,7 +74,7 @@ fn worker_count(dir_count: usize) -> usize {
     let available = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    dir_count.min(available.clamp(1, 4))
+    dir_count.min(available.clamp(1, 8))
 }
 
 #[cfg(test)]
@@ -87,6 +87,6 @@ mod tests {
         assert_eq!(worker_count(1), 1);
 
         let workers = worker_count(64);
-        assert!((1..=4).contains(&workers));
+        assert!((1..=8).contains(&workers));
     }
 }

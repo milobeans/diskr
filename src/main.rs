@@ -839,8 +839,7 @@ fn launch_external_action(app: &mut App, action: ExternalAction) {
 fn selected_action_target(app: &App) -> Option<(PathBuf, String)> {
     match app.focus {
         Focus::Files => app
-            .entries
-            .get(app.selected)
+            .visible_entry(app.selected)
             .map(|entry| (entry.path.clone(), entry.name.clone())),
         Focus::Disks => app.disks.get(app.selected_disk).map(|disk| {
             let label = if disk.name.is_empty() {
@@ -851,19 +850,16 @@ fn selected_action_target(app: &App) -> Option<(PathBuf, String)> {
             (disk.mount.clone(), label)
         }),
         Focus::Packages => match app.pkg_view {
-            app::PkgView::SystemManagers => {
-                let packages = app.flat_packages();
-                packages
-                    .get(app.selected_pkg)
-                    .and_then(|(package, manager)| {
-                        package.path.as_ref().map(|path| {
-                            (
-                                path.clone(),
-                                format!("{} {}", manager.label(), package.name),
-                            )
-                        })
+            app::PkgView::SystemManagers => app.flat_packages().get(app.selected_pkg).and_then(
+                |(package, manager): &(packages::Package, packages::Manager)| {
+                    package.path.as_ref().map(|path| {
+                        (
+                            path.clone(),
+                            format!("{} {}", manager.label(), package.name),
+                        )
                     })
-            }
+                },
+            ),
             app::PkgView::ProjectDeps => app.project_deps.get(app.selected_pkg).map(|dep| {
                 let path = dep.deps_dir.as_ref().unwrap_or(&dep.path).clone();
                 (
@@ -1307,6 +1303,7 @@ mod tests {
             deps_dir: Some(root.join("target")),
         }];
         app.packages_loaded = true;
+        app.rebuild_flat_packages();
         app.focus = Focus::Packages;
         app.pkg_view = app::PkgView::SystemManagers;
         app.selected_pkg = 0;
