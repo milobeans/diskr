@@ -258,39 +258,34 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(block, area);
 
         if app.packages_loading {
-            if block_inner.height >= 7 {
+            if block_inner.height >= 6 {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Min(1),
                         Constraint::Length(1), // Title
                         Constraint::Length(1), // Activity bar
-                        Constraint::Length(1), // Spacing
-                        Constraint::Length(1), // Subtitle 1
-                        Constraint::Length(1), // Subtitle 2
+                        Constraint::Length(1), // Subtitle
                         Constraint::Min(1),
                     ])
                     .split(block_inner);
 
                 let title = Line::from(vec![
-                    Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::styled("Scanning Package Managers & Projects…", Style::default().add_modifier(Modifier::BOLD).fg(Color::White)),
+                    Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Cyan)),
+                    Span::styled("scanning package data…", Style::default().fg(Color::White)),
                 ]);
                 f.render_widget(Paragraph::new(title).alignment(Alignment::Center), chunks[1]);
 
                 let act_bar = activity_bar(block_inner.width as usize);
-                let bar_line = Line::from(Span::styled(act_bar, Style::default().fg(Color::Cyan)));
+                let bar_line = Line::from(Span::styled(act_bar, Style::default().fg(Color::DarkGray)));
                 f.render_widget(Paragraph::new(bar_line).alignment(Alignment::Center), chunks[2]);
 
-                let sub1 = Line::from(Span::styled("Locating global formula, casks, npm, cargo, pip, and bun.", Style::default().fg(Color::Gray)));
-                f.render_widget(Paragraph::new(sub1).alignment(Alignment::Center), chunks[4]);
-
-                let sub2 = Line::from(Span::styled("Searching node_modules, target, and virtualenv folders…", Style::default().fg(Color::Gray)));
-                f.render_widget(Paragraph::new(sub2).alignment(Alignment::Center), chunks[5]);
+                let sub = Line::from(Span::styled("checking package managers and project dependencies", Style::default().fg(Color::DarkGray)));
+                f.render_widget(Paragraph::new(sub).alignment(Alignment::Center), chunks[3]);
             } else {
                 let message = Line::from(vec![
-                    Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::styled("Scanning packages…", Style::default().fg(Color::White)),
+                    Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Cyan)),
+                    Span::styled("scanning…", Style::default().fg(Color::White)),
                 ]);
                 let text = Paragraph::new(message)
                     .alignment(Alignment::Center)
@@ -551,7 +546,7 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
     match app.focus {
         Focus::Files => match app.entries.get(app.selected) {
             Some(entry) if entry.is_dir && entry.scanning => {
-                spans.push(Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Cyan)));
                 spans.push(Span::styled("dir ", Style::default().fg(Color::DarkGray)));
                 spans.push(Span::styled(truncate(&entry.name, 28), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
                 spans.push(Span::styled(" · scanning size", Style::default().fg(Color::Gray)));
@@ -599,7 +594,7 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
         },
         Focus::Packages => {
             if app.packages_loading {
-                spans.push(Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Cyan)));
                 spans.push(Span::styled("scanning packages", Style::default().fg(Color::White)));
                 return spans;
             }
@@ -747,26 +742,20 @@ fn spinner_char() -> char {
 }
 
 fn activity_bar(width: usize) -> String {
-    let bar_width = 30.min(width.saturating_sub(10)).max(10);
+    let bar_width = 20.min(width.saturating_sub(10)).max(10);
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     
-    let period = 1500; // 1.5 seconds back and forth
+    let period = 2000; // 2 seconds back and forth
     let pos_t = (ms % period) as f64 / period as f64; // 0.0 to 1.0
     let pos = if pos_t < 0.5 { pos_t * 2.0 } else { 2.0 - pos_t * 2.0 };
     
     let active_pos = (pos * (bar_width - 1) as f64).round() as usize;
     
-    let mut bar = vec![' '; bar_width];
-    if active_pos > 0 {
-        bar[active_pos - 1] = '░';
-    }
-    bar[active_pos] = '█';
-    if active_pos + 1 < bar_width {
-        bar[active_pos + 1] = '░';
-    }
+    let mut bar = vec!['·'; bar_width];
+    bar[active_pos] = '●';
     
-    format!("▕{}▏", bar.into_iter().collect::<String>())
+    format!("  {}  ", bar.into_iter().map(|c| format!("{c} ")).collect::<String>().trim_end())
 }
