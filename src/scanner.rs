@@ -1,5 +1,7 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 use crate::bulkstat;
 
@@ -33,16 +35,57 @@ impl Scanner {
         std::thread::Builder::new()
             .name(String::from("diskr-scan"))
             .spawn(move || {
-                for dir in dirs {
-                    let size = bulkstat::size_of_dir(&dir);
-                    let _ = tx.send(ScanMsg::DirSize {
-                        scan_id,
-                        path: dir,
-                        size,
-                    });
-                }
+                let worker_count = worker_count(dirs.len());
+                let dirs = Arc::new(dirs);
+                let next_index = AtomicUsize::new(0);
+
+                std::thread::scope(|scope| {
+                    for _ in 0..worker_count {
+                        let tx = tx.clone();
+                        let dirs = Arc::clone(&dirs);
+                        let next_index = &next_index;
+                        scope.spawn(move || loop {
+                            let index = next_index.fetch_add(1, Ordering::Relaxed);
+                            let Some(dir) = dirs.get(index).cloned() else {
+                                break;
+                            };
+                            let size = bulkstat::size_of_dir(&dir);
+                            let _ = tx.send(ScanMsg::DirSize {
+                                scan_id,
+                                path: dir,
+                                size,
+                            });
+                        });
+                    }
+                });
+
                 let _ = tx.send(ScanMsg::AllDone { scan_id });
             })
             .map(|_| ())
+    }
+}
+
+fn worker_count(dir_count: usize) -> usize {
+    if dir_count <= 1 {
+        return dir_count;
+    }
+
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    dir_count.min(available.clamp(1, 4))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worker_count;
+
+    #[test]
+    fn worker_count_respects_bounds() {
+        assert_eq!(worker_count(0), 0);
+        assert_eq!(worker_count(1), 1);
+
+        let workers = worker_count(64);
+        assert!((1..=4).contains(&workers));
     }
 }
