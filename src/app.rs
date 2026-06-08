@@ -447,39 +447,44 @@ impl App {
             Focus::Disks => {
                 self.status = String::from("cannot delete a disk mount");
             }
-            Focus::Packages => {
-                match self.pkg_view {
-                    PkgView::SystemManagers => {
-                        let packages = self.flat_packages();
-                        if let Some((package, manager)) = packages.get(self.selected_pkg) {
-                            if let Some(path) = &package.path {
-                                self.pending_delete = Some(DeleteTarget::Package {
-                                    name: format!("{} {}", manager.label(), package.name),
-                                    path: path.clone(),
-                                    is_project_dep: false,
-                                });
-                                self.confirming_delete = true;
-                            } else {
-                                self.status = format!("no path known for package {}", package.name);
-                            }
-                        }
-                    }
-                    PkgView::ProjectDeps => {
-                        if let Some(dep) = self.project_deps.get(self.selected_pkg) {
-                            if let Some(deps_dir) = &dep.deps_dir {
-                                self.pending_delete = Some(DeleteTarget::Package {
-                                    name: format!("{} dependency dir ({})", dep.manager_label, deps_dir.display()),
-                                    path: deps_dir.clone(),
-                                    is_project_dep: true,
-                                });
-                                self.confirming_delete = true;
-                            } else {
-                                self.status = format!("no local dependency directory to delete for {}", dep.manifest);
-                            }
+            Focus::Packages => match self.pkg_view {
+                PkgView::SystemManagers => {
+                    let packages = self.flat_packages();
+                    if let Some((package, manager)) = packages.get(self.selected_pkg) {
+                        if let Some(path) = &package.path {
+                            self.pending_delete = Some(DeleteTarget::Package {
+                                name: format!("{} {}", manager.label(), package.name),
+                                path: path.clone(),
+                                is_project_dep: false,
+                            });
+                            self.confirming_delete = true;
+                        } else {
+                            self.status = format!("no path known for package {}", package.name);
                         }
                     }
                 }
-            }
+                PkgView::ProjectDeps => {
+                    if let Some(dep) = self.project_deps.get(self.selected_pkg) {
+                        if let Some(deps_dir) = &dep.deps_dir {
+                            self.pending_delete = Some(DeleteTarget::Package {
+                                name: format!(
+                                    "{} dependency dir ({})",
+                                    dep.manager_label,
+                                    deps_dir.display()
+                                ),
+                                path: deps_dir.clone(),
+                                is_project_dep: true,
+                            });
+                            self.confirming_delete = true;
+                        } else {
+                            self.status = format!(
+                                "no local dependency directory to delete for {}",
+                                dep.manifest
+                            );
+                        }
+                    }
+                }
+            },
         }
     }
 
@@ -505,21 +510,23 @@ impl App {
                         Err(e) => self.status = format!("delete failed: {e}"),
                     }
                 }
-                DeleteTarget::Package { name, path, is_project_dep } => {
-                    match crate::fs_ops::delete_to_trash(&path) {
-                        Ok(()) => {
-                            self.status = format!("moved to trash: {name}");
-                            self.invalidate_cache_for(&path);
-                            self.refresh_disks();
-                            if is_project_dep {
-                                self.reload_project_deps();
-                            } else {
-                                self.refresh_packages();
-                            }
+                DeleteTarget::Package {
+                    name,
+                    path,
+                    is_project_dep,
+                } => match crate::fs_ops::delete_to_trash(&path) {
+                    Ok(()) => {
+                        self.status = format!("moved to trash: {name}");
+                        self.invalidate_cache_for(&path);
+                        self.refresh_disks();
+                        if is_project_dep {
+                            self.reload_project_deps();
+                        } else {
+                            self.refresh_packages();
                         }
-                        Err(e) => self.status = format!("delete failed: {e}"),
                     }
-                }
+                    Err(e) => self.status = format!("delete failed: {e}"),
+                },
             }
         }
         Ok(())
@@ -848,7 +855,11 @@ mod tests {
 
         assert!(app.confirming_delete);
         match app.pending_delete.as_ref().unwrap() {
-            DeleteTarget::Package { name, path, is_project_dep } => {
+            DeleteTarget::Package {
+                name,
+                path,
+                is_project_dep,
+            } => {
                 assert!(is_project_dep);
                 assert_eq!(path, &root.join("target"));
                 assert!(name.contains("dependency dir"));

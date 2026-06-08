@@ -1042,7 +1042,9 @@ where
                             true
                         }
                         KeyCode::Left | KeyCode::Char('h') => {
-                            if app.focus == Focus::Packages && app.pkg_view == app::PkgView::ProjectDeps {
+                            if app.focus == Focus::Packages
+                                && app.pkg_view == app::PkgView::ProjectDeps
+                            {
                                 app.toggle_pkg_view();
                                 true
                             } else {
@@ -1050,7 +1052,9 @@ where
                             }
                         }
                         KeyCode::Right | KeyCode::Char('l') => {
-                            if app.focus == Focus::Packages && app.pkg_view == app::PkgView::SystemManagers {
+                            if app.focus == Focus::Packages
+                                && app.pkg_view == app::PkgView::SystemManagers
+                            {
                                 app.toggle_pkg_view();
                                 true
                             } else {

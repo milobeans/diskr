@@ -236,16 +236,40 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         Color::DarkGray
     };
     let (sys_style, proj_style) = if app.pkg_view == PkgView::SystemManagers {
-        (Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow), Style::default().fg(Color::DarkGray))
+        (
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Yellow),
+            Style::default().fg(Color::DarkGray),
+        )
     } else {
-        (Style::default().fg(Color::DarkGray), Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
+        (
+            Style::default().fg(Color::DarkGray),
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Yellow),
+        )
     };
 
     let title = Line::from(vec![
         Span::raw(" packages ─"),
-        Span::styled(if app.pkg_view == PkgView::SystemManagers { "[ System ]" } else { " System " }, sys_style),
+        Span::styled(
+            if app.pkg_view == PkgView::SystemManagers {
+                "[ System ]"
+            } else {
+                " System "
+            },
+            sys_style,
+        ),
         Span::raw("─"),
-        Span::styled(if app.pkg_view == PkgView::ProjectDeps { "[ Projects ]" } else { " Projects " }, proj_style),
+        Span::styled(
+            if app.pkg_view == PkgView::ProjectDeps {
+                "[ Projects ]"
+            } else {
+                " Projects "
+            },
+            proj_style,
+        ),
     ]);
 
     let block = Block::default()
@@ -271,20 +295,36 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
                     .split(block_inner);
 
                 let title = Line::from(vec![
-                    Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!("{} ", spinner_char()),
+                        Style::default().fg(Color::Cyan),
+                    ),
                     Span::styled("scanning package data…", Style::default().fg(Color::White)),
                 ]);
-                f.render_widget(Paragraph::new(title).alignment(Alignment::Center), chunks[1]);
+                f.render_widget(
+                    Paragraph::new(title).alignment(Alignment::Center),
+                    chunks[1],
+                );
 
                 let act_bar = activity_bar(block_inner.width as usize);
-                let bar_line = Line::from(Span::styled(act_bar, Style::default().fg(Color::DarkGray)));
-                f.render_widget(Paragraph::new(bar_line).alignment(Alignment::Center), chunks[2]);
+                let bar_line =
+                    Line::from(Span::styled(act_bar, Style::default().fg(Color::DarkGray)));
+                f.render_widget(
+                    Paragraph::new(bar_line).alignment(Alignment::Center),
+                    chunks[2],
+                );
 
-                let sub = Line::from(Span::styled("checking package managers and project dependencies", Style::default().fg(Color::DarkGray)));
+                let sub = Line::from(Span::styled(
+                    "checking package managers and project dependencies",
+                    Style::default().fg(Color::DarkGray),
+                ));
                 f.render_widget(Paragraph::new(sub).alignment(Alignment::Center), chunks[3]);
             } else {
                 let message = Line::from(vec![
-                    Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!("{} ", spinner_char()),
+                        Style::default().fg(Color::Cyan),
+                    ),
                     Span::styled("scanning…", Style::default().fg(Color::White)),
                 ]);
                 let text = Paragraph::new(message)
@@ -546,14 +586,30 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
     match app.focus {
         Focus::Files => match app.entries.get(app.selected) {
             Some(entry) if entry.is_dir && entry.scanning => {
-                spans.push(Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Cyan)));
+                spans.push(Span::styled(
+                    format!("{} ", spinner_char()),
+                    Style::default().fg(Color::Cyan),
+                ));
                 spans.push(Span::styled("dir ", Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled(truncate(&entry.name, 28), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
-                spans.push(Span::styled(" · scanning size", Style::default().fg(Color::Gray)));
+                spans.push(Span::styled(
+                    truncate(&entry.name, 28),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    " · scanning size",
+                    Style::default().fg(Color::Gray),
+                ));
             }
             Some(entry) if entry.is_dir => {
                 spans.push(Span::styled("dir ", Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled(truncate(&entry.name, 28), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(
+                    truncate(&entry.name, 28),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
                 spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
                 let size = entry
                     .size
@@ -563,7 +619,12 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
             }
             Some(entry) => {
                 spans.push(Span::styled("file ", Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled(truncate(&entry.name, 28), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(
+                    truncate(&entry.name, 28),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
                 spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
                 let size = entry
                     .size
@@ -572,7 +633,10 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                 spans.push(Span::styled(size, Style::default().fg(Color::Green)));
             }
             None => {
-                spans.push(Span::styled("no files in view", Style::default().fg(Color::Gray)));
+                spans.push(Span::styled(
+                    "no files in view",
+                    Style::default().fg(Color::Gray),
+                ));
             }
         },
         Focus::Disks => match app.disks.get(app.selected_disk) {
@@ -585,21 +649,41 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                     disk.name.clone()
                 };
                 spans.push(Span::styled("disk ", Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled(truncate(&label, 28), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
-                spans.push(Span::styled(format!(" · {free} free of {total}"), Style::default().fg(Color::Gray)));
+                spans.push(Span::styled(
+                    truncate(&label, 28),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!(" · {free} free of {total}"),
+                    Style::default().fg(Color::Gray),
+                ));
             }
             None => {
-                spans.push(Span::styled("no disks available", Style::default().fg(Color::Gray)));
+                spans.push(Span::styled(
+                    "no disks available",
+                    Style::default().fg(Color::Gray),
+                ));
             }
         },
         Focus::Packages => {
             if app.packages_loading {
-                spans.push(Span::styled(format!("{} ", spinner_char()), Style::default().fg(Color::Cyan)));
-                spans.push(Span::styled("scanning packages", Style::default().fg(Color::White)));
+                spans.push(Span::styled(
+                    format!("{} ", spinner_char()),
+                    Style::default().fg(Color::Cyan),
+                ));
+                spans.push(Span::styled(
+                    "scanning packages",
+                    Style::default().fg(Color::White),
+                ));
                 return spans;
             }
             if !app.packages_loaded {
-                spans.push(Span::styled("packages not scanned", Style::default().fg(Color::Gray)));
+                spans.push(Span::styled(
+                    "packages not scanned",
+                    Style::default().fg(Color::Gray),
+                ));
                 return spans;
             }
             match app.pkg_view {
@@ -611,13 +695,24 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                                 .size
                                 .map(size_detail)
                                 .unwrap_or_else(|| String::from("?"));
-                            spans.push(Span::styled(format!("{} package ", manager.label()), Style::default().fg(Color::DarkGray)));
-                            spans.push(Span::styled(truncate(&package.name, 28), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                            spans.push(Span::styled(
+                                format!("{} package ", manager.label()),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                            spans.push(Span::styled(
+                                truncate(&package.name, 28),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
                             spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
                             spans.push(Span::styled(size, Style::default().fg(Color::Green)));
                         }
                         None => {
-                            spans.push(Span::styled("no packages in view", Style::default().fg(Color::Gray)));
+                            spans.push(Span::styled(
+                                "no packages in view",
+                                Style::default().fg(Color::Gray),
+                            ));
                         }
                     }
                 }
@@ -627,11 +722,17 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                             .deps_size
                             .map(size_detail)
                             .unwrap_or_else(|| String::from("—"));
-                        spans.push(Span::styled(format!("{} project · {} deps · ", dep.manager_label, dep.dep_count), Style::default().fg(Color::Gray)));
+                        spans.push(Span::styled(
+                            format!("{} project · {} deps · ", dep.manager_label, dep.dep_count),
+                            Style::default().fg(Color::Gray),
+                        ));
                         spans.push(Span::styled(size, Style::default().fg(Color::Green)));
                     }
                     None => {
-                        spans.push(Span::styled("no project dependencies in view", Style::default().fg(Color::Gray)));
+                        spans.push(Span::styled(
+                            "no project dependencies in view",
+                            Style::default().fg(Color::Gray),
+                        ));
                     }
                 },
             }
@@ -689,6 +790,45 @@ fn package_columns(inner_width: u16) -> (usize, usize) {
     (name_width, size_width)
 }
 
+fn spinner_char() -> char {
+    let spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let index = ((ms / 80) % spinners.len() as u128) as usize;
+    spinners[index]
+}
+
+fn activity_bar(width: usize) -> String {
+    let bar_width = 20.min(width.saturating_sub(10)).max(10);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let period = 2000; // 2 seconds back and forth
+    let pos_t = (ms % period) as f64 / period as f64; // 0.0 to 1.0
+    let pos = if pos_t < 0.5 {
+        pos_t * 2.0
+    } else {
+        2.0 - pos_t * 2.0
+    };
+
+    let active_pos = (pos * (bar_width - 1) as f64).round() as usize;
+
+    let mut bar = vec!['·'; bar_width];
+    bar[active_pos] = '●';
+
+    format!(
+        "  {}  ",
+        bar.into_iter()
+            .map(|c| format!("{c} "))
+            .collect::<String>()
+            .trim_end()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,33 +869,4 @@ mod tests {
     fn package_columns_hide_size_when_narrow() {
         assert_eq!(package_columns(12), (12, 0));
     }
-}
-
-fn spinner_char() -> char {
-    let spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let index = ((ms / 80) % spinners.len() as u128) as usize;
-    spinners[index]
-}
-
-fn activity_bar(width: usize) -> String {
-    let bar_width = 20.min(width.saturating_sub(10)).max(10);
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    
-    let period = 2000; // 2 seconds back and forth
-    let pos_t = (ms % period) as f64 / period as f64; // 0.0 to 1.0
-    let pos = if pos_t < 0.5 { pos_t * 2.0 } else { 2.0 - pos_t * 2.0 };
-    
-    let active_pos = (pos * (bar_width - 1) as f64).round() as usize;
-    
-    let mut bar = vec!['·'; bar_width];
-    bar[active_pos] = '●';
-    
-    format!("  {}  ", bar.into_iter().map(|c| format!("{c} ")).collect::<String>().trim_end())
 }
