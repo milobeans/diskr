@@ -979,7 +979,15 @@ where
                         continue;
                     }
                     let handled = match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Esc => {
+                            if app.focus != Focus::Files {
+                                app.focus = Focus::Files;
+                                true
+                            } else {
+                                return Ok(());
+                            }
+                        }
                         KeyCode::Down | KeyCode::Char('j') => {
                             app.move_cursor(1);
                             true

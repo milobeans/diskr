@@ -576,8 +576,12 @@ fn command_exists(cmd: &str) -> bool {
 }
 
 fn run_command(cmd: &str, args: &[&str]) -> String {
-    Command::new(cmd)
-        .args(args)
+    let mut command = Command::new(cmd);
+    command.args(args);
+    if cmd == "brew" {
+        command.env("HOMEBREW_NO_AUTO_UPDATE", "1");
+    }
+    command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()

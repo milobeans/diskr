@@ -108,7 +108,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|e| {
             let size_str = match (e.is_dir, e.size, e.scanning) {
-                (true, _, true) => String::from("scanning…"),
+                (true, _, true) => format!("{} scanning…", spinner_char()),
                 (true, Some(size), _) => human(size_sort_key(size)),
                 (true, None, _) => String::from("—"),
                 (false, Some(size), _) => human(size_sort_key(size)),
@@ -255,9 +255,9 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
 
     if !app.packages_loaded {
         let message = if app.packages_loading {
-            "scanning packages…"
+            format!("{} scanning packages…", spinner_char())
         } else {
-            "press p to scan packages"
+            String::from("press p to scan packages")
         };
         let text = Paragraph::new(message)
             .block(block)
@@ -545,11 +545,11 @@ fn selection_status(app: &App) -> String {
             None => String::from("no disks available"),
         },
         Focus::Packages => {
+            if app.packages_loading {
+                return format!("{} scanning packages", spinner_char());
+            }
             if !app.packages_loaded {
                 return String::from("packages not scanned");
-            }
-            if app.packages_loading {
-                return String::from("refreshing package data");
             }
             match app.pkg_view {
                 PkgView::SystemManagers => {
@@ -677,4 +677,14 @@ mod tests {
     fn package_columns_hide_size_when_narrow() {
         assert_eq!(package_columns(12), (12, 0));
     }
+}
+
+fn spinner_char() -> char {
+    let spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let index = ((ms / 80) % spinners.len() as u128) as usize;
+    spinners[index]
 }

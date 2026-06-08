@@ -48,6 +48,16 @@ pub struct Entry {
     pub scanning: bool,
 }
 
+#[derive(Clone)]
+pub enum DeleteTarget {
+    FileEntry(Entry),
+    Package {
+        name: String,
+        path: PathBuf,
+        is_project_dep: bool,
+    },
+}
+
 pub struct DiskInfo {
     pub name: String,
     pub mount: PathBuf,
@@ -74,7 +84,7 @@ pub struct App {
     pub packages_loaded: bool,
     pub packages_loading: bool,
 
-    pending_delete: Option<Entry>,
+    pending_delete: Option<DeleteTarget>,
     size_cache: HashMap<PathBuf, SizeInfo>,
     last_sort: Instant,
     sort_dirty: bool,
@@ -427,13 +437,49 @@ impl App {
         if self.confirming_delete {
             return;
         }
-        if self.focus != Focus::Files {
-            self.status = String::from("switch to files pane to trash items");
-            return;
-        }
-        if let Some(entry) = self.entries.get(self.selected).cloned() {
-            self.pending_delete = Some(entry);
-            self.confirming_delete = true;
+        match self.focus {
+            Focus::Files => {
+                if let Some(entry) = self.entries.get(self.selected).cloned() {
+                    self.pending_delete = Some(DeleteTarget::FileEntry(entry));
+                    self.confirming_delete = true;
+                }
+            }
+            Focus::Disks => {
+                self.status = String::from("cannot delete a disk mount");
+            }
+            Focus::Packages => {
+                match self.pkg_view {
+                    PkgView::SystemManagers => {
+                        let packages = self.flat_packages();
+                        if let Some((package, manager)) = packages.get(self.selected_pkg) {
+                            if let Some(path) = &package.path {
+                                self.pending_delete = Some(DeleteTarget::Package {
+                                    name: format!("{} {}", manager.label(), package.name),
+                                    path: path.clone(),
+                                    is_project_dep: false,
+                                });
+                                self.confirming_delete = true;
+                            } else {
+                                self.status = format!("no path known for package {}", package.name);
+                            }
+                        }
+                    }
+                    PkgView::ProjectDeps => {
+                        if let Some(dep) = self.project_deps.get(self.selected_pkg) {
+                            if let Some(deps_dir) = &dep.deps_dir {
+                                self.pending_delete = Some(DeleteTarget::Package {
+                                    name: format!("{} dependency dir ({})", dep.manager_label, deps_dir.display()),
+                                    path: deps_dir.clone(),
+                                    is_project_dep: true,
+                                });
+                                self.confirming_delete = true;
+                            } else {
+                                self.status = format!("no local dependency directory to delete for {}", dep.manifest);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -444,27 +490,47 @@ impl App {
 
     pub fn confirm_delete(&mut self) -> Result<()> {
         self.confirming_delete = false;
-        if let Some(entry) = self.pending_delete.take() {
-            match crate::fs_ops::delete_to_trash(&entry.path) {
-                Ok(()) => {
-                    self.status = format!("moved to trash: {}", entry.name);
-                    self.invalidate_cache_for(&entry.path);
-                    self.refresh_disks();
-                    let status = self.status.clone();
-                    self.reload()?;
-                    self.status = status;
+        if let Some(target) = self.pending_delete.take() {
+            match target {
+                DeleteTarget::FileEntry(entry) => {
+                    match crate::fs_ops::delete_to_trash(&entry.path) {
+                        Ok(()) => {
+                            self.status = format!("moved to trash: {}", entry.name);
+                            self.invalidate_cache_for(&entry.path);
+                            self.refresh_disks();
+                            let status = self.status.clone();
+                            self.reload()?;
+                            self.status = status;
+                        }
+                        Err(e) => self.status = format!("delete failed: {e}"),
+                    }
                 }
-                Err(e) => self.status = format!("delete failed: {e}"),
+                DeleteTarget::Package { name, path, is_project_dep } => {
+                    match crate::fs_ops::delete_to_trash(&path) {
+                        Ok(()) => {
+                            self.status = format!("moved to trash: {name}");
+                            self.invalidate_cache_for(&path);
+                            self.refresh_disks();
+                            if is_project_dep {
+                                self.reload_project_deps();
+                            } else {
+                                self.refresh_packages();
+                            }
+                        }
+                        Err(e) => self.status = format!("delete failed: {e}"),
+                    }
+                }
             }
         }
         Ok(())
     }
 
     pub fn pending_delete_name(&self) -> &str {
-        self.pending_delete
-            .as_ref()
-            .map(|entry| entry.name.as_str())
-            .unwrap_or("?")
+        match &self.pending_delete {
+            Some(DeleteTarget::FileEntry(entry)) => &entry.name,
+            Some(DeleteTarget::Package { name, .. }) => name,
+            None => "?",
+        }
     }
 
     /// When a path changes (deletion, write), its own cache entry and every
@@ -503,6 +569,9 @@ impl App {
     }
 
     fn request_package_scan(&mut self, include_managers: bool) {
+        if self.packages_loading {
+            return;
+        }
         let scan_id = self.next_pkg_scan_id();
         let (tx, rx) = std::sync::mpsc::channel();
         let cwd = self.cwd.clone();
@@ -726,10 +795,15 @@ mod tests {
         let target = app.entries[0].path.clone();
         app.request_delete();
 
+        let get_path = |t: &DeleteTarget| match t {
+            DeleteTarget::FileEntry(e) => e.path.clone(),
+            DeleteTarget::Package { path, .. } => path.clone(),
+        };
+
         assert!(app.confirming_delete);
-        assert_eq!(app.pending_delete.as_ref().unwrap().path, target);
+        assert_eq!(get_path(app.pending_delete.as_ref().unwrap()), target);
         app.move_cursor(1);
-        assert_eq!(app.pending_delete.as_ref().unwrap().path, target);
+        assert_eq!(get_path(app.pending_delete.as_ref().unwrap()), target);
 
         app.cancel_delete();
         assert!(!app.confirming_delete);
@@ -749,6 +823,39 @@ mod tests {
 
         assert!(!app.confirming_delete);
         assert!(app.pending_delete.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_request_applies_to_package_deps() {
+        let root = test_root("delete_pkg_deps");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.project_deps = vec![ProjectDeps {
+            path: root.clone(),
+            manager_label: "cargo",
+            manifest: "Cargo.toml",
+            dep_count: 5,
+            deps_size: None,
+            deps_dir: Some(root.join("target")),
+        }];
+        app.focus = Focus::Packages;
+        app.pkg_view = PkgView::ProjectDeps;
+        app.selected_pkg = 0;
+
+        app.request_delete();
+
+        assert!(app.confirming_delete);
+        match app.pending_delete.as_ref().unwrap() {
+            DeleteTarget::Package { name, path, is_project_dep } => {
+                assert!(is_project_dep);
+                assert_eq!(path, &root.join("target"));
+                assert!(name.contains("dependency dir"));
+            }
+            _ => panic!("expected DeleteTarget::Package"),
+        }
+
         fs::remove_dir_all(root).unwrap();
     }
 
