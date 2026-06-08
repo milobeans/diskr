@@ -34,9 +34,15 @@ pub fn draw(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(root[1]);
 
+    let disk_height = if app.disks.is_empty() {
+        3
+    } else {
+        (app.disks.len() as u16 * 4) + 2
+    };
+
     let side = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Length(disk_height), Constraint::Min(0)])
         .split(body[1]);
 
     draw_files(f, body[0], app);
@@ -229,9 +235,22 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Color::DarkGray
     };
+    let (sys_style, proj_style) = if app.pkg_view == PkgView::SystemManagers {
+        (Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow), Style::default().fg(Color::DarkGray))
+    } else {
+        (Style::default().fg(Color::DarkGray), Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
+    };
+
+    let title = Line::from(vec![
+        Span::raw(" packages ─"),
+        Span::styled(if app.pkg_view == PkgView::SystemManagers { "[ System ]" } else { " System " }, sys_style),
+        Span::raw("─"),
+        Span::styled(if app.pkg_view == PkgView::ProjectDeps { "[ Projects ]" } else { " Projects " }, proj_style),
+    ]);
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("packages ({})", app.pkg_view.label()))
+        .title(title)
         .border_style(Style::default().fg(border_color));
 
     if !app.packages_loaded {
@@ -375,6 +394,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let text = Line::from(vec![
         key("↑↓/jk"),
         label(" move"),
+        sep(),
+        key("←→/hl"),
+        label(" views"),
         sep(),
         key("⏎"),
         label(" open"),

@@ -100,12 +100,7 @@ struct PkgScanMsg {
 }
 
 impl PkgView {
-    pub fn label(self) -> &'static str {
-        match self {
-            PkgView::SystemManagers => "system",
-            PkgView::ProjectDeps => "projects",
-        }
-    }
+    // Methods related to PkgView...
 }
 
 impl App {

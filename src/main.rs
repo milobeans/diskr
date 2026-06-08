@@ -1029,16 +1029,39 @@ where
                             true
                         }
                         KeyCode::Char('p') => {
-                            if app.focus == Focus::Packages {
-                                app.toggle_pkg_view();
-                            } else {
-                                app.focus = Focus::Packages;
-                                app.load_packages();
-                            }
+                            app.focus = Focus::Packages;
+                            app.load_packages();
                             true
+                        }
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            if app.focus == Focus::Packages && app.pkg_view == app::PkgView::ProjectDeps {
+                                app.toggle_pkg_view();
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        KeyCode::Right | KeyCode::Char('l') => {
+                            if app.focus == Focus::Packages && app.pkg_view == app::PkgView::SystemManagers {
+                                app.toggle_pkg_view();
+                                true
+                            } else {
+                                false
+                            }
                         }
                         KeyCode::Char('.') => {
                             app.toggle_hidden()?;
+                            true
+                        }
+                        KeyCode::BackTab => {
+                            app.focus = match app.focus {
+                                Focus::Files => Focus::Packages,
+                                Focus::Disks => Focus::Files,
+                                Focus::Packages => Focus::Disks,
+                            };
+                            if app.focus == Focus::Packages {
+                                app.load_packages();
+                            }
                             true
                         }
                         KeyCode::Tab => {
