@@ -109,11 +109,11 @@ Release flow:
 
 1. Update `Cargo.toml` to the new crate version.
 2. Refresh `Cargo.lock` if needed and push the version bump to `main`.
-3. Create and push a matching tag like `v0.1.13`.
+3. Create and push a matching tag like `v0.1.14`.
 
 ```sh
-git tag -a v0.1.13 -m "v0.1.13"
-git push origin v0.1.13
+git tag -a v0.1.14 -m "v0.1.14"
+git push origin v0.1.14
 ```
 
 When that tag is pushed, the `Release` workflow will:

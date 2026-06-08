@@ -21,6 +21,9 @@ use std::collections::BinaryHeap;
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use rayon::Scope;
 
 // sys/attr.h constants (stable macOS ABI)
 const ATTR_BIT_MAP_COUNT: u16 = 5;
@@ -88,6 +91,94 @@ pub fn scan_dir(root: &Path, top_file_limit: usize) -> DirScan {
         return DirScan::default();
     }
 
+    let aggregate = Mutex::new(ScanAggregate::default());
+
+    rayon::scope(|scope| {
+        spawn_scan(scope, root.to_path_buf(), top_file_limit, &aggregate);
+    });
+
+    aggregate
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .finish()
+}
+
+#[derive(Default)]
+struct ScanAggregate {
+    size: SizeInfo,
+    largest_files: BinaryHeap<Reverse<FileCandidate>>,
+}
+
+impl ScanAggregate {
+    fn merge(&mut self, partial: DirectoryScan, top_file_limit: usize) {
+        self.size.add_file(partial.size);
+        if top_file_limit == 0 {
+            return;
+        }
+        for Reverse(candidate) in partial.largest_files {
+            push_file_candidate(&mut self.largest_files, top_file_limit, candidate);
+        }
+    }
+
+    fn finish(self) -> DirScan {
+        DirScan {
+            size: self.size,
+            largest_files: sorted_largest_files(self.largest_files),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DirectoryScan {
+    size: SizeInfo,
+    largest_files: BinaryHeap<Reverse<FileCandidate>>,
+    subdirs: Vec<PathBuf>,
+}
+
+fn spawn_scan<'scope>(
+    scope: &Scope<'scope>,
+    dir: PathBuf,
+    top_file_limit: usize,
+    aggregate: &'scope Mutex<ScanAggregate>,
+) {
+    scope.spawn(move |scope| {
+        let partial = scan_one_dir(&dir, top_file_limit);
+        let DirectoryScan {
+            size,
+            largest_files,
+            subdirs,
+        } = partial;
+
+        for subdir in subdirs {
+            spawn_scan(scope, subdir, top_file_limit, aggregate);
+        }
+        let mut shared = aggregate.lock().unwrap();
+        shared.merge(
+            DirectoryScan {
+                size,
+                largest_files,
+                subdirs: Vec::new(),
+            },
+            top_file_limit,
+        );
+    });
+}
+
+fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
+    let c_path = match CString::new(dir.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return DirectoryScan::default(),
+    };
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return DirectoryScan::default();
+    }
+
     let mut attrlist = Attrlist {
         bitmapcount: ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -98,145 +189,126 @@ pub fn scan_dir(root: &Path, top_file_limit: usize) -> DirScan {
         forkattr: 0,
     };
     let mut buf = vec![0u8; 64 * 1024];
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    let mut scan = DirScan::default();
-    let mut largest_files = BinaryHeap::<Reverse<FileCandidate>>::new();
+    let mut partial = DirectoryScan::default();
 
-    while let Some(dir) = stack.pop() {
-        let c_path = match CString::new(dir.as_os_str().as_bytes()) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    loop {
+        let n = unsafe {
+            libc::getattrlistbulk(
+                fd,
+                &mut attrlist as *mut _ as *mut libc::c_void,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                FSOPT_PACK_INVAL_ATTRS,
             )
         };
-        if fd < 0 {
-            continue;
+        if n <= 0 {
+            break;
         }
-        loop {
-            let n = unsafe {
-                libc::getattrlistbulk(
-                    fd,
-                    &mut attrlist as *mut _ as *mut libc::c_void,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    FSOPT_PACK_INVAL_ATTRS,
-                )
+
+        let mut offset: usize = 0;
+        for _ in 0..n {
+            let entry_start = offset;
+            if entry_start + 4 + ATTRIBUTE_SET_LEN > buf.len() {
+                break;
+            }
+            let Some(length) = read_u32(&buf, buf.len(), entry_start).map(|n| n as usize) else {
+                break;
             };
-            if n < 0 {
+            if length == 0 || entry_start + length > buf.len() {
                 break;
             }
-            if n == 0 {
+            let entry_end = entry_start + length;
+            let Some(returned_common) = read_u32(&buf, entry_end, entry_start + 4) else {
                 break;
-            }
-            let mut offset: usize = 0;
-            for _ in 0..n {
-                let entry_start = offset;
-                if entry_start + 4 + ATTRIBUTE_SET_LEN > buf.len() {
+            };
+            let Some(returned_file) = read_u32(&buf, entry_end, entry_start + 16) else {
+                break;
+            };
+            let mut field = entry_start + 4 + ATTRIBUTE_SET_LEN;
+
+            let err = if returned_common & ATTR_CMN_ERROR != 0 {
+                let Some(err) = read_u32(&buf, entry_end, field) else {
                     break;
-                }
-                let Some(length) = read_u32(&buf, buf.len(), entry_start).map(|n| n as usize)
+                };
+                field += 4;
+                err
+            } else {
+                0
+            };
+
+            let name_bytes = if returned_common & ATTR_CMN_NAME != 0 {
+                let attr_ref_start = field;
+                let Some(name_off) = read_i32(&buf, entry_end, field).map(|n| n as isize) else {
+                    break;
+                };
+                let Some(name_len) = read_u32(&buf, entry_end, field + 4).map(|n| n as usize)
                 else {
                     break;
                 };
-                if length == 0 || entry_start + length > buf.len() {
+                field += ATTR_REFERENCE_LEN;
+                read_attr_reference(&buf, entry_end, attr_ref_start, name_off, name_len)
+            } else {
+                None
+            };
+
+            let objtype = if returned_common & ATTR_CMN_OBJTYPE != 0 {
+                let Some(objtype) = read_u32(&buf, entry_end, field) else {
                     break;
-                }
-                let entry_end = entry_start + length;
-                let Some(returned_common) = read_u32(&buf, entry_end, entry_start + 4) else {
-                    break;
                 };
-                let Some(returned_file) = read_u32(&buf, entry_end, entry_start + 16) else {
-                    break;
-                };
-                let mut field = entry_start + 4 + ATTRIBUTE_SET_LEN;
+                field += 4;
+                objtype
+            } else {
+                0
+            };
 
-                let err = if returned_common & ATTR_CMN_ERROR != 0 {
-                    let Some(err) = read_u32(&buf, entry_end, field) else {
-                        break;
-                    };
-                    field += 4;
-                    err
-                } else {
-                    0
-                };
+            let totalsize = if returned_file & ATTR_FILE_TOTALSIZE != 0 {
+                let value = read_u64(&buf, entry_end, field).unwrap_or(0);
+                field += 8;
+                value
+            } else {
+                0
+            };
+            let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
+                read_u64(&buf, entry_end, field).unwrap_or(0)
+            } else {
+                0
+            };
+            offset += length;
 
-                let name_bytes = if returned_common & ATTR_CMN_NAME != 0 {
-                    let attr_ref_start = field;
-                    let Some(name_off) = read_i32(&buf, entry_end, field).map(|n| n as isize)
-                    else {
-                        break;
-                    };
-                    let Some(name_len) = read_u32(&buf, entry_end, field + 4).map(|n| n as usize)
-                    else {
-                        break;
-                    };
-                    field += ATTR_REFERENCE_LEN;
-                    read_attr_reference(&buf, entry_end, attr_ref_start, name_off, name_len)
-                } else {
-                    None
-                };
-
-                let objtype = if returned_common & ATTR_CMN_OBJTYPE != 0 {
-                    let Some(objtype) = read_u32(&buf, entry_end, field) else {
-                        break;
-                    };
-                    field += 4;
-                    objtype
-                } else {
-                    0
-                };
-
-                let totalsize = if returned_file & ATTR_FILE_TOTALSIZE != 0 {
-                    let value = read_u64(&buf, entry_end, field).unwrap_or(0);
-                    field += 8;
-                    value
-                } else {
-                    0
-                };
-                let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
-                    read_u64(&buf, entry_end, field).unwrap_or(0)
-                } else {
-                    0
-                };
-                offset += length;
-
-                if err != 0 {
-                    continue;
-                }
-                match objtype {
-                    VREG => {
-                        let size = SizeInfo::new(totalsize, allocsize);
-                        scan.size.add_file(size);
-                        if let Some(name_bytes) = name_bytes {
-                            push_largest_file(
-                                &mut largest_files,
-                                top_file_limit,
-                                dir.join(OsStr::from_bytes(name_bytes)),
-                                size,
-                            );
-                        }
+            if err != 0 {
+                continue;
+            }
+            match objtype {
+                VREG => {
+                    let size = SizeInfo::new(totalsize, allocsize);
+                    partial.size.add_file(size);
+                    if let Some(name_bytes) = name_bytes {
+                        push_largest_file(
+                            &mut partial.largest_files,
+                            top_file_limit,
+                            dir.join(OsStr::from_bytes(name_bytes)),
+                            size,
+                        );
                     }
-                    VDIR => {
-                        let Some(name_bytes) = name_bytes else {
-                            continue;
-                        };
-                        if matches!(name_bytes, b"." | b"..") {
-                            continue;
-                        }
-                        stack.push(dir.join(OsStr::from_bytes(name_bytes)));
-                    }
-                    _ => {} // VLNK, VSOCK, VBLK, VCHR, VFIFO: ignore
                 }
+                VDIR => {
+                    let Some(name_bytes) = name_bytes else {
+                        continue;
+                    };
+                    if matches!(name_bytes, b"." | b"..") {
+                        continue;
+                    }
+                    partial
+                        .subdirs
+                        .push(dir.join(OsStr::from_bytes(name_bytes)));
+                }
+                _ => {} // VLNK, VSOCK, VBLK, VCHR, VFIFO: ignore
             }
         }
-        unsafe { libc::close(fd) };
     }
-    scan.largest_files = sorted_largest_files(largest_files);
-    scan
+
+    unsafe { libc::close(fd) };
+    partial
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -256,11 +328,25 @@ fn push_largest_file(
         return;
     }
 
-    let candidate = FileCandidate {
-        allocated: size.allocated,
-        logical: size.logical,
-        path,
-    };
+    push_file_candidate(
+        heap,
+        limit,
+        FileCandidate {
+            allocated: size.allocated,
+            logical: size.logical,
+            path,
+        },
+    );
+}
+
+fn push_file_candidate(
+    heap: &mut BinaryHeap<Reverse<FileCandidate>>,
+    limit: usize,
+    candidate: FileCandidate,
+) {
+    if limit == 0 {
+        return;
+    }
 
     if heap.len() < limit {
         heap.push(Reverse(candidate));
