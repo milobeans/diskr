@@ -109,11 +109,11 @@ Release flow:
 
 1. Update `Cargo.toml` to the new crate version.
 2. Refresh `Cargo.lock` if needed and push the version bump to `main`.
-3. Create and push a matching tag like `v0.1.11`.
+3. Create and push a matching tag like `v0.1.13`.
 
 ```sh
-git tag -a v0.1.11 -m "v0.1.11"
-git push origin v0.1.11
+git tag -a v0.1.13 -m "v0.1.13"
+git push origin v0.1.13
 ```
 
 When that tag is pushed, the `Release` workflow will:
@@ -122,4 +122,5 @@ When that tag is pushed, the `Release` workflow will:
 2. Verify the tagged commit is reachable from `main`.
 3. Run the full release validation set.
 4. Publish the crate to crates.io if that version is not already published.
-5. Create or update the matching GitHub release with generated notes.
+5. Download the published crate and verify it was built from the exact tag commit.
+6. Create the matching GitHub release once, using generated notes.

@@ -5,6 +5,10 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -98,9 +102,78 @@ jobs:
           fi
           cargo publish --locked
 
+      - name: Download published crate
+        id: published
+        env:
+          CRATE_NAME: ${{ steps.meta.outputs.name }}
+          CRATE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          crate_archive="$RUNNER_TEMP/${CRATE_NAME}-${CRATE_VERSION}.crate"
+          for attempt in $(seq 1 12); do
+            if curl -fsSL \
+              -H "User-Agent: diskr-release-workflow" \
+              -H "Accept: application/octet-stream" \
+              "https://crates.io/api/v1/crates/$CRATE_NAME/$CRATE_VERSION/download" \
+              -o "$crate_archive"; then
+              echo "crate_archive=$crate_archive" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$attempt" -eq 12 ]; then
+              echo "published crate did not become available on crates.io" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Verify published crate provenance
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          CRATE_ARCHIVE: ${{ steps.published.outputs.crate_archive }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import tarfile
+
+          archive = os.environ["CRATE_ARCHIVE"]
+          expected_sha = os.environ["EXPECTED_SHA"]
+
+          with tarfile.open(archive, "r:gz") as tf:
+              member = next(
+                  (item for item in tf.getmembers() if item.name.endswith("/.cargo_vcs_info.json")),
+                  None,
+              )
+              if member is None:
+                  raise SystemExit("published crate is missing .cargo_vcs_info.json")
+              with tf.extractfile(member) as fh:
+                  info = json.load(fh)
+
+          actual_sha = (info.get("git") or {}).get("sha1")
+          if actual_sha != expected_sha:
+              raise SystemExit(
+                  f"published crate was built from {actual_sha}, expected {expected_sha}"
+              )
+          PY
+
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
-        with:
-          generate_release_notes: true
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub release $GITHUB_REF_NAME already exists; leaving it unchanged."
+            exit 0
+          fi
+
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" \
+            -f target_commitish="$GITHUB_SHA" \
+            --jq .body > "$notes_file"
+
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "$notes_file"
