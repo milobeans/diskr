@@ -1,11 +1,14 @@
 mod app;
 mod bulkstat;
 mod fs_ops;
+mod history;
+mod reclaim;
 mod scanner;
+mod space;
 mod terminal_backend;
 mod ui;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
@@ -15,11 +18,12 @@ use ratatui_core::terminal::Terminal;
 use std::{
     ffi::OsString,
     io::{self, IsTerminal},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::Duration,
 };
 
-use app::{App, Focus};
+use app::{human, App, Focus};
 use terminal_backend::CrosstermBackend;
 
 fn main() -> Result<()> {
@@ -32,6 +36,16 @@ fn main() -> Result<()> {
             println!("diskr {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        CliAction::Top { path, limit, json } => print_top(path, limit, json),
+        CliAction::Reclaim { path, json } => print_reclaim(path, json),
+        CliAction::Save { path, json } => save_baseline(path, json),
+        CliAction::Diff { path, json } => print_diff(path, json),
+        CliAction::Space { path, json } => print_space(path, json),
+        CliAction::ThinSnapshots {
+            path,
+            bytes,
+            confirmed,
+        } => thin_snapshots(path, bytes, confirmed),
         CliAction::Run(start) => run_app(start),
     }
 }
@@ -63,35 +77,177 @@ fn run_app(start: PathBuf) -> Result<()> {
 
 enum CliAction {
     Run(PathBuf),
+    Top {
+        path: PathBuf,
+        limit: usize,
+        json: bool,
+    },
+    Reclaim {
+        path: PathBuf,
+        json: bool,
+    },
+    Save {
+        path: PathBuf,
+        json: bool,
+    },
+    Diff {
+        path: PathBuf,
+        json: bool,
+    },
+    Space {
+        path: PathBuf,
+        json: bool,
+    },
+    ThinSnapshots {
+        path: PathBuf,
+        bytes: u64,
+        confirmed: bool,
+    },
     Help,
     Version,
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
     let mut args = args.into_iter();
-    let Some(first) = args.next() else {
-        return Ok(CliAction::Run(dirs_home()));
-    };
+    let mut path: Option<PathBuf> = None;
+    let mut top_limit: Option<usize> = None;
+    let mut reclaim_report = false;
+    let mut save_baseline = false;
+    let mut diff_baseline = false;
+    let mut space_report = false;
+    let mut thin_snapshots: Option<u64> = None;
+    let mut confirmed = false;
+    let mut json = false;
+    let mut separator_seen = false;
 
-    match first.to_string_lossy().as_ref() {
-        "-h" | "--help" => Ok(CliAction::Help),
-        "-V" | "--version" => Ok(CliAction::Version),
-        "--" => {
-            let Some(path) = args.next() else {
-                bail!("usage: diskr [PATH]");
-            };
-            if args.next().is_some() {
-                bail!("usage: diskr [PATH]");
-            }
-            Ok(CliAction::Run(PathBuf::from(path)))
+    while let Some(arg) = args.next() {
+        if separator_seen {
+            set_cli_path(&mut path, arg)?;
+            continue;
         }
-        _ => {
-            if args.next().is_some() {
-                bail!("usage: diskr [PATH]");
+
+        let arg_text = arg.to_string_lossy().into_owned();
+        match arg_text.as_str() {
+            "-h" | "--help" => return Ok(CliAction::Help),
+            "-V" | "--version" => return Ok(CliAction::Version),
+            "--" => {
+                separator_seen = true;
             }
-            Ok(CliAction::Run(PathBuf::from(first)))
+            "--json" => {
+                json = true;
+            }
+            "--yes" => {
+                confirmed = true;
+            }
+            "--reclaim" => {
+                reclaim_report = true;
+            }
+            "--save" => {
+                save_baseline = true;
+            }
+            "--diff" => {
+                diff_baseline = true;
+            }
+            "--space" => {
+                space_report = true;
+            }
+            "--thin-snapshots" => {
+                let Some(size) = args.next() else {
+                    bail!("usage: diskr --thin-snapshots SIZE [--yes] [PATH]");
+                };
+                thin_snapshots = Some(space::parse_byte_size(&size.to_string_lossy())?);
+            }
+            _ if arg_text.starts_with("--thin-snapshots=") => {
+                let size = arg_text.trim_start_matches("--thin-snapshots=");
+                thin_snapshots = Some(space::parse_byte_size(size)?);
+            }
+            "--top" => {
+                let Some(limit) = args.next() else {
+                    bail!("usage: diskr --top N [--json] [PATH]");
+                };
+                top_limit = Some(parse_top_limit(&limit.to_string_lossy())?);
+            }
+            _ if arg_text.starts_with("--top=") => {
+                let limit = arg_text.trim_start_matches("--top=");
+                top_limit = Some(parse_top_limit(limit)?);
+            }
+            _ => {
+                set_cli_path(&mut path, arg)?;
+            }
         }
     }
+
+    if json
+        && top_limit.is_none()
+        && !reclaim_report
+        && !save_baseline
+        && !diff_baseline
+        && !space_report
+    {
+        bail!("--json requires --top, --reclaim, --save, --diff, or --space");
+    }
+    if confirmed && thin_snapshots.is_none() {
+        bail!("--yes requires --thin-snapshots");
+    }
+    if separator_seen && path.is_none() {
+        bail!("usage: diskr [PATH]");
+    }
+    let mode_count = usize::from(top_limit.is_some())
+        + usize::from(reclaim_report)
+        + usize::from(save_baseline)
+        + usize::from(diff_baseline)
+        + usize::from(space_report)
+        + usize::from(thin_snapshots.is_some());
+    if mode_count > 1 {
+        bail!("choose only one of --top, --reclaim, --save, --diff, --space, or --thin-snapshots");
+    }
+
+    match top_limit {
+        Some(limit) => Ok(CliAction::Top {
+            path: path.unwrap_or_else(dirs_home),
+            limit,
+            json,
+        }),
+        None if reclaim_report => Ok(CliAction::Reclaim {
+            path: path.unwrap_or_else(dirs_home),
+            json,
+        }),
+        None if save_baseline => Ok(CliAction::Save {
+            path: path.unwrap_or_else(dirs_home),
+            json,
+        }),
+        None if diff_baseline => Ok(CliAction::Diff {
+            path: path.unwrap_or_else(dirs_home),
+            json,
+        }),
+        None if space_report => Ok(CliAction::Space {
+            path: path.unwrap_or_else(dirs_home),
+            json,
+        }),
+        None if thin_snapshots.is_some() => Ok(CliAction::ThinSnapshots {
+            path: path.unwrap_or_else(dirs_home),
+            bytes: thin_snapshots.unwrap_or_default(),
+            confirmed,
+        }),
+        None => Ok(CliAction::Run(path.unwrap_or_else(dirs_home))),
+    }
+}
+
+fn set_cli_path(path: &mut Option<PathBuf>, value: OsString) -> Result<()> {
+    if path.replace(PathBuf::from(value)).is_some() {
+        bail!("usage: diskr [PATH]");
+    }
+    Ok(())
+}
+
+fn parse_top_limit(value: &str) -> Result<usize> {
+    let limit = value
+        .parse::<usize>()
+        .with_context(|| format!("invalid --top value: {value}"))?;
+    if limit == 0 {
+        bail!("--top must be greater than zero");
+    }
+    Ok(limit)
 }
 
 fn print_help() {
@@ -104,11 +260,20 @@ Lightweight terminal file explorer and disk/storage manager for macOS.
 Usage:
   diskr [PATH]
   diskr -- PATH
+  diskr --top N [--json] [PATH]
+  diskr --reclaim [--json] [PATH]
+  diskr --save [--json] [PATH]
+  diskr --diff [--json] [PATH]
+  diskr --space [--json] [PATH]
+  diskr --thin-snapshots SIZE [--yes] [PATH]
 
 Keys:
   Up/Down, j/k    Move selection
   Enter           Open selected directory or disk
   Backspace       Go to parent directory
+  Space           Quick Look selected item
+  f               Reveal selected item in Finder
+  O               Open selected item with default app
   r               Refresh view and rescan directory sizes
   o               Cycle sort mode
   .               Toggle hidden files
@@ -118,6 +283,473 @@ Keys:
 ",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
+    if !path.exists() {
+        bail!("path does not exist: {}", path.display());
+    }
+    if !path.is_dir() {
+        bail!("path is not a directory: {}", path.display());
+    }
+
+    let scan = bulkstat::scan_dir(&path, limit);
+    if json {
+        let files: Vec<_> = scan
+            .largest_files
+            .iter()
+            .map(|file| {
+                serde_json::json!({
+                    "path": file.path.to_string_lossy(),
+                    "logical": file.size.logical,
+                    "allocated": file.size.allocated,
+                })
+            })
+            .collect();
+        let report = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "limit": limit,
+            "total_logical": scan.size.logical,
+            "total_allocated": scan.size.allocated,
+            "files": files,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!(
+        "Top {} files by allocated size under {}",
+        limit,
+        path.display()
+    );
+    println!(
+        "Total: {} disk / {} apparent",
+        human(scan.size.allocated),
+        human(scan.size.logical)
+    );
+    if scan.largest_files.is_empty() {
+        println!("No regular files found.");
+        return Ok(());
+    }
+    for (index, file) in scan.largest_files.iter().enumerate() {
+        println!(
+            "{:>2}. {:>22}  {}",
+            index + 1,
+            top_size_label(file.size),
+            file.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn top_size_label(size: bulkstat::SizeInfo) -> String {
+    if size.allocated == size.logical {
+        human(size.logical)
+    } else {
+        format!(
+            "{} disk / {} apparent",
+            human(size.allocated),
+            human(size.logical)
+        )
+    }
+}
+
+fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
+    if !path.exists() {
+        bail!("path does not exist: {}", path.display());
+    }
+    if !path.is_dir() {
+        bail!("path is not a directory: {}", path.display());
+    }
+
+    let report = reclaim::report(&path);
+    if json {
+        let findings: Vec<_> = report
+            .findings
+            .iter()
+            .map(|finding| {
+                serde_json::json!({
+                    "label": finding.label,
+                    "class": finding.class.label(),
+                    "count": finding.count,
+                    "logical": finding.size.logical,
+                    "allocated": finding.size.allocated,
+                    "note": finding.note,
+                    "paths": finding
+                        .paths
+                        .iter()
+                        .map(|p| p.to_string_lossy())
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let value = serde_json::json!({
+            "root": report.root.to_string_lossy(),
+            "total_logical": report.total.logical,
+            "total_allocated": report.total.allocated,
+            "findings": findings,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!("Reclaimable space under {}", report.root.display());
+    println!(
+        "Total: {} disk / {} apparent",
+        human(report.total.allocated),
+        human(report.total.logical)
+    );
+    if report.findings.is_empty() {
+        println!("No known reclaimable caches or build artifacts found.");
+        return Ok(());
+    }
+    for finding in &report.findings {
+        let count = if finding.count > 1 {
+            format!(" (x{})", finding.count)
+        } else {
+            String::new()
+        };
+        println!(
+            "{:>22}  [{:^11}]  {}{}",
+            top_size_label(finding.size),
+            finding.class.label(),
+            finding.label,
+            count
+        );
+        println!("                          {}", finding.note);
+    }
+    println!("\nThis is a report only; diskr does not delete anything here.");
+    Ok(())
+}
+
+fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
+    let record = history::save(&path)?;
+    let total = record.total();
+    if json {
+        let children: Vec<_> = record
+            .children
+            .iter()
+            .map(|child| {
+                serde_json::json!({
+                    "name": child.name,
+                    "is_dir": child.is_dir,
+                    "logical": child.size.logical,
+                    "allocated": child.size.allocated,
+                })
+            })
+            .collect();
+        let value = serde_json::json!({
+            "path": record.path.to_string_lossy(),
+            "timestamp": record.timestamp,
+            "total_logical": total.logical,
+            "total_allocated": total.allocated,
+            "children": children,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!("Saved baseline for {}", record.path.display());
+    println!(
+        "Total: {} disk / {} apparent across {} entries",
+        human(total.allocated),
+        human(total.logical),
+        record.children.len()
+    );
+    println!(
+        "Compare later with `diskr --diff {}`.",
+        record.path.display()
+    );
+    Ok(())
+}
+
+fn print_diff(path: PathBuf, json: bool) -> Result<()> {
+    let report = history::diff(&path)?;
+    if json {
+        let changes: Vec<_> = report
+            .changes
+            .iter()
+            .map(|change| {
+                serde_json::json!({
+                    "name": change.name,
+                    "status": change_status(change),
+                    "before_logical": change.before.map(|s| s.logical),
+                    "before_allocated": change.before.map(|s| s.allocated),
+                    "after_logical": change.after.map(|s| s.logical),
+                    "after_allocated": change.after.map(|s| s.allocated),
+                    "delta_logical": change.delta_logical().to_string(),
+                    "delta_allocated": change.delta_allocated().to_string(),
+                })
+            })
+            .collect();
+        let value = serde_json::json!({
+            "path": report.path.to_string_lossy(),
+            "baseline_timestamp": report.baseline_timestamp,
+            "current_timestamp": report.current_timestamp,
+            "before_total_logical": report.before_total.logical,
+            "before_total_allocated": report.before_total.allocated,
+            "after_total_logical": report.after_total.logical,
+            "after_total_allocated": report.after_total.allocated,
+            "total_delta_logical": report.total_delta_logical().to_string(),
+            "total_delta_allocated": report.total_delta_allocated().to_string(),
+            "changes": changes,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!("Diff for {}", report.path.display());
+    println!(
+        "Baseline captured {}",
+        format_elapsed(
+            report
+                .current_timestamp
+                .saturating_sub(report.baseline_timestamp)
+        )
+    );
+    println!(
+        "Total: {} disk → {} disk  ({})",
+        human(report.before_total.allocated),
+        human(report.after_total.allocated),
+        format_signed_bytes(report.total_delta_allocated())
+    );
+    if report.changes.is_empty() {
+        println!("No changes since the baseline.");
+        return Ok(());
+    }
+    for change in &report.changes {
+        println!(
+            "{:>12}  {:<9}  {}",
+            format_signed_bytes(change.delta_allocated()),
+            change_status(change),
+            change.name
+        );
+    }
+    Ok(())
+}
+
+fn change_status(change: &history::ChildChange) -> &'static str {
+    match (change.before, change.after) {
+        (None, Some(_)) => "new",
+        (Some(_), None) => "removed",
+        _ if change.delta_allocated() >= 0 => "grew",
+        _ => "shrank",
+    }
+}
+
+fn format_signed_bytes(delta: i128) -> String {
+    let magnitude = delta.unsigned_abs().min(u128::from(u64::MAX)) as u64;
+    let sign = if delta < 0 { "-" } else { "+" };
+    format!("{sign}{}", human(magnitude))
+}
+
+fn format_elapsed(secs: u64) -> String {
+    if secs == 0 {
+        return String::from("just now");
+    }
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    if days > 0 {
+        return format!("{days}d {hours}h ago");
+    }
+    if hours > 0 {
+        return format!("{hours}h {minutes}m ago");
+    }
+    if minutes > 0 {
+        return format!("{minutes}m ago");
+    }
+    format!("{secs}s ago")
+}
+
+fn print_space(path: PathBuf, json: bool) -> Result<()> {
+    let report = space::report_for_path(&path)?;
+    if json {
+        let snapshots: Vec<_> = report
+            .local_snapshots
+            .names
+            .iter()
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect();
+        let apfs_container = report.apfs_container.as_ref().map(|container| {
+            serde_json::json!({
+                "reference": container.reference,
+                "size": container.size,
+                "free": container.free,
+            })
+        });
+        let value = serde_json::json!({
+            "path": report.path.to_string_lossy(),
+            "mount": report.mount.to_string_lossy(),
+            "device": report.device,
+            "filesystem": report.fs_type,
+            "total": report.total,
+            "used": report.used,
+            "free": report.free,
+            "available": report.available,
+            "free_not_user_available": report.unavailable_free(),
+            "apfs_container": apfs_container,
+            "local_snapshots": snapshots,
+            "local_snapshot_error": report.local_snapshots.error,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!("Space report for {}", report.path.display());
+    println!(
+        "Mount: {} ({}, {})",
+        report.mount.display(),
+        report.fs_type,
+        report.device
+    );
+    println!("Total: {}", human(report.total));
+    println!("Used: {}", human(report.used));
+    println!("Free blocks: {}", human(report.free));
+    println!("Available to user: {}", human(report.available));
+    let unavailable = report.unavailable_free();
+    if unavailable > 0 {
+        println!("Free but not user-available: {}", human(unavailable));
+    }
+    if let Some(container) = &report.apfs_container {
+        println!(
+            "APFS container {}: {} total / {} free",
+            container.reference,
+            human(container.size),
+            human(container.free)
+        );
+    }
+    match &report.local_snapshots.error {
+        Some(error) if !error.is_empty() => {
+            println!("Local snapshots: unavailable ({error})");
+        }
+        _ if report.local_snapshots.names.is_empty() => {
+            println!("Local snapshots: none reported by tmutil");
+        }
+        _ => {
+            println!("Local snapshots: {}", report.local_snapshots.names.len());
+            for name in &report.local_snapshots.names {
+                println!("  {name}");
+            }
+            println!(
+                "Snapshot sizes are not reported by tmutil. To request reclamation, first preview with `diskr --thin-snapshots 10G {}`.",
+                report.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn thin_snapshots(path: PathBuf, bytes: u64, confirmed: bool) -> Result<()> {
+    if !path.exists() {
+        bail!("path does not exist: {}", path.display());
+    }
+    if !confirmed {
+        println!(
+            "Would run: tmutil thinlocalsnapshots {} {} 4",
+            path.display(),
+            bytes
+        );
+        println!(
+            "Re-run with --yes to request {} of local snapshot reclamation.",
+            human(bytes)
+        );
+        return Ok(());
+    }
+
+    let result = space::thin_local_snapshots(&path, bytes)?;
+    println!(
+        "Requested {} of local snapshot reclamation for {}.",
+        human(result.requested_bytes),
+        result.path.display()
+    );
+    if !result.stdout.is_empty() {
+        println!("{}", result.stdout);
+    }
+    if !result.stderr.is_empty() {
+        eprintln!("{}", result.stderr);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ExternalAction {
+    QuickLook,
+    RevealInFinder,
+    Open,
+}
+
+impl ExternalAction {
+    fn status_label(self) -> &'static str {
+        match self {
+            ExternalAction::QuickLook => "quick look",
+            ExternalAction::RevealInFinder => "reveal in Finder",
+            ExternalAction::Open => "open",
+        }
+    }
+}
+
+fn launch_external_action(app: &mut App, action: ExternalAction) {
+    let Some((path, label)) = selected_action_target(app) else {
+        app.status = String::from("nothing selected");
+        return;
+    };
+
+    let result = match action {
+        ExternalAction::QuickLook => spawn_quick_look(&path),
+        ExternalAction::RevealInFinder => spawn_reveal_in_finder(&path),
+        ExternalAction::Open => spawn_open(&path),
+    };
+
+    app.status = match result {
+        Ok(()) => format!("{}: {label}", action.status_label()),
+        Err(err) => format!("{} failed: {err}", action.status_label()),
+    };
+}
+
+fn selected_action_target(app: &App) -> Option<(PathBuf, String)> {
+    match app.focus {
+        Focus::Files => app
+            .entries
+            .get(app.selected)
+            .map(|entry| (entry.path.clone(), entry.name.clone())),
+        Focus::Disks => app.disks.get(app.selected_disk).map(|disk| {
+            let label = if disk.name.is_empty() {
+                disk.mount.display().to_string()
+            } else {
+                disk.name.clone()
+            };
+            (disk.mount.clone(), label)
+        }),
+    }
+}
+
+fn spawn_quick_look(path: &Path) -> Result<()> {
+    let mut command = Command::new("qlmanage");
+    command.arg("-p").arg(path);
+    spawn_detached(&mut command)
+}
+
+fn spawn_reveal_in_finder(path: &Path) -> Result<()> {
+    let mut command = Command::new("open");
+    command.arg("-R").arg(path);
+    spawn_detached(&mut command)
+}
+
+fn spawn_open(path: &Path) -> Result<()> {
+    let mut command = Command::new("open");
+    command.arg(path);
+    spawn_detached(&mut command)
+}
+
+fn spawn_detached(command: &mut Command) -> Result<()> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn macOS command")?;
+    Ok(())
 }
 
 struct TerminalGuard;
@@ -213,6 +845,18 @@ where
                             app.go_up()?;
                             true
                         }
+                        KeyCode::Char(' ') => {
+                            launch_external_action(app, ExternalAction::QuickLook);
+                            true
+                        }
+                        KeyCode::Char('f') => {
+                            launch_external_action(app, ExternalAction::RevealInFinder);
+                            true
+                        }
+                        KeyCode::Char('O') => {
+                            launch_external_action(app, ExternalAction::Open);
+                            true
+                        }
                         KeyCode::Char('r') => {
                             app.force_rescan();
                             true
@@ -251,6 +895,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn parse(parts: &[&str]) -> Result<CliAction> {
         parse_args(parts.iter().map(OsString::from))
@@ -274,6 +919,156 @@ mod tests {
     }
 
     #[test]
+    fn parses_top_report() {
+        let action = parse(&["--top", "20", "--json", "/tmp"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::Top {
+                path,
+                limit: 20,
+                json: true
+            } if path == std::path::Path::new("/tmp")
+        ));
+    }
+
+    #[test]
+    fn parses_top_equals_report_with_default_path() {
+        let action = parse(&["--top=5"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::Top {
+                limit: 5,
+                json: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_save_baseline() {
+        let action = parse(&["--save", "/tmp"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::Save { path, json: false } if path == std::path::Path::new("/tmp")
+        ));
+    }
+
+    #[test]
+    fn parses_diff_report() {
+        let action = parse(&["--diff", "--json", "/tmp"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::Diff { path, json: true } if path == std::path::Path::new("/tmp")
+        ));
+    }
+
+    #[test]
+    fn parses_space_report() {
+        let action = parse(&["--space", "--json", "/tmp"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::Space {
+                path,
+                json: true
+            } if path == std::path::Path::new("/tmp")
+        ));
+    }
+
+    #[test]
+    fn parses_reclaim_report() {
+        let action = parse(&["--reclaim", "--json", "/tmp"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::Reclaim {
+                path,
+                json: true
+            } if path == std::path::Path::new("/tmp")
+        ));
+    }
+
+    #[test]
+    fn parses_snapshot_thin_dry_run() {
+        let action = parse(&["--thin-snapshots", "1.5G", "/tmp"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::ThinSnapshots {
+                path,
+                bytes: 1_610_612_736,
+                confirmed: false
+            } if path == std::path::Path::new("/tmp")
+        ));
+    }
+
+    #[test]
+    fn parses_snapshot_thin_confirmation() {
+        let action = parse(&["--thin-snapshots=2G", "--yes"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::ThinSnapshots {
+                bytes: 2_147_483_648,
+                confirmed: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn top_rejects_zero_limit() {
+        let err = parse(&["--top", "0"]).err().unwrap();
+        assert!(err.to_string().contains("--top must be greater than zero"));
+    }
+
+    #[test]
+    fn json_requires_top_report() {
+        let err = parse(&["--json"]).err().unwrap();
+        assert!(err
+            .to_string()
+            .contains("--json requires --top, --reclaim, --save, --diff, or --space"));
+    }
+
+    #[test]
+    fn yes_requires_snapshot_thinning() {
+        let err = parse(&["--yes"]).err().unwrap();
+        assert!(err.to_string().contains("--yes requires --thin-snapshots"));
+    }
+
+    #[test]
+    fn report_modes_are_mutually_exclusive() {
+        let err = parse(&["--top", "5", "--space"]).err().unwrap();
+        assert!(err.to_string().contains(
+            "choose only one of --top, --reclaim, --save, --diff, --space, or --thin-snapshots"
+        ));
+    }
+
+    #[test]
+    fn external_action_target_uses_selected_file_or_disk() {
+        let root = test_root("external_target");
+        let file = root.join("visible.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&file, b"visible").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        let target = selected_action_target(&app).unwrap();
+        assert_eq!(target.0, file);
+        assert_eq!(target.1, "visible.txt");
+
+        let mount = root.join("mount");
+        fs::create_dir_all(&mount).unwrap();
+        app.disks = vec![app::DiskInfo {
+            name: String::from("External"),
+            mount: mount.clone(),
+            total: 100,
+            available: 50,
+        }];
+        app.focus = Focus::Disks;
+
+        let target = selected_action_target(&app).unwrap();
+        assert_eq!(target.0, mount);
+        assert_eq!(target.1, "External");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn separator_requires_path() {
         let err = parse(&["--"]).err().unwrap();
         assert!(err.to_string().contains("usage: diskr [PATH]"));
@@ -291,5 +1086,17 @@ mod tests {
     fn rejects_extra_args() {
         assert!(parse(&["/tmp", "/var"]).is_err());
         assert!(parse(&["--", "/tmp", "/var"]).is_err());
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "diskr_main_{name}_{}_{}",
+            std::process::id(),
+            nanos
+        ))
     }
 }

@@ -13,7 +13,8 @@ use ratatui_widgets::{
     paragraph::{Paragraph, Wrap},
 };
 
-use crate::app::{human, App, Focus};
+use crate::app::{human, size_sort_key, App, Focus};
+use crate::bulkstat::SizeInfo;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let root = Layout::default()
@@ -96,9 +97,9 @@ fn draw_files(f: &mut Frame, area: Rect, app: &App) {
         .map(|e| {
             let size_str = match (e.is_dir, e.size, e.scanning) {
                 (true, _, true) => String::from("scanning…"),
-                (true, Some(n), _) => human(n),
+                (true, Some(size), _) => human(size_sort_key(size)),
                 (true, None, _) => String::from("—"),
-                (false, Some(n), _) => human(n),
+                (false, Some(size), _) => human(size_sort_key(size)),
                 (false, None, _) => String::from("?"),
             };
             let icon = if e.is_dir { "▸ " } else { "  " };
@@ -251,6 +252,15 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("⌫"),
         label(" up"),
         sep(),
+        key("Space"),
+        label(" preview"),
+        sep(),
+        key("f"),
+        label(" finder"),
+        sep(),
+        key("O"),
+        label(" open"),
+        sep(),
         key("r"),
         label(" refresh"),
         sep(),
@@ -351,11 +361,17 @@ fn selection_status(app: &App) -> String {
                 format!("dir {} · scanning size", truncate(&entry.name, 28))
             }
             Some(entry) if entry.is_dir => {
-                let size = entry.size.map(human).unwrap_or_else(|| String::from("—"));
+                let size = entry
+                    .size
+                    .map(size_detail)
+                    .unwrap_or_else(|| String::from("—"));
                 format!("dir {} · {}", truncate(&entry.name, 28), size)
             }
             Some(entry) => {
-                let size = entry.size.map(human).unwrap_or_else(|| String::from("?"));
+                let size = entry
+                    .size
+                    .map(size_detail)
+                    .unwrap_or_else(|| String::from("?"));
                 format!("file {} · {}", truncate(&entry.name, 28), size)
             }
             None => String::from("no files in view"),
@@ -374,6 +390,17 @@ fn selection_status(app: &App) -> String {
             None => String::from("no disks available"),
         },
     }
+}
+
+fn size_detail(size: SizeInfo) -> String {
+    if size.allocated == size.logical {
+        return human(size.logical);
+    }
+    format!(
+        "{} disk · {} apparent",
+        human(size.allocated),
+        human(size.logical)
+    )
 }
 
 fn file_columns(inner_width: u16) -> (usize, usize) {

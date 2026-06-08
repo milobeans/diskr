@@ -2,10 +2,12 @@ use anyhow::Result;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use crate::bulkstat::SizeInfo;
 use crate::scanner::{ScanId, ScanMsg, Scanner};
 
 const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -38,7 +40,7 @@ pub struct Entry {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
-    pub size: Option<u64>,
+    pub size: Option<SizeInfo>,
     pub modified: Option<std::time::SystemTime>,
     pub scanning: bool,
 }
@@ -63,7 +65,7 @@ pub struct App {
     pub confirming_delete: bool,
 
     pending_delete: Option<Entry>,
-    size_cache: HashMap<PathBuf, u64>,
+    size_cache: HashMap<PathBuf, SizeInfo>,
     last_sort: Instant,
     sort_dirty: bool,
     active_scan_id: ScanId,
@@ -84,7 +86,7 @@ impl App {
             sort: SortMode::SizeDesc,
             focus: Focus::Files,
             disks: Vec::new(),
-            status: String::from("q to quit · r to refresh · d to trash"),
+            status: String::from("Space preview · f Finder · O open"),
             confirming_delete: false,
             pending_delete: None,
             size_cache: HashMap::new(),
@@ -144,7 +146,7 @@ impl App {
             } else {
                 meta.as_ref().and_then(|m| {
                     if m.file_type().is_file() {
-                        Some(m.len())
+                        Some(SizeInfo::new(m.len(), m.blocks().saturating_mul(512)))
                     } else {
                         None
                     }
@@ -171,7 +173,9 @@ impl App {
                     .cmp(&a.is_dir)
                     .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             }),
-            SortMode::SizeDesc => self.entries.sort_by_key(|e| Reverse(e.size.unwrap_or(0))),
+            SortMode::SizeDesc => self
+                .entries
+                .sort_by_key(|e| Reverse(e.size.map(size_sort_key).unwrap_or(0))),
             SortMode::Modified => self.entries.sort_by_key(|e| Reverse(e.modified)),
         }
         self.last_sort = Instant::now();
@@ -473,6 +477,10 @@ pub fn human(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+pub fn size_sort_key(size: SizeInfo) -> u64 {
+    size.allocated
 }
 
 fn disk_info() -> Vec<DiskInfo> {

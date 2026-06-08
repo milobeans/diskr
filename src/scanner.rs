@@ -4,6 +4,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use crate::bulkstat;
+use crate::bulkstat::SizeInfo;
 
 pub type ScanId = u64;
 
@@ -12,7 +13,7 @@ pub enum ScanMsg {
     DirSize {
         scan_id: ScanId,
         path: PathBuf,
-        size: u64,
+        size: SizeInfo,
     },
     AllDone {
         scan_id: ScanId,
@@ -28,7 +29,7 @@ impl Scanner {
         Self { tx }
     }
 
-    /// Scan each directory in `dirs` for its TOTAL recursive size on disk.
+    /// Scan each directory in `dirs` for its recursive logical and allocated size.
     /// Must NOT block the UI thread.
     pub fn scan_all(&self, scan_id: ScanId, dirs: Vec<PathBuf>) -> std::io::Result<()> {
         let tx = self.tx.clone();
@@ -49,7 +50,7 @@ impl Scanner {
                             let Some(dir) = dirs.get(index).cloned() else {
                                 break;
                             };
-                            let size = bulkstat::size_of_dir(&dir);
+                            let size = bulkstat::scan_dir(&dir, 0).size;
                             let _ = tx.send(ScanMsg::DirSize {
                                 scan_id,
                                 path: dir,

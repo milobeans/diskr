@@ -13,8 +13,11 @@
 //!   [28..36] name ref        i32+u32 — offset+length pointing to name bytes below
 //!   [36..40] objtype         u32   — VREG=1, VDIR=2, VLNK=5, …
 //!   [40..48] totalsize       u64   — present for regular files
+//!   [48..56] allocsize       u64   — present for regular files
 //!   [..    ] name bytes + padding
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -26,6 +29,7 @@ const ATTR_CMN_OBJTYPE: u32 = 0x00000008;
 const ATTR_CMN_ERROR: u32 = 0x20000000;
 const ATTR_CMN_RETURNED_ATTRS: u32 = 0x80000000;
 const ATTR_FILE_TOTALSIZE: u32 = 0x00000002;
+const ATTR_FILE_ALLOCSIZE: u32 = 0x00000004;
 const FSOPT_PACK_INVAL_ATTRS: u64 = 0x00000008;
 const ATTRIBUTE_SET_LEN: usize = 20;
 const ATTR_REFERENCE_LEN: usize = 8;
@@ -33,6 +37,35 @@ const ATTR_REFERENCE_LEN: usize = 8;
 // vnode types (sys/vnode.h)
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SizeInfo {
+    pub logical: u64,
+    pub allocated: u64,
+}
+
+impl SizeInfo {
+    pub fn new(logical: u64, allocated: u64) -> Self {
+        Self { logical, allocated }
+    }
+
+    fn add_file(&mut self, file: SizeInfo) {
+        self.logical = self.logical.saturating_add(file.logical);
+        self.allocated = self.allocated.saturating_add(file.allocated);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LargeFile {
+    pub path: PathBuf,
+    pub size: SizeInfo,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirScan {
+    pub size: SizeInfo,
+    pub largest_files: Vec<LargeFile>,
+}
 
 #[repr(C)]
 struct Attrlist {
@@ -45,14 +78,14 @@ struct Attrlist {
     forkattr: u32,
 }
 
-/// Recursive total size (logical bytes, matches Finder "Size") of `root`.
+/// Recursive size and optional largest-file report for `root`.
 /// Symlinks are skipped. Permission errors yield zero contribution, not panic.
-pub fn size_of_dir(root: &Path) -> u64 {
+pub fn scan_dir(root: &Path, top_file_limit: usize) -> DirScan {
     let Ok(meta) = std::fs::symlink_metadata(root) else {
-        return 0;
+        return DirScan::default();
     };
     if !meta.file_type().is_dir() {
-        return 0;
+        return DirScan::default();
     }
 
     let mut attrlist = Attrlist {
@@ -61,12 +94,13 @@ pub fn size_of_dir(root: &Path) -> u64 {
         commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | ATTR_CMN_ERROR,
         volattr: 0,
         dirattr: 0,
-        fileattr: ATTR_FILE_TOTALSIZE,
+        fileattr: ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE,
         forkattr: 0,
     };
     let mut buf = vec![0u8; 64 * 1024];
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    let mut total: u64 = 0;
+    let mut scan = DirScan::default();
+    let mut largest_files = BinaryHeap::<Reverse<FileCandidate>>::new();
 
     while let Some(dir) = stack.pop() {
         let c_path = match CString::new(dir.as_os_str().as_bytes()) {
@@ -101,7 +135,7 @@ pub fn size_of_dir(root: &Path) -> u64 {
             let mut offset: usize = 0;
             for _ in 0..n {
                 let entry_start = offset;
-                if entry_start + 48 > buf.len() {
+                if entry_start + 4 + ATTRIBUTE_SET_LEN > buf.len() {
                     break;
                 }
                 let Some(length) = read_u32(&buf, buf.len(), entry_start).map(|n| n as usize)
@@ -157,6 +191,13 @@ pub fn size_of_dir(root: &Path) -> u64 {
                 };
 
                 let totalsize = if returned_file & ATTR_FILE_TOTALSIZE != 0 {
+                    let value = read_u64(&buf, entry_end, field).unwrap_or(0);
+                    field += 8;
+                    value
+                } else {
+                    0
+                };
+                let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
                     read_u64(&buf, entry_end, field).unwrap_or(0)
                 } else {
                     0
@@ -168,7 +209,16 @@ pub fn size_of_dir(root: &Path) -> u64 {
                 }
                 match objtype {
                     VREG => {
-                        total = total.saturating_add(totalsize);
+                        let size = SizeInfo::new(totalsize, allocsize);
+                        scan.size.add_file(size);
+                        if let Some(name_bytes) = name_bytes {
+                            push_largest_file(
+                                &mut largest_files,
+                                top_file_limit,
+                                dir.join(OsStr::from_bytes(name_bytes)),
+                                size,
+                            );
+                        }
                     }
                     VDIR => {
                         let Some(name_bytes) = name_bytes else {
@@ -185,7 +235,61 @@ pub fn size_of_dir(root: &Path) -> u64 {
         }
         unsafe { libc::close(fd) };
     }
-    total
+    scan.largest_files = sorted_largest_files(largest_files);
+    scan
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FileCandidate {
+    allocated: u64,
+    logical: u64,
+    path: PathBuf,
+}
+
+fn push_largest_file(
+    heap: &mut BinaryHeap<Reverse<FileCandidate>>,
+    limit: usize,
+    path: PathBuf,
+    size: SizeInfo,
+) {
+    if limit == 0 {
+        return;
+    }
+
+    let candidate = FileCandidate {
+        allocated: size.allocated,
+        logical: size.logical,
+        path,
+    };
+
+    if heap.len() < limit {
+        heap.push(Reverse(candidate));
+    } else if heap
+        .peek()
+        .map(|Reverse(smallest)| candidate > *smallest)
+        .unwrap_or(false)
+    {
+        heap.pop();
+        heap.push(Reverse(candidate));
+    }
+}
+
+fn sorted_largest_files(heap: BinaryHeap<Reverse<FileCandidate>>) -> Vec<LargeFile> {
+    let mut files: Vec<LargeFile> = heap
+        .into_iter()
+        .map(|Reverse(file)| LargeFile {
+            path: file.path,
+            size: SizeInfo::new(file.logical, file.allocated),
+        })
+        .collect();
+    files.sort_by(|a, b| {
+        b.size
+            .allocated
+            .cmp(&a.size.allocated)
+            .then(b.size.logical.cmp(&a.size.logical))
+            .then(a.path.cmp(&b.path))
+    });
+    files
 }
 
 #[inline]
@@ -264,15 +368,35 @@ mod tests {
         fs::write(root.join("a/b/c/deep.txt"), b"nested\n").unwrap(); // 7
         let _ = symlink("/nonexistent", root.join("broken-link"));
 
-        let got = size_of_dir(&root);
+        let got = scan_dir(&root, 0).size.logical;
         assert_eq!(got, 12 + 1_024_000 + 7, "bulkstat size mismatch");
         fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
+    fn scan_reports_allocated_size_and_largest_files() {
+        let root = test_root("bulkstat_scan");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("small.txt"), b"small").unwrap();
+        fs::write(root.join("a/large.bin"), vec![0u8; 4096 * 8]).unwrap();
+        fs::write(root.join("a/b/medium.bin"), vec![0u8; 4096]).unwrap();
+
+        let scan = scan_dir(&root, 2);
+
+        assert_eq!(scan.size.logical, 5 + 4096 * 8 + 4096);
+        assert!(scan.size.allocated > 0);
+        assert_eq!(scan.largest_files.len(), 2);
+        assert_eq!(scan.largest_files[0].path, root.join("a/large.bin"));
+        assert_eq!(scan.largest_files[0].size.logical, 4096 * 8);
+        assert_eq!(scan.largest_files[1].path, root.join("a/b/medium.bin"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn missing_directory_counts_as_zero() {
         let root = test_root("missing");
-        assert_eq!(size_of_dir(&root), 0);
+        assert_eq!(scan_dir(&root, 0).size.logical, 0);
     }
 
     #[test]
@@ -284,7 +408,7 @@ mod tests {
         fs::write(target.join("data.bin"), vec![1u8; 4096]).unwrap();
         symlink(&target, &link).unwrap();
 
-        assert_eq!(size_of_dir(&link), 0);
+        assert_eq!(scan_dir(&link, 0).size.logical, 0);
         fs::remove_dir_all(&root).unwrap();
     }
 
