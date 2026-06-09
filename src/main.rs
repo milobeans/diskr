@@ -286,12 +286,16 @@ Usage:
 
 Keys:
   Up/Down, j/k    Move selection
+  PageUp/PageDown  Move by a page
+  Home/End        Jump to first or last item
   Enter           Open selected directory or disk/package path
   Backspace       Go to parent directory
+  /               Search files in the current directory
+  Left/Right, h/l Switch pane or package view
   Space           Quick Look selected item
   f               Reveal selected item in Finder
   O               Open selected item with default app
-  r               Refresh view and rescan directory sizes
+  r               Refresh view and scan nearby directory sizes
   o               Cycle sort mode
   p               Open packages pane / switch package view
   .               Toggle hidden files
@@ -974,6 +978,55 @@ where
                         }
                         continue;
                     }
+                    if app.search_mode {
+                        let handled = match key.code {
+                            KeyCode::Esc => {
+                                app.exit_search();
+                                true
+                            }
+                            KeyCode::Enter => {
+                                app.exit_search();
+                                true
+                            }
+                            KeyCode::Backspace => {
+                                app.search_pop();
+                                true
+                            }
+                            KeyCode::Down => {
+                                app.move_cursor(1);
+                                true
+                            }
+                            KeyCode::Up => {
+                                app.move_cursor(-1);
+                                true
+                            }
+                            KeyCode::PageDown => {
+                                app.page_move(1);
+                                true
+                            }
+                            KeyCode::PageUp => {
+                                app.page_move(-1);
+                                true
+                            }
+                            KeyCode::Home => {
+                                app.move_to_start();
+                                true
+                            }
+                            KeyCode::End => {
+                                app.move_to_end();
+                                true
+                            }
+                            KeyCode::Char(ch) => {
+                                app.search_push(ch);
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
                     let handled = match key.code {
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Esc => {
@@ -990,6 +1043,22 @@ where
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             app.move_cursor(-1);
+                            true
+                        }
+                        KeyCode::PageDown => {
+                            app.page_move(1);
+                            true
+                        }
+                        KeyCode::PageUp => {
+                            app.page_move(-1);
+                            true
+                        }
+                        KeyCode::Home => {
+                            app.move_to_start();
+                            true
+                        }
+                        KeyCode::End => {
+                            app.move_to_end();
                             true
                         }
                         KeyCode::Enter => {
@@ -1037,6 +1106,10 @@ where
                             app.load_packages();
                             true
                         }
+                        KeyCode::Char('/') if app.focus == Focus::Files => {
+                            app.enter_search();
+                            true
+                        }
                         KeyCode::Left | KeyCode::Char('h') => {
                             if app.focus == Focus::Packages
                                 && app.pkg_view == app::PkgView::ProjectDeps
@@ -1044,7 +1117,8 @@ where
                                 app.toggle_pkg_view();
                                 true
                             } else {
-                                false
+                                focus_previous(app);
+                                true
                             }
                         }
                         KeyCode::Right | KeyCode::Char('l') => {
@@ -1054,7 +1128,8 @@ where
                                 app.toggle_pkg_view();
                                 true
                             } else {
-                                false
+                                focus_next(app);
+                                true
                             }
                         }
                         KeyCode::Char('.') => {
@@ -1062,25 +1137,11 @@ where
                             true
                         }
                         KeyCode::BackTab => {
-                            app.focus = match app.focus {
-                                Focus::Files => Focus::Packages,
-                                Focus::Disks => Focus::Files,
-                                Focus::Packages => Focus::Disks,
-                            };
-                            if app.focus == Focus::Packages {
-                                app.load_packages();
-                            }
+                            focus_previous(app);
                             true
                         }
                         KeyCode::Tab => {
-                            app.focus = match app.focus {
-                                Focus::Files => Focus::Disks,
-                                Focus::Disks => Focus::Packages,
-                                Focus::Packages => Focus::Files,
-                            };
-                            if app.focus == Focus::Packages {
-                                app.load_packages();
-                            }
+                            focus_next(app);
                             true
                         }
                         _ => false,
@@ -1092,6 +1153,34 @@ where
                 _ => {}
             }
         }
+    }
+}
+
+fn focus_next(app: &mut App) {
+    let next = match app.focus {
+        Focus::Files => Focus::Disks,
+        Focus::Disks => Focus::Packages,
+        Focus::Packages => Focus::Files,
+    };
+    set_focus(app, next);
+}
+
+fn focus_previous(app: &mut App) {
+    let previous = match app.focus {
+        Focus::Files => Focus::Packages,
+        Focus::Disks => Focus::Files,
+        Focus::Packages => Focus::Disks,
+    };
+    set_focus(app, previous);
+}
+
+fn set_focus(app: &mut App, focus: Focus) {
+    if app.focus != focus {
+        app.status.clear();
+    }
+    app.focus = focus;
+    if app.focus == Focus::Packages {
+        app.load_packages();
     }
 }
 

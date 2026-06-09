@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use crate::packages::{self, ManagerReport, ProjectDeps};
 use crate::scanner::{ScanId, ScanMsg, Scanner};
 
 const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
+const AUTO_SCAN_LIMIT: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -45,6 +46,7 @@ pub struct Entry {
     pub name_lower: String,
     pub path: PathBuf,
     pub is_dir: bool,
+    pub is_symlink: bool,
     pub size: Option<SizeInfo>,
     pub modified: Option<std::time::SystemTime>,
     pub scanning: bool,
@@ -208,15 +210,20 @@ impl App {
             }
             let path = dirent.path();
             let meta = std::fs::symlink_metadata(&path).ok();
-            let is_dir = meta
+            let file_type = meta.as_ref().map(|m| m.file_type());
+            let is_dir = file_type
                 .as_ref()
-                .map(|m| m.file_type().is_dir())
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false);
+            let is_symlink = file_type
+                .as_ref()
+                .map(|file_type| file_type.is_symlink())
                 .unwrap_or(false);
             let size = if is_dir {
                 self.size_cache.get(&path).copied()
             } else {
                 meta.as_ref().and_then(|m| {
-                    if m.file_type().is_file() {
+                    if m.file_type().is_file() || m.file_type().is_symlink() {
                         Some(SizeInfo::new(m.len(), m.blocks().saturating_mul(512)))
                     } else {
                         None
@@ -232,6 +239,7 @@ impl App {
                 name_lower,
                 path,
                 is_dir,
+                is_symlink,
                 size,
                 modified,
                 scanning: false,
@@ -254,7 +262,7 @@ impl App {
             SortMode::Name => self.entries.sort_by(|a, b| {
                 b.is_dir
                     .cmp(&a.is_dir)
-                    .then(a.name_lower.cmp(&b.name_lower))
+                    .then_with(|| natural_cmp(&a.name_lower, &b.name_lower))
             }),
             SortMode::SizeDesc => self
                 .entries
@@ -301,6 +309,7 @@ impl App {
                 let n = item_count as i32;
                 let s = self.selected as i32 + delta;
                 self.selected = s.rem_euclid(n) as usize;
+                self.scan_selected_missing_dir();
             }
             Focus::Disks => {
                 if self.disks.is_empty() {
@@ -321,28 +330,29 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
     pub fn page_move(&mut self, pages: i32) {
         let height = self.files_area.height.saturating_sub(2).max(1) as i32;
         self.move_cursor(pages * height);
     }
 
-    #[allow(dead_code)]
     pub fn move_to_start(&mut self) {
         match self.focus {
-            Focus::Files => self.selected = 0,
+            Focus::Files => {
+                self.selected = 0;
+                self.scan_selected_missing_dir();
+            }
             Focus::Disks => self.selected_disk = 0,
             Focus::Packages => self.selected_pkg = 0,
         }
     }
 
-    #[allow(dead_code)]
     pub fn move_to_end(&mut self) {
         match self.focus {
             Focus::Files => {
                 let n = self.visible_entry_count();
                 if n > 0 {
                     self.selected = n - 1;
+                    self.scan_selected_missing_dir();
                 }
             }
             Focus::Disks => {
@@ -433,28 +443,22 @@ impl App {
         self.reload()
     }
 
-    /// Scan only directories missing a size (usually because the cache didn't have them).
+    /// Scan only a small batch of nearby directories. Starting at `/` or other broad
+    /// roots should not recursively walk every child before the user asks for it.
     fn auto_scan(&mut self) {
-        let scan_id = self.next_scan_id();
-        let dirs: Vec<PathBuf> = self
+        let missing: Vec<PathBuf> = self
             .entries
             .iter()
             .filter(|e| e.is_dir && e.size.is_none())
             .map(|e| e.path.clone())
             .collect();
-        if dirs.is_empty() {
+        if missing.is_empty() {
             self.status = String::from("cache hit · all sizes known");
             return;
         }
-        for e in self
-            .entries
-            .iter_mut()
-            .filter(|e| e.is_dir && e.size.is_none())
-        {
-            e.scanning = true;
-        }
-        let dir_count = dirs.len();
-        self.start_scan(scan_id, dirs, format!("scanning {dir_count} directories…"));
+        let dirs = self.scan_candidates(AUTO_SCAN_LIMIT, &missing);
+        let status = limited_scan_status("scanning", dirs.len(), missing.len());
+        self.start_scan(dirs, status);
     }
 
     /// Invoked by the `r` key. Refreshes the directory view and rescans visible directories.
@@ -462,7 +466,6 @@ impl App {
         if self.confirming_delete {
             return;
         }
-        let scan_id = self.next_scan_id();
         let previous_selected = self
             .entries
             .get(self.selected)
@@ -478,20 +481,20 @@ impl App {
         self.restore_selection(previous_selected, previous_index);
         for e in self.entries.iter_mut().filter(|entry| entry.is_dir) {
             e.size = None;
-            e.scanning = true;
         }
-        let dirs: Vec<PathBuf> = self
+        let missing: Vec<PathBuf> = self
             .entries
             .iter()
             .filter(|e| e.is_dir)
             .map(|e| e.path.clone())
             .collect();
-        if dirs.is_empty() {
+        if missing.is_empty() {
             self.status = String::from("refresh complete · no directories to rescan");
             return;
         }
-        let dir_count = dirs.len();
-        self.start_scan(scan_id, dirs, format!("rescan: {dir_count} directories…"));
+        let dirs = self.scan_candidates(AUTO_SCAN_LIMIT, &missing);
+        let status = limited_scan_status("refresh scan", dirs.len(), missing.len());
+        self.start_scan(dirs, status);
     }
 
     pub fn drain_scan_results(&mut self) -> bool {
@@ -512,6 +515,12 @@ impl App {
                         }
                     }
                     self.scan_completed += 1;
+                    if self.scan_completed < self.scan_total {
+                        self.status = format!(
+                            "scanning directories: {}/{}",
+                            self.scan_completed, self.scan_total
+                        );
+                    }
                     if self.sort == SortMode::SizeDesc {
                         self.sort_dirty = true;
                     }
@@ -669,9 +678,55 @@ impl App {
             .unwrap_or_else(|| previous_index.min(self.entries.len().saturating_sub(1)));
     }
 
-    fn start_scan(&mut self, scan_id: ScanId, dirs: Vec<PathBuf>, status: String) {
+    fn scan_candidates(&self, limit: usize, missing: &[PathBuf]) -> Vec<PathBuf> {
+        if limit == 0 || missing.is_empty() {
+            return Vec::new();
+        }
+
+        let missing: HashSet<&Path> = missing.iter().map(PathBuf::as_path).collect();
+        let mut dirs = Vec::new();
+        let mut push_if_missing = |entry: &Entry| {
+            if dirs.len() < limit && entry.is_dir && missing.contains(entry.path.as_path()) {
+                dirs.push(entry.path.clone());
+            }
+        };
+
+        if let Some(entry) = self.entries.get(self.selected) {
+            push_if_missing(entry);
+        }
+        for entry in self.entries.iter().skip(self.selected.saturating_add(1)) {
+            push_if_missing(entry);
+        }
+        for entry in self.entries.iter().take(self.selected) {
+            push_if_missing(entry);
+        }
+        dirs
+    }
+
+    fn scan_selected_missing_dir(&mut self) {
+        let Some(entry) = self.entries.get(self.selected) else {
+            return;
+        };
+        if !entry.is_dir || entry.size.is_some() || entry.scanning {
+            return;
+        }
+        let name = entry.name.clone();
+        let path = entry.path.clone();
+        self.start_scan(vec![path], format!("scanning selected directory: {name}"));
+    }
+
+    fn start_scan(&mut self, dirs: Vec<PathBuf>, status: String) {
+        if dirs.is_empty() {
+            self.status = String::from("no directories to scan");
+            return;
+        }
+        let scan_id = self.next_scan_id();
         self.scan_total = dirs.len();
         self.scan_completed = 0;
+        let dir_set: HashSet<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        for entry in &mut self.entries {
+            entry.scanning = dir_set.contains(entry.path.as_path());
+        }
         match self.scanner.scan_all(scan_id, dirs) {
             Ok(()) => self.status = status,
             Err(err) => {
@@ -829,7 +884,6 @@ impl App {
         self.selected_disk = self.selected_disk.min(self.disks.len().saturating_sub(1));
     }
 
-    #[allow(dead_code)]
     pub fn enter_search(&mut self) {
         self.search_mode = true;
         self.search_query.clear();
@@ -838,19 +892,25 @@ impl App {
     }
 
     pub fn exit_search(&mut self) {
+        let selected_path = self
+            .visible_entry_index(self.selected)
+            .map(|entry_idx| self.entries.get(entry_idx).map(|entry| entry.path.clone()));
         self.search_mode = false;
         self.search_query.clear();
         self.search_matches.clear();
         self.file_list_offset = 0;
+        if let Some(Some(path)) = selected_path {
+            if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+                self.selected = index;
+            }
+        }
     }
 
-    #[allow(dead_code)]
     pub fn search_push(&mut self, ch: char) {
         self.search_query.push(ch);
         self.update_search();
     }
 
-    #[allow(dead_code)]
     pub fn search_pop(&mut self) {
         self.search_query.pop();
         if self.search_query.is_empty() {
@@ -862,7 +922,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
     fn update_search(&mut self) {
         let query = self.search_query.to_lowercase();
         self.search_matches = self
@@ -920,6 +979,14 @@ impl App {
     }
 }
 
+fn limited_scan_status(action: &str, scanning: usize, total: usize) -> String {
+    if scanning >= total {
+        format!("{action}: {total} directories")
+    } else {
+        format!("{action}: {scanning}/{total} directories · move or r to scan more")
+    }
+}
+
 pub fn human(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut value = bytes as f64;
@@ -967,7 +1034,7 @@ fn disk_info() -> Vec<DiskInfo> {
                 return None;
             }
             let fs_type = c_char_array_to_string(&stat.f_fstypename);
-            if matches!(fs_type.as_str(), "autofs" | "devfs") {
+            if !should_show_disk_mount(&mount, &fs_type) {
                 return None;
             }
             let block_size = u64::from(stat.f_bsize);
@@ -984,6 +1051,13 @@ fn disk_info() -> Vec<DiskInfo> {
             })
         })
         .collect()
+}
+
+fn should_show_disk_mount(mount: &str, fs_type: &str) -> bool {
+    if matches!(fs_type, "autofs" | "devfs") {
+        return false;
+    }
+    !mount.starts_with("/System/Volumes/") && !mount.starts_with("/private/var/")
 }
 
 fn c_char_array_to_string(chars: &[libc::c_char]) -> String {
@@ -1010,6 +1084,62 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     }
     child.wait().context("wait for pbcopy")?;
     Ok(())
+}
+
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let mut ai = 0;
+    let mut bi = 0;
+
+    while ai < a.len() && bi < b.len() {
+        let ac = a[ai];
+        let bc = b[bi];
+        if ac.is_ascii_digit() && bc.is_ascii_digit() {
+            let a_start = ai;
+            let b_start = bi;
+            while ai < a.len() && a[ai].is_ascii_digit() {
+                ai += 1;
+            }
+            while bi < b.len() && b[bi].is_ascii_digit() {
+                bi += 1;
+            }
+
+            let a_digits = &a[a_start..ai];
+            let b_digits = &b[b_start..bi];
+            let a_sig = trim_leading_zeroes(a_digits);
+            let b_sig = trim_leading_zeroes(b_digits);
+            match a_sig.len().cmp(&b_sig.len()) {
+                Ordering::Equal => match a_sig.cmp(b_sig) {
+                    Ordering::Equal => match a_digits.len().cmp(&b_digits.len()) {
+                        Ordering::Equal => {}
+                        ordering => return ordering,
+                    },
+                    ordering => return ordering,
+                },
+                ordering => return ordering,
+            }
+            continue;
+        }
+
+        match ac.cmp(&bc) {
+            Ordering::Equal => {
+                ai += 1;
+                bi += 1;
+            }
+            ordering => return ordering,
+        }
+    }
+
+    a.len().cmp(&b.len())
+}
+
+fn trim_leading_zeroes(digits: &[u8]) -> &[u8] {
+    let trimmed = digits.iter().position(|digit| *digit != b'0');
+    match trimmed {
+        Some(index) => &digits[index..],
+        None => &digits[digits.len().saturating_sub(1)..],
+    }
 }
 
 #[cfg(test)]
@@ -1195,6 +1325,111 @@ mod tests {
         assert_eq!(app.entries[app.selected].path, child);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_scan_is_bounded_for_broad_directories() {
+        let root = test_root("bounded_scan");
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..8 {
+            fs::create_dir_all(root.join(format!("dir-{i}"))).unwrap();
+        }
+
+        let app = App::new(root.clone()).unwrap();
+        let scanning_count = app.entries.iter().filter(|entry| entry.scanning).count();
+
+        assert_eq!(scanning_count, AUTO_SCAN_LIMIT);
+        assert!(app.status.contains("4/8 directories"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn moving_to_unscanned_directory_starts_selected_scan() {
+        let root = test_root("selected_scan");
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..6 {
+            fs::create_dir_all(root.join(format!("dir-{i}"))).unwrap();
+        }
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        app.selected = 5;
+        for entry in &mut app.entries {
+            entry.scanning = false;
+        }
+
+        app.move_cursor(0);
+
+        assert!(app.entries[app.selected].scanning);
+        assert!(app.status.contains("scanning selected directory"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn name_sort_uses_natural_numeric_order() {
+        let root = test_root("natural_sort");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file-10.txt"), b"x").unwrap();
+        fs::write(root.join("file-2.txt"), b"x").unwrap();
+        fs::write(root.join("file-1.txt"), b"x").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        let names: Vec<_> = app
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["file-1.txt", "file-2.txt", "file-10.txt"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn symlinks_are_marked_and_sized() {
+        let root = test_root("symlink");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target.txt");
+        let link = root.join("link.txt");
+        fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let app = App::new(root.clone()).unwrap();
+        let entry = app.entries.iter().find(|entry| entry.path == link).unwrap();
+
+        assert!(entry.is_symlink);
+        assert!(entry.size.is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_exit_preserves_selected_match() {
+        let root = test_root("search");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("alpha.txt"), b"x").unwrap();
+        fs::write(root.join("beta.txt"), b"x").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        app.enter_search();
+        app.search_push('b');
+        app.exit_search();
+
+        assert_eq!(app.entries[app.selected].name, "beta.txt");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disk_filter_hides_macos_system_volumes() {
+        assert!(!should_show_disk_mount("/System/Volumes/VM", "apfs"));
+        assert!(!should_show_disk_mount("/System/Volumes/Data", "apfs"));
+        assert!(!should_show_disk_mount("/private/var/run", "apfs"));
+        assert!(!should_show_disk_mount("/dev", "devfs"));
+        assert!(should_show_disk_mount("/", "apfs"));
+        assert!(should_show_disk_mount("/Volumes/External", "apfs"));
     }
 
     #[test]

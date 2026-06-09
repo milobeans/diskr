@@ -34,15 +34,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(root[1]);
 
-    let disk_height = if app.disks.is_empty() {
-        3
-    } else {
-        (app.disks.len() as u16 * 4) + 2
-    };
+    let packages_visible =
+        app.focus == Focus::Packages || app.packages_loaded || app.packages_loading;
+    let (disk_height, package_height) =
+        side_panel_heights(body[1].height, app.disks.len(), packages_visible);
 
     let side = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(disk_height), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(disk_height),
+            Constraint::Length(package_height),
+        ])
         .split(body[1]);
 
     draw_files(f, body[0], app);
@@ -122,10 +124,18 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                 (true, _, true) => format!("{} scanning…", spinner_char()),
                 (true, Some(size), _) => human(size_sort_key(size)),
                 (true, None, _) => String::from("—"),
+                (false, Some(size), _) if e.is_symlink => human(size_sort_key(size)),
+                (false, None, _) if e.is_symlink => String::from("link"),
                 (false, Some(size), _) => human(size_sort_key(size)),
                 (false, None, _) => String::from("?"),
             };
-            let icon = if e.is_dir { "▸ " } else { "  " };
+            let icon = if e.is_dir {
+                "▸ "
+            } else if e.is_symlink {
+                "↪ "
+            } else {
+                "  "
+            };
             let name_style = if e.is_dir {
                 Style::default()
                     .fg(Color::Blue)
@@ -196,6 +206,9 @@ fn file_window_bounds(
 }
 
 fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
     let border_color = if app.focus == Focus::Disks {
         Color::Yellow
     } else {
@@ -215,32 +228,44 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
+    if inner.height < 4 {
+        let selected = app
+            .disks
+            .get(app.selected_disk)
+            .map(disk_label)
+            .unwrap_or_else(|| String::from("no disks"));
+        f.render_widget(
+            Paragraph::new(truncate(&selected, inner.width as usize)).alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+    let max_rows = (inner.height / 4).max(1) as usize;
+    let (offset, end) = disk_window_bounds(app.selected_disk, app.disks.len(), max_rows);
+    let visible_disks = &app.disks[offset..end];
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
-            app.disks
+            visible_disks
                 .iter()
                 .map(|_| Constraint::Length(4))
                 .collect::<Vec<_>>(),
         )
         .split(inner);
 
-    for (i, d) in app.disks.iter().enumerate() {
-        if i >= rows.len() {
+    for (visible_i, d) in visible_disks.iter().enumerate() {
+        if visible_i >= rows.len() {
             break;
         }
-        let selected = app.focus == Focus::Disks && i == app.selected_disk;
+        let disk_index = offset + visible_i;
+        let selected = app.focus == Focus::Disks && disk_index == app.selected_disk;
         let used = d.total.saturating_sub(d.available);
         let pct = if d.total > 0 {
             (used as f64 / d.total as f64 * 100.0) as u16
         } else {
             0
         };
-        let disk_name = if d.name.is_empty() {
-            d.mount.display().to_string()
-        } else {
-            format!("{}  {}", d.name, d.mount.display())
-        };
+        let disk_name = disk_label(d);
         let label = if selected {
             format!("> {}  {} / {}", disk_name, human(used), human(d.total))
         } else {
@@ -261,11 +286,14 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
             .block(Block::default().title(label))
             .gauge_style(gauge_style)
             .percent(pct.min(100));
-        f.render_widget(gauge, rows[i]);
+        f.render_widget(gauge, rows[visible_i]);
     }
 }
 
 fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
     let border_color = if app.focus == Focus::Packages {
         Color::Yellow
     } else {
@@ -473,6 +501,29 @@ fn package_line(
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    if app.search_mode {
+        let query = if app.search_query.is_empty() {
+            String::from("/")
+        } else {
+            format!("/{}", app.search_query)
+        };
+        let count = app.visible_entry_count();
+        let text = Line::from(vec![
+            Span::styled("search ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                query,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {count} matches · Enter keep · Esc clear"),
+                Style::default().fg(Color::Gray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
+        return;
+    }
     let mut spans = selection_status(app);
     if !app.status.is_empty() {
         spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
@@ -498,8 +549,14 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("↑↓/jk"),
         label(" move"),
         sep(),
+        key("Pg/Home"),
+        label(" jump"),
+        sep(),
         key("←→/hl"),
-        label(" views"),
+        label(" pane/view"),
+        sep(),
+        key("/"),
+        label(" search"),
         sep(),
         key("⏎"),
         label(" open"),
@@ -541,7 +598,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
 }
 
 fn draw_confirm(f: &mut Frame, app: &App) {
-    let area = centered_rect(60, 20, f.area());
+    let area = centered_rect(60, 20, 40, 6, f.area());
     f.render_widget(Clear, area);
     let name = app.pending_delete_name();
     let body = vec![
@@ -565,23 +622,22 @@ fn draw_confirm(f: &mut Frame, app: &App) {
     );
 }
 
-fn centered_rect(px: u16, py: u16, area: Rect) -> Rect {
-    let popup = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - py) / 2),
-            Constraint::Percentage(py),
-            Constraint::Percentage((100 - py) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - px) / 2),
-            Constraint::Percentage(px),
-            Constraint::Percentage((100 - px) / 2),
-        ])
-        .split(popup[1])[1]
+fn centered_rect(px: u16, py: u16, min_width: u16, min_height: u16, area: Rect) -> Rect {
+    let width = area
+        .width
+        .saturating_mul(px)
+        .saturating_div(100)
+        .max(min_width)
+        .min(area.width);
+    let height = area
+        .height
+        .saturating_mul(py)
+        .saturating_div(100)
+        .max(min_height)
+        .min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -646,6 +702,21 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                     .size
                     .map(size_detail)
                     .unwrap_or_else(|| String::from("—"));
+                spans.push(Span::styled(size, Style::default().fg(Color::Green)));
+            }
+            Some(entry) if entry.is_symlink => {
+                spans.push(Span::styled("link ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    truncate(&entry.name, 28),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+                let size = entry
+                    .size
+                    .map(size_detail)
+                    .unwrap_or_else(|| String::from("symlink"));
                 spans.push(Span::styled(size, Style::default().fg(Color::Green)));
             }
             Some(entry) => {
@@ -772,6 +843,47 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
     spans
 }
 
+fn side_panel_heights(side_height: u16, disk_count: usize, packages_visible: bool) -> (u16, u16) {
+    if side_height == 0 {
+        return (0, 0);
+    }
+    if side_height <= 8 {
+        return (side_height, 0);
+    }
+
+    let desired_disk_height = if disk_count == 0 {
+        3
+    } else {
+        (disk_count as u16).saturating_mul(4).saturating_add(2)
+    };
+    let min_package_height = if packages_visible { 7 } else { 5 };
+    let reserved_package_height = min_package_height.min(side_height.saturating_sub(6));
+    let max_disk_height = side_height.saturating_sub(reserved_package_height);
+    let disk_height = desired_disk_height.min(max_disk_height).max(3);
+    (disk_height, side_height.saturating_sub(disk_height))
+}
+
+fn disk_window_bounds(selected: usize, total_items: usize, max_rows: usize) -> (usize, usize) {
+    if total_items == 0 {
+        return (0, 0);
+    }
+    let max_rows = max_rows.max(1);
+    let selected = selected.min(total_items.saturating_sub(1));
+    let half = max_rows / 2;
+    let max_offset = total_items.saturating_sub(max_rows);
+    let offset = selected.saturating_sub(half).min(max_offset);
+    let end = (offset + max_rows).min(total_items);
+    (offset, end)
+}
+
+fn disk_label(disk: &crate::app::DiskInfo) -> String {
+    if disk.name.is_empty() {
+        disk.mount.display().to_string()
+    } else {
+        format!("{}  {}", disk.name, disk.mount.display())
+    }
+}
+
 fn size_detail(size: SizeInfo) -> String {
     if size.allocated == size.logical {
         return human(size.logical);
@@ -844,8 +956,15 @@ mod tests {
     #[test]
     fn centered_rect_uses_expected_percent_area() {
         let area = Rect::new(0, 0, 100, 40);
-        let got = centered_rect(60, 20, area);
+        let got = centered_rect(60, 20, 40, 6, area);
         assert_eq!(got, Rect::new(20, 16, 60, 8));
+    }
+
+    #[test]
+    fn centered_rect_respects_minimum_size() {
+        let area = Rect::new(0, 0, 80, 24);
+        let got = centered_rect(60, 20, 40, 6, area);
+        assert_eq!(got.height, 6);
     }
 
     #[test]
@@ -861,6 +980,18 @@ mod tests {
     #[test]
     fn package_columns_hide_size_when_narrow() {
         assert_eq!(package_columns(12), (12, 0));
+    }
+
+    #[test]
+    fn side_panel_keeps_room_for_packages() {
+        assert_eq!(side_panel_heights(21, 12, true), (14, 7));
+    }
+
+    #[test]
+    fn disk_window_tracks_selected_disk() {
+        assert_eq!(disk_window_bounds(0, 12, 3), (0, 3));
+        assert_eq!(disk_window_bounds(8, 12, 3), (7, 10));
+        assert_eq!(disk_window_bounds(11, 12, 3), (9, 12));
     }
 
     #[test]

@@ -6,7 +6,7 @@ A fast, macOS-native terminal file explorer and disk analyzer built in Rust.
 
 Most disk usage tools show you a tree of sizes and leave you to figure out the rest. diskr goes further: it tells you *what changed*, *what's reclaimable*, and *why your free space doesn't match what Finder says*.
 
-**Fast scanning.** Directory sizing uses `getattrlistbulk(2)`, a macOS syscall that returns attributes for many entries in a single kernel crossing. Where the typical `readdir` + `stat` pattern makes one syscall per file, diskr batches them -- 3-10x faster on directories with thousands of small files like `node_modules` or `~/Library/Caches`. Scans run on a thread pool so the TUI stays responsive while subdirectory sizes stream in.
+**Fast, lazy scanning.** Directory sizing uses `getattrlistbulk(2)`, a macOS syscall that returns attributes for many entries in a single kernel crossing. Where the typical `readdir` + `stat` pattern makes one syscall per file, diskr batches them -- 3-10x faster on directories with thousands of small files like `node_modules` or `~/Library/Caches`. Scans run on a thread pool and are started in small batches around the current selection, so opening `/` or another broad directory does not immediately walk every child subtree.
 
 **Allocated vs. apparent size.** APFS clones, sparse files, and compressed files mean logical size and on-disk size often diverge. diskr tracks both, sorts by allocated size, and shows apparent size when they differ. This is the number you actually care about when reclaiming space.
 
@@ -61,13 +61,17 @@ diskr --thin-snapshots 10G --yes ~ # execute it
 | Key | Action |
 | --- | --- |
 | Up/Down, j/k | Move selection |
+| PageUp/PageDown | Move by a page |
+| Home/End | Jump to first or last item |
 | Enter | Open selected directory, disk, or package path |
 | p | Open packages pane or switch package view |
 | Backspace | Go to parent directory |
+| / | Search files in the current directory |
+| Left/Right, h/l | Switch pane or package view |
 | Space | Quick Look selected item |
 | f | Reveal selected item in Finder |
 | O | Open selected item with the default app |
-| r | Refresh the current view and rescan directory sizes |
+| r | Refresh the current view and rescan a nearby batch of directory sizes |
 | o | Cycle sort mode |
 | . | Toggle hidden files |
 | d | Move selected item to Trash |
