@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 
-use app::{human, App, Focus};
+use app::{human, App, Focus, PkgView};
 use terminal_backend::CrosstermBackend;
 
 fn main() -> Result<()> {
@@ -42,7 +42,13 @@ fn main() -> Result<()> {
         CliAction::Save { path, json } => save_baseline(path, json),
         CliAction::Diff { path, json } => print_diff(path, json),
         CliAction::Space { path, json } => print_space(path, json),
-        CliAction::Packages { path, json } => print_packages(path, json),
+        CliAction::Packages { path, json } => {
+            if json {
+                print_packages(path, json)
+            } else {
+                run_packages_app(path)
+            }
+        }
         CliAction::ThinSnapshots {
             path,
             bytes,
@@ -53,6 +59,14 @@ fn main() -> Result<()> {
 }
 
 fn run_app(start: PathBuf) -> Result<()> {
+    run_app_with(start, None)
+}
+
+fn run_packages_app(start: PathBuf) -> Result<()> {
+    run_app_with(start, Some(Focus::Packages))
+}
+
+fn run_app_with(start: PathBuf, initial_focus: Option<Focus>) -> Result<()> {
     if !start.exists() {
         bail!("path does not exist: {}", start.display());
     }
@@ -64,6 +78,11 @@ fn run_app(start: PathBuf) -> Result<()> {
     }
 
     let mut app = App::new(start)?;
+    if initial_focus == Some(Focus::Packages) {
+        app.focus = Focus::Packages;
+        app.pkg_view = PkgView::SystemManagers;
+        app.load_packages();
+    }
 
     let _terminal_guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -158,7 +177,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
             "--space" => {
                 space_report = true;
             }
-            "--packages" => {
+            "-p" | "--packages" => {
                 packages_report = true;
             }
             "--thin-snapshots" => {
@@ -281,7 +300,8 @@ Usage:
   diskr --save [--json] [PATH]
   diskr --diff [--json] [PATH]
   diskr --space [--json] [PATH]
-  diskr --packages [--json] [PATH]
+  diskr --packages [PATH]
+  diskr --packages --json [PATH]
   diskr --thin-snapshots SIZE [--yes] [PATH]
 
 Keys:
@@ -1393,6 +1413,30 @@ mod tests {
             CliAction::Packages {
                 path,
                 json: true
+            } if path == std::path::Path::new("/tmp")
+        ));
+    }
+
+    #[test]
+    fn parses_interactive_packages_mode() {
+        let action = parse(&["--packages", "/tmp"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::Packages {
+                path,
+                json: false
+            } if path == std::path::Path::new("/tmp")
+        ));
+    }
+
+    #[test]
+    fn parses_short_interactive_packages_mode() {
+        let action = parse(&["-p", "/tmp"]).unwrap();
+        assert!(matches!(
+            action,
+            CliAction::Packages {
+                path,
+                json: false
             } if path == std::path::Path::new("/tmp")
         ));
     }
