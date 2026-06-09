@@ -15,6 +15,7 @@ use ratatui_widgets::{
 
 use crate::app::{human, size_sort_key, App, Focus, PkgView};
 use crate::bulkstat::SizeInfo;
+use crate::packages::{DepEvidence, PackageUseStatus};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::default()
@@ -365,7 +366,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         ),
         Span::styled(total_str, Style::default().fg(Color::Green)),
         if app.pkg_show_unused {
-            Span::styled(" [removable]", Style::default().fg(Color::Magenta))
+            Span::styled(" [dependency leaves]", Style::default().fg(Color::Magenta))
         } else {
             Span::raw("")
         },
@@ -471,16 +472,17 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
                         .size
                         .map(|s| human(s.allocated))
                         .unwrap_or_else(|| String::from("?"));
-                    let removable = app
+                    let use_status = app
                         .dep_graph
                         .as_ref()
-                        .map(|g| g.is_removable(*manager, &package.name));
+                        .map(|g| g.use_status(*manager, &package.name))
+                        .unwrap_or(PackageUseStatus::Untracked);
                     Some(package_line_with_version(
                         manager.label(),
                         &package.name,
                         &package.version,
                         &size,
-                        removable,
+                        use_status,
                         inner_width,
                     ))
                 }
@@ -522,7 +524,7 @@ fn package_line_with_version(
     name: &str,
     version: &str,
     size: &str,
-    removable: Option<bool>,
+    use_status: PackageUseStatus,
     inner_width: u16,
 ) -> ListItem<'static> {
     let (name_width, size_width) = package_columns(inner_width);
@@ -531,10 +533,10 @@ fn package_line_with_version(
     } else {
         format!("@{version}")
     };
-    let dep_indicator = match removable {
-        Some(true) => "  ",
-        Some(false) => "* ",
-        None => "  ",
+    let dep_indicator = match use_status {
+        PackageUseStatus::RequiredByDependents => "* ",
+        PackageUseStatus::DependencyLeaf => "  ",
+        PackageUseStatus::Untracked => "? ",
     };
     let mgr_label = format!("{manager} ");
     let name_budget = name_width
@@ -544,8 +546,8 @@ fn package_line_with_version(
     let name_truncated = truncate(&name_ver, name_budget);
     let padded_name = format!("{name_truncated:<width$}", width = name_budget);
 
-    let dep_style = match removable {
-        Some(false) => Style::default().fg(Color::DarkGray),
+    let dep_style = match use_status {
+        PackageUseStatus::Untracked => Style::default().fg(Color::Yellow),
         _ => Style::default().fg(Color::DarkGray),
     };
     let mut spans = vec![
@@ -702,7 +704,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         label(" info"),
         sep(),
         key("u"),
-        label(" unused"),
+        label(" leaves"),
         sep(),
         key("x"),
         label(" uninstall"),
@@ -818,7 +820,7 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
     lines.push(Line::from(""));
 
     match dep_info {
-        Some(info) => {
+        Some(info) if info.evidence == DepEvidence::ManagerGraph => {
             let dep_text = if info.dependencies.is_empty() {
                 String::from("none")
             } else {
@@ -835,7 +837,7 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
             ]));
 
             let rev_text = if info.dependents.is_empty() {
-                String::from("none (removable)")
+                String::from("none in manager graph")
             } else {
                 let max_len = area.width.saturating_sub(14) as usize;
                 let joined = info.dependents.join(", ");
@@ -853,6 +855,16 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
                 ),
                 Span::styled(rev_text, rev_style),
             ]));
+        }
+        Some(_) => {
+            lines.push(Line::from(Span::styled(
+                "  Usage: not dependency-tracked by this package manager",
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  This can still be a runtime, app, environment, CLI, or manually used tool.",
+                Style::default().fg(Color::Gray),
+            )));
         }
         None => {
             if app.deps_loading {

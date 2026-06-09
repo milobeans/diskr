@@ -292,7 +292,7 @@ Keys:
   Backspace       Go to parent directory
   /               Search files or filter packages
   i               Show package details (deps, reverse deps)
-  u               Toggle showing only removable packages
+  u               Toggle dependency-leaf package filter
   x               Uninstall selected package via its manager
   Left/Right, h/l Switch pane or package view
   Space           Quick Look selected item

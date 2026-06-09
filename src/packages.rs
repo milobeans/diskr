@@ -71,10 +71,48 @@ impl Manager {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepEvidence {
+    ManagerGraph,
+    Untracked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageUseStatus {
+    DependencyLeaf,
+    RequiredByDependents,
+    Untracked,
+}
+
+#[derive(Clone, Debug)]
 pub struct DepInfo {
     pub dependencies: Vec<String>,
     pub dependents: Vec<String>,
+    pub evidence: DepEvidence,
+}
+
+impl Default for DepInfo {
+    fn default() -> Self {
+        Self {
+            dependencies: Vec::new(),
+            dependents: Vec::new(),
+            evidence: DepEvidence::Untracked,
+        }
+    }
+}
+
+impl DepInfo {
+    fn tracked(dependencies: Vec<String>, dependents: Vec<String>) -> Self {
+        Self {
+            dependencies,
+            dependents,
+            evidence: DepEvidence::ManagerGraph,
+        }
+    }
+
+    pub fn is_dependency_leaf(&self) -> bool {
+        self.evidence == DepEvidence::ManagerGraph && self.dependents.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -97,17 +135,24 @@ impl DepGraph {
         }
     }
 
-    pub fn is_removable(&self, manager: Manager, name: &str) -> bool {
+    pub fn use_status(&self, manager: Manager, name: &str) -> PackageUseStatus {
         match self.entries.get(&(manager, name.to_string())) {
-            Some(info) => info.dependents.is_empty(),
-            None => true,
+            Some(info)
+                if info.evidence == DepEvidence::ManagerGraph && info.dependents.is_empty() =>
+            {
+                PackageUseStatus::DependencyLeaf
+            }
+            Some(info) if info.evidence == DepEvidence::ManagerGraph => {
+                PackageUseStatus::RequiredByDependents
+            }
+            _ => PackageUseStatus::Untracked,
         }
     }
 
-    pub fn removable_count(&self) -> usize {
+    pub fn dependency_leaf_count(&self) -> usize {
         self.entries
             .values()
-            .filter(|info| info.dependents.is_empty())
+            .filter(|info| info.is_dependency_leaf())
             .count()
     }
 }
@@ -228,16 +273,13 @@ fn parse_brew_dep_graph(output: &str) -> HashMap<String, DepInfo> {
     let mut result: HashMap<String, DepInfo> = HashMap::new();
     for (name, deps) in &forward {
         let dependents = reverse.remove(name).unwrap_or_default();
-        result.insert(
-            name.clone(),
-            DepInfo {
-                dependencies: deps.clone(),
-                dependents,
-            },
-        );
+        result.insert(name.clone(), DepInfo::tracked(deps.clone(), dependents));
     }
     for (name, dependents) in reverse {
-        result.entry(name).or_default().dependents = dependents;
+        result
+            .entry(name)
+            .and_modify(|info| info.dependents = dependents.clone())
+            .or_insert_with(|| DepInfo::tracked(Vec::new(), dependents));
     }
     result
 }
@@ -267,10 +309,7 @@ fn parse_pip_show_output(output: &str) -> HashMap<String, DepInfo> {
         if !name.is_empty() {
             result.insert(
                 std::mem::take(name),
-                DepInfo {
-                    dependencies: std::mem::take(deps),
-                    dependents: std::mem::take(rev),
-                },
+                DepInfo::tracked(std::mem::take(deps), std::mem::take(rev)),
             );
         }
     };

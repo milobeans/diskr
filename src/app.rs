@@ -917,13 +917,13 @@ impl App {
 
         match recv {
             Ok(msg) => {
-                let removable = msg.graph.removable_count();
+                let dependency_leaves = msg.graph.dependency_leaf_count();
                 self.dep_graph = Some(msg.graph);
                 self.deps_loading = false;
                 self.dep_scan_rx = None;
                 let total = self.cached_flat_packages.len();
                 self.status = format!(
-                    "{total} packages · {removable} removable · u to filter · i for details"
+                    "{total} packages · {dependency_leaves} dependency leaves · u to filter · i for details"
                 );
                 true
             }
@@ -972,7 +972,7 @@ impl App {
         self.pkg_search_query.clear();
         self.pkg_search_mode = false;
         if self.pkg_show_unused {
-            self.status = String::from("showing removable packages only");
+            self.status = String::from("showing dependency leaves only");
         } else {
             self.status = String::from("showing all packages");
         }
@@ -1078,7 +1078,7 @@ impl App {
         let Some((pkg, manager)) = self.cached_flat_packages.get(idx) else {
             return false;
         };
-        graph.is_removable(*manager, &pkg.name)
+        graph.use_status(*manager, &pkg.name) == packages::PackageUseStatus::DependencyLeaf
     }
 
     fn base_pkg_indices(&self) -> Vec<usize> {
@@ -1552,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn removable_package_filter_maps_visible_indices_to_real_packages() {
+    fn dependency_leaf_filter_excludes_untracked_packages() {
         let root = test_root("pkg_unused_filter");
         fs::create_dir_all(&root).unwrap();
 
@@ -1578,12 +1578,25 @@ mod tests {
                 },
                 packages::Manager::Brew,
             ),
+            (
+                packages::Package {
+                    name: "miniconda".into(),
+                    version: "base".into(),
+                    size: None,
+                    path: None,
+                },
+                packages::Manager::BrewCask,
+            ),
         ];
         app.dep_graph = Some(packages::DepGraph::from_entries(vec![
             (
                 packages::Manager::Brew,
                 "leaf",
-                packages::DepInfo::default(),
+                packages::DepInfo {
+                    dependencies: Vec::new(),
+                    dependents: Vec::new(),
+                    evidence: packages::DepEvidence::ManagerGraph,
+                },
             ),
             (
                 packages::Manager::Brew,
@@ -1591,6 +1604,16 @@ mod tests {
                 packages::DepInfo {
                     dependencies: Vec::new(),
                     dependents: vec!["app".into()],
+                    evidence: packages::DepEvidence::ManagerGraph,
+                },
+            ),
+            (
+                packages::Manager::BrewCask,
+                "miniconda",
+                packages::DepInfo {
+                    dependencies: Vec::new(),
+                    dependents: Vec::new(),
+                    evidence: packages::DepEvidence::Untracked,
                 },
             ),
         ]));
