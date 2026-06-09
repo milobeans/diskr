@@ -272,8 +272,6 @@ impl App {
             };
             let modified = meta.as_ref().and_then(|m| m.modified().ok());
             let name_lower = name.to_lowercase();
-            let idx = self.entries.len();
-            self.entry_index.insert(path.clone(), idx);
             self.entries.push(Entry {
                 name,
                 name_lower,
