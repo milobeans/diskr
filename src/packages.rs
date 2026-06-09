@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 
+use rayon::prelude::*;
+
 use crate::bulkstat::{self, SizeInfo};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,31 +131,88 @@ fn scan_manager(manager: Manager) -> ManagerReport {
 
 fn scan_brew_formulae() -> Vec<Package> {
     let cellar = brew_prefix().join("Cellar");
-    if !cellar.is_dir() {
-        return Vec::new();
-    }
-    let output = run_command("brew", &["list", "--formula", "--versions"]);
-    parse_brew_list(&output, &cellar)
+    scan_brew_dir(&cellar)
 }
 
 fn scan_brew_casks() -> Vec<Package> {
     let caskroom = brew_prefix().join("Caskroom");
-    if !caskroom.is_dir() {
-        return Vec::new();
-    }
-    let output = run_command("brew", &["list", "--cask", "--versions"]);
-    parse_brew_list(&output, &caskroom)
+    scan_brew_dir(&caskroom)
 }
 
-fn parse_brew_list(output: &str, install_dir: &Path) -> Vec<Package> {
-    output
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let mut parts = line.split_whitespace();
-            let name = parts.next().unwrap_or("").to_string();
-            let version = parts.next().unwrap_or("").to_string();
-            let pkg_path = install_dir.join(&name);
+fn scan_brew_dir(install_dir: &Path) -> Vec<Package> {
+    if !install_dir.is_dir() {
+        return Vec::new();
+    }
+    let Ok(read) = std::fs::read_dir(install_dir) else {
+        return Vec::new();
+    };
+    let entries: Vec<_> = read
+        .flatten()
+        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let pkg_path = e.path();
+            (name, pkg_path)
+        })
+        .collect();
+
+    entries
+        .into_par_iter()
+        .map(|(name, pkg_path)| {
+            let version = latest_subdir_name(&pkg_path);
+            let size = Some(bulkstat::scan_dir(&pkg_path, 0).size);
+            Package {
+                name,
+                version,
+                size,
+                path: Some(pkg_path),
+            }
+        })
+        .collect()
+}
+
+fn latest_subdir_name(dir: &Path) -> String {
+    std::fs::read_dir(dir)
+        .ok()
+        .and_then(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+                .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
+}
+
+fn scan_npm_global() -> Vec<Package> {
+    let output = run_command("npm", &["list", "-g", "--depth=0", "--json"]);
+    if output.is_empty() {
+        return Vec::new();
+    }
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output) else {
+        return Vec::new();
+    };
+    let Some(deps) = parsed.get("dependencies").and_then(|d| d.as_object()) else {
+        return Vec::new();
+    };
+
+    let global_root = find_npm_global_root();
+
+    let entries: Vec<_> = deps
+        .iter()
+        .map(|(name, info)| {
+            let version = info
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            (name.clone(), version)
+        })
+        .collect();
+
+    entries
+        .into_par_iter()
+        .map(|(name, version)| {
+            let pkg_path = global_root.join(&name);
             let size = if pkg_path.is_dir() {
                 Some(bulkstat::scan_dir(&pkg_path, 0).size)
             } else {
@@ -169,42 +228,51 @@ fn parse_brew_list(output: &str, install_dir: &Path) -> Vec<Package> {
         .collect()
 }
 
-fn scan_npm_global() -> Vec<Package> {
-    let output = run_command("npm", &["list", "-g", "--depth=0", "--json"]);
-    if output.is_empty() {
-        return Vec::new();
-    }
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output) else {
-        return Vec::new();
-    };
-    let Some(deps) = parsed.get("dependencies").and_then(|d| d.as_object()) else {
-        return Vec::new();
-    };
-
-    let global_root = run_command("npm", &["root", "-g"]).trim().to_string();
-    let global_root = PathBuf::from(&global_root);
-
-    deps.iter()
-        .map(|(name, info)| {
-            let version = info
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let pkg_path = global_root.join(name);
-            let size = if pkg_path.is_dir() {
-                Some(bulkstat::scan_dir(&pkg_path, 0).size)
-            } else {
-                None
-            };
-            Package {
-                name: name.clone(),
-                version,
-                size,
-                path: Some(pkg_path),
+fn find_npm_global_root() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(ref home) = home {
+        if let Some(nvm_dir) = std::env::var_os("NVM_DIR") {
+            let nvm_current = PathBuf::from(nvm_dir).join("versions/node");
+            if let Ok(rd) = std::fs::read_dir(&nvm_current) {
+                if let Some(latest) = rd
+                    .flatten()
+                    .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+                    .max_by_key(|e| e.file_name())
+                {
+                    let root = latest.path().join("lib/node_modules");
+                    if root.is_dir() {
+                        return root;
+                    }
+                }
             }
-        })
-        .collect()
+        }
+        let fnm = home.join(".local/share/fnm/node-versions");
+        if fnm.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&fnm) {
+                if let Some(latest) = rd
+                    .flatten()
+                    .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+                    .max_by_key(|e| e.file_name())
+                {
+                    let root = latest.path().join("installation/lib/node_modules");
+                    if root.is_dir() {
+                        return root;
+                    }
+                }
+            }
+        }
+    }
+    let known = if cfg!(target_arch = "aarch64") {
+        "/opt/homebrew/lib/node_modules"
+    } else {
+        "/usr/local/lib/node_modules"
+    };
+    let known_path = PathBuf::from(known);
+    if known_path.is_dir() {
+        return known_path;
+    }
+    let fallback = run_command("npm", &["root", "-g"]).trim().to_string();
+    PathBuf::from(fallback)
 }
 
 fn scan_pip() -> Vec<Package> {
@@ -221,7 +289,8 @@ fn scan_pip() -> Vec<Package> {
 
     let site_packages = find_pip_site_packages();
 
-    arr.iter()
+    let entries: Vec<_> = arr
+        .iter()
         .filter_map(|entry| {
             let name = entry.get("name")?.as_str()?.to_string();
             let version = entry
@@ -229,6 +298,13 @@ fn scan_pip() -> Vec<Package> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            Some((name, version))
+        })
+        .collect();
+
+    entries
+        .into_par_iter()
+        .map(|(name, version)| {
             let (size, path) = if let Some(sp) = &site_packages {
                 let pkg_dir = sp.join(&name);
                 let pkg_dir_alt = sp.join(name.replace('-', "_"));
@@ -246,12 +322,12 @@ fn scan_pip() -> Vec<Package> {
             } else {
                 (None, None)
             };
-            Some(Package {
+            Package {
                 name,
                 version,
                 size,
                 path,
-            })
+            }
         })
         .collect()
 }
@@ -316,14 +392,13 @@ fn scan_bun_global() -> Vec<Package> {
         .as_ref()
         .map(|h| h.join(".bun/install/global/node_modules"));
 
-    output
+    let entries: Vec<_> = output
         .lines()
         .filter_map(|line| {
             let line = line.trim();
             if line.is_empty() || !line.contains('@') {
                 return None;
             }
-            // Lines look like: "package@version" or "├── package@version"
             let cleaned = line.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '@');
             let (name, version) = if let Some(at_pos) = cleaned.rfind('@') {
                 if at_pos == 0 {
@@ -336,7 +411,13 @@ fn scan_bun_global() -> Vec<Package> {
             } else {
                 (cleaned.to_string(), String::new())
             };
+            Some((name, version))
+        })
+        .collect();
 
+    entries
+        .into_par_iter()
+        .map(|(name, version)| {
             let (size, path) = if let Some(global_dir) = &bun_global {
                 let pkg_path = global_dir.join(&name);
                 if pkg_path.is_dir() {
@@ -347,20 +428,20 @@ fn scan_bun_global() -> Vec<Package> {
             } else {
                 (None, None)
             };
-
-            Some(Package {
+            Package {
                 name,
                 version,
                 size,
                 path,
-            })
+            }
         })
         .collect()
 }
 
 pub fn find_project_deps(root: &Path, max_depth: usize) -> Vec<ProjectDeps> {
-    let mut results = Vec::new();
-    find_project_deps_recursive(root, 0, max_depth, &mut results);
+    let results = std::sync::Mutex::new(Vec::new());
+    find_project_deps_parallel(root, 0, max_depth, &results);
+    let mut results = results.into_inner().unwrap_or_default();
     results.sort_by(|a, b| {
         let a_size = a.deps_size.map(|s| s.allocated).unwrap_or(0);
         let b_size = b.deps_size.map(|s| s.allocated).unwrap_or(0);
@@ -379,11 +460,11 @@ const PROJECT_MANIFESTS: &[(&str, &str, &str)] = &[
     ("composer.json", "composer", "vendor"),
 ];
 
-fn find_project_deps_recursive(
+fn find_project_deps_parallel(
     dir: &Path,
     depth: usize,
     max_depth: usize,
-    results: &mut Vec<ProjectDeps>,
+    results: &std::sync::Mutex<Vec<ProjectDeps>>,
 ) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
@@ -417,36 +498,42 @@ fn find_project_deps_recursive(
         }
     }
 
-    for (manifest, mgr, deps_dir_name) in found_manifests {
-        let dep_count = count_manifest_deps(dir, manifest);
-        let (deps_size, deps_dir) = if !deps_dir_name.is_empty() {
-            let deps_path = dir.join(deps_dir_name);
-            if deps_path.is_dir() {
-                (
-                    Some(bulkstat::scan_dir(&deps_path, 0).size),
-                    Some(deps_path),
-                )
+    let new_deps: Vec<_> = found_manifests
+        .into_par_iter()
+        .map(|(manifest, mgr, deps_dir_name)| {
+            let dep_count = count_manifest_deps(dir, manifest);
+            let (deps_size, deps_dir) = if !deps_dir_name.is_empty() {
+                let deps_path = dir.join(deps_dir_name);
+                if deps_path.is_dir() {
+                    (
+                        Some(bulkstat::scan_dir(&deps_path, 0).size),
+                        Some(deps_path),
+                    )
+                } else {
+                    (None, None)
+                }
             } else {
                 (None, None)
+            };
+            ProjectDeps {
+                path: dir.to_path_buf(),
+                manager_label: mgr,
+                manifest,
+                dep_count,
+                deps_size,
+                deps_dir,
             }
-        } else {
-            (None, None)
-        };
+        })
+        .collect();
 
-        results.push(ProjectDeps {
-            path: dir.to_path_buf(),
-            manager_label: mgr,
-            manifest,
-            dep_count,
-            deps_size,
-            deps_dir,
-        });
+    if !new_deps.is_empty() {
+        results.lock().unwrap().extend(new_deps);
     }
 
     if depth < max_depth {
-        for child in children {
-            find_project_deps_recursive(&child, depth + 1, max_depth, results);
-        }
+        children.par_iter().for_each(|child| {
+            find_project_deps_parallel(child, depth + 1, max_depth, results);
+        });
     }
 }
 

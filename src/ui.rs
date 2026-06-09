@@ -315,6 +315,29 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         )
     };
 
+    let total_str = if app.packages_loaded {
+        match app.pkg_view {
+            PkgView::SystemManagers => {
+                let total = app.total_pkg_size();
+                if total > 0 {
+                    format!(" · {}", human(total))
+                } else {
+                    String::new()
+                }
+            }
+            PkgView::ProjectDeps => {
+                let total = app.total_project_deps_size();
+                if total > 0 {
+                    format!(" · {}", human(total))
+                } else {
+                    String::new()
+                }
+            }
+        }
+    } else {
+        String::new()
+    };
+
     let title = Line::from(vec![
         Span::raw(" packages ─"),
         Span::styled(
@@ -334,6 +357,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
             },
             proj_style,
         ),
+        Span::styled(total_str, Style::default().fg(Color::Green)),
     ]);
 
     let block = Block::default()
@@ -406,22 +430,62 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let items = match app.pkg_view {
-        PkgView::SystemManagers => package_items(app, area.width.saturating_sub(2)),
-        PkgView::ProjectDeps => project_dep_items(app, area.width.saturating_sub(2)),
-    };
+    let item_count = app.pkg_item_count();
+    let inner_width = area.width.saturating_sub(2);
 
-    if items.is_empty() {
-        let empty = Paragraph::new(match app.pkg_view {
-            PkgView::SystemManagers => "no supported packages found",
-            PkgView::ProjectDeps => "no project manifests found",
-        })
-        .block(block)
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true });
+    if item_count == 0 {
+        let message = if app.pkg_search_mode && !app.pkg_search_query.is_empty() {
+            "no matching packages"
+        } else {
+            match app.pkg_view {
+                PkgView::SystemManagers => "no supported packages found",
+                PkgView::ProjectDeps => "no project manifests found",
+            }
+        };
+        let empty = Paragraph::new(message)
+            .block(block)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
         f.render_widget(empty, area);
         return;
     }
+
+    let items: Vec<ListItem> = (0..item_count)
+        .filter_map(|visible_i| {
+            let real_i = app.pkg_visible_index(visible_i)?;
+            match app.pkg_view {
+                PkgView::SystemManagers => {
+                    let (package, manager) = app.flat_packages().get(real_i)?;
+                    let size = package
+                        .size
+                        .map(|s| human(s.allocated))
+                        .unwrap_or_else(|| String::from("?"));
+                    Some(package_line_with_version(
+                        manager.label(),
+                        &package.name,
+                        &package.version,
+                        &size,
+                        inner_width,
+                    ))
+                }
+                PkgView::ProjectDeps => {
+                    let dep = app.project_deps.get(real_i)?;
+                    let size = dep
+                        .deps_size
+                        .map(|s| human(s.allocated))
+                        .unwrap_or_else(|| String::from("—"));
+                    let label = format!(
+                        "{} · {} deps · {}",
+                        dep.manager_label,
+                        dep.dep_count,
+                        dep.path.display()
+                    );
+                    let (name_width, size_width) = package_columns(inner_width);
+                    Some(package_line(&label, &size, name_width, size_width))
+                }
+            }
+        })
+        .collect();
 
     let list = List::new(items)
         .block(block)
@@ -434,46 +498,42 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
 
     let mut state = ListState::default();
     state.select(Some(
-        app.selected_pkg.min(app.pkg_item_count().saturating_sub(1)),
+        app.selected_pkg.min(item_count.saturating_sub(1)),
     ));
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn package_items(app: &App, inner_width: u16) -> Vec<ListItem<'_>> {
+fn package_line_with_version(
+    manager: &str,
+    name: &str,
+    version: &str,
+    size: &str,
+    inner_width: u16,
+) -> ListItem<'static> {
     let (name_width, size_width) = package_columns(inner_width);
-    let packages = app.flat_packages();
+    let ver_display = if version.is_empty() {
+        String::new()
+    } else {
+        format!("@{version}")
+    };
+    let mgr_label = format!("{manager} ");
+    let name_budget = name_width.saturating_sub(mgr_label.len());
+    let name_ver = format!("{name}{ver_display}");
+    let name_truncated = truncate(&name_ver, name_budget);
+    let padded_name = format!("{name_truncated:<width$}", width = name_budget);
 
-    packages
-        .iter()
-        .map(|(package, manager)| {
-            let size = package
-                .size
-                .map(|s| human(s.allocated))
-                .unwrap_or_else(|| String::from("?"));
-            let label = format!("{} {}", manager.label(), package.name);
-            package_line(&label, &size, name_width, size_width)
-        })
-        .collect()
-}
-
-fn project_dep_items(app: &App, inner_width: u16) -> Vec<ListItem<'_>> {
-    let (name_width, size_width) = package_columns(inner_width);
-    app.project_deps
-        .iter()
-        .map(|dep| {
-            let size = dep
-                .deps_size
-                .map(|s| human(s.allocated))
-                .unwrap_or_else(|| String::from("—"));
-            let label = format!(
-                "{} · {} deps · {}",
-                dep.manager_label,
-                dep.dep_count,
-                dep.path.display()
-            );
-            package_line(&label, &size, name_width, size_width)
-        })
-        .collect()
+    let mut spans = vec![
+        Span::styled(mgr_label, Style::default().fg(Color::DarkGray)),
+        Span::styled(padded_name, Style::default().fg(Color::White)),
+    ];
+    if size_width > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("{size:>size_width$}"),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    ListItem::new(Line::from(spans))
 }
 
 fn package_line(
@@ -510,6 +570,29 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         let count = app.visible_entry_count();
         let text = Line::from(vec![
             Span::styled("search ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                query,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {count} matches · Enter keep · Esc clear"),
+                Style::default().fg(Color::Gray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
+        return;
+    }
+    if app.pkg_search_mode {
+        let query = if app.pkg_search_query.is_empty() {
+            String::from("/")
+        } else {
+            format!("/{}", app.pkg_search_query)
+        };
+        let count = app.pkg_item_count();
+        let text = Line::from(vec![
+            Span::styled("filter packages ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 query,
                 Style::default()
@@ -791,7 +874,8 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
             match app.pkg_view {
                 PkgView::SystemManagers => {
                     let packages = app.flat_packages();
-                    match packages.get(app.selected_pkg) {
+                    let real_idx = app.pkg_visible_index(app.selected_pkg).unwrap_or(usize::MAX);
+                    match packages.get(real_idx) {
                         Some((package, manager)) => {
                             let size = package
                                 .size
@@ -818,7 +902,7 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                         }
                     }
                 }
-                PkgView::ProjectDeps => match app.project_deps.get(app.selected_pkg) {
+                PkgView::ProjectDeps => match app.pkg_visible_index(app.selected_pkg).and_then(|i| app.project_deps.get(i)) {
                     Some(dep) => {
                         let size = dep
                             .deps_size

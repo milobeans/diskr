@@ -290,7 +290,7 @@ Keys:
   Home/End        Jump to first or last item
   Enter           Open selected directory or disk/package path
   Backspace       Go to parent directory
-  /               Search files in the current directory
+  /               Search files or filter packages
   Left/Right, h/l Switch pane or package view
   Space           Quick Look selected item
   f               Reveal selected item in Finder
@@ -853,25 +853,28 @@ fn selected_action_target(app: &App) -> Option<(PathBuf, String)> {
             };
             (disk.mount.clone(), label)
         }),
-        Focus::Packages => match app.pkg_view {
-            app::PkgView::SystemManagers => app.flat_packages().get(app.selected_pkg).and_then(
-                |(package, manager): &(packages::Package, packages::Manager)| {
-                    package.path.as_ref().map(|path| {
-                        (
-                            path.clone(),
-                            format!("{} {}", manager.label(), package.name),
-                        )
-                    })
-                },
-            ),
-            app::PkgView::ProjectDeps => app.project_deps.get(app.selected_pkg).map(|dep| {
-                let path = dep.deps_dir.as_ref().unwrap_or(&dep.path).clone();
-                (
-                    path,
-                    format!("{} {}", dep.manager_label, dep.path.display()),
-                )
-            }),
-        },
+        Focus::Packages => {
+            let real_idx = app.pkg_visible_index(app.selected_pkg)?;
+            match app.pkg_view {
+                app::PkgView::SystemManagers => app.flat_packages().get(real_idx).and_then(
+                    |(package, manager): &(packages::Package, packages::Manager)| {
+                        package.path.as_ref().map(|path| {
+                            (
+                                path.clone(),
+                                format!("{} {}", manager.label(), package.name),
+                            )
+                        })
+                    },
+                ),
+                app::PkgView::ProjectDeps => app.project_deps.get(real_idx).map(|dep| {
+                    let path = dep.deps_dir.as_ref().unwrap_or(&dep.path).clone();
+                    (
+                        path,
+                        format!("{} {}", dep.manager_label, dep.path.display()),
+                    )
+                }),
+            }
+        }
     }
 }
 
@@ -1027,6 +1030,55 @@ where
                         }
                         continue;
                     }
+                    if app.pkg_search_mode {
+                        let handled = match key.code {
+                            KeyCode::Esc => {
+                                app.exit_pkg_search();
+                                true
+                            }
+                            KeyCode::Enter => {
+                                app.exit_pkg_search();
+                                true
+                            }
+                            KeyCode::Backspace => {
+                                app.pkg_search_pop();
+                                true
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.move_cursor(1);
+                                true
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.move_cursor(-1);
+                                true
+                            }
+                            KeyCode::PageDown => {
+                                app.page_move(1);
+                                true
+                            }
+                            KeyCode::PageUp => {
+                                app.page_move(-1);
+                                true
+                            }
+                            KeyCode::Home => {
+                                app.move_to_start();
+                                true
+                            }
+                            KeyCode::End => {
+                                app.move_to_end();
+                                true
+                            }
+                            KeyCode::Char(ch) => {
+                                app.pkg_search_push(ch);
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
                     let handled = match key.code {
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Esc => {
@@ -1108,6 +1160,10 @@ where
                         }
                         KeyCode::Char('/') if app.focus == Focus::Files => {
                             app.enter_search();
+                            true
+                        }
+                        KeyCode::Char('/') if app.focus == Focus::Packages && app.packages_loaded => {
+                            app.enter_pkg_search();
                             true
                         }
                         KeyCode::Left | KeyCode::Char('h') => {

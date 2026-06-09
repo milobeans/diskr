@@ -92,6 +92,10 @@ pub struct App {
     pub search_query: String,
     pub search_matches: Vec<usize>,
 
+    pub pkg_search_mode: bool,
+    pub pkg_search_query: String,
+    pub pkg_search_matches: Vec<usize>,
+
     pub scan_total: usize,
     pub scan_completed: usize,
 
@@ -152,6 +156,9 @@ impl App {
             search_mode: false,
             search_query: String::new(),
             search_matches: Vec::new(),
+            pkg_search_mode: false,
+            pkg_search_query: String::new(),
+            pkg_search_matches: Vec::new(),
             scan_total: 0,
             scan_completed: 0,
             files_area: ratatui_core::layout::Rect::default(),
@@ -565,8 +572,9 @@ impl App {
             }
             Focus::Packages => match self.pkg_view {
                 PkgView::SystemManagers => {
+                    let real_idx = self.pkg_visible_index(self.selected_pkg).unwrap_or(usize::MAX);
                     let packages = &self.cached_flat_packages;
-                    if let Some((package, manager)) = packages.get(self.selected_pkg) {
+                    if let Some((package, manager)) = packages.get(real_idx) {
                         if let Some(path) = &package.path {
                             self.pending_delete = Some(DeleteTarget::Package {
                                 name: format!("{} {}", manager.label(), package.name),
@@ -580,7 +588,8 @@ impl App {
                     }
                 }
                 PkgView::ProjectDeps => {
-                    if let Some(dep) = self.project_deps.get(self.selected_pkg) {
+                    let real_idx = self.pkg_visible_index(self.selected_pkg).unwrap_or(usize::MAX);
+                    if let Some(dep) = self.project_deps.get(real_idx) {
                         if let Some(deps_dir) = &dep.deps_dir {
                             self.pending_delete = Some(DeleteTarget::Package {
                                 name: format!(
@@ -851,14 +860,101 @@ impl App {
     }
 
     pub fn pkg_item_count(&self) -> usize {
+        if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+            return self.pkg_search_matches.len();
+        }
         match self.pkg_view {
             PkgView::SystemManagers => self.cached_flat_packages.len(),
             PkgView::ProjectDeps => self.project_deps.len(),
         }
     }
 
+    pub fn pkg_visible_index(&self, visible_index: usize) -> Option<usize> {
+        if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+            self.pkg_search_matches.get(visible_index).copied()
+        } else {
+            Some(visible_index)
+        }
+    }
+
+    pub fn enter_pkg_search(&mut self) {
+        self.pkg_search_mode = true;
+        self.pkg_search_query.clear();
+        self.pkg_search_matches.clear();
+    }
+
+    pub fn exit_pkg_search(&mut self) {
+        let real_index = self.pkg_visible_index(self.selected_pkg);
+        self.pkg_search_mode = false;
+        self.pkg_search_query.clear();
+        self.pkg_search_matches.clear();
+        if let Some(idx) = real_index {
+            self.selected_pkg = idx;
+        }
+    }
+
+    pub fn pkg_search_push(&mut self, ch: char) {
+        self.pkg_search_query.push(ch);
+        self.update_pkg_search();
+    }
+
+    pub fn pkg_search_pop(&mut self) {
+        self.pkg_search_query.pop();
+        if self.pkg_search_query.is_empty() {
+            self.pkg_search_matches.clear();
+            self.selected_pkg = 0;
+        } else {
+            self.update_pkg_search();
+        }
+    }
+
+    fn update_pkg_search(&mut self) {
+        let query = self.pkg_search_query.to_lowercase();
+        self.pkg_search_matches = match self.pkg_view {
+            PkgView::SystemManagers => self
+                .cached_flat_packages
+                .iter()
+                .enumerate()
+                .filter(|(_, (pkg, mgr))| {
+                    pkg.name.to_lowercase().contains(&query)
+                        || mgr.label().contains(&query)
+                })
+                .map(|(i, _)| i)
+                .collect(),
+            PkgView::ProjectDeps => self
+                .project_deps
+                .iter()
+                .enumerate()
+                .filter(|(_, dep)| {
+                    dep.path
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&query)
+                        || dep.manager_label.contains(&query)
+                })
+                .map(|(i, _)| i)
+                .collect(),
+        };
+        self.selected_pkg = 0;
+    }
+
     pub fn flat_packages(&self) -> &[(packages::Package, packages::Manager)] {
         &self.cached_flat_packages
+    }
+
+    pub fn total_pkg_size(&self) -> u64 {
+        self.pkg_reports
+            .iter()
+            .filter(|r| r.available)
+            .map(|r| r.total_size.allocated)
+            .sum()
+    }
+
+    pub fn total_project_deps_size(&self) -> u64 {
+        self.project_deps
+            .iter()
+            .filter_map(|d| d.deps_size.map(|s| s.allocated))
+            .sum()
     }
 
     pub fn rebuild_flat_packages(&mut self) {
@@ -965,16 +1061,19 @@ impl App {
         match self.focus {
             Focus::Files => self.visible_entry(self.selected).map(|e| e.path.clone()),
             Focus::Disks => self.disks.get(self.selected_disk).map(|d| d.mount.clone()),
-            Focus::Packages => match self.pkg_view {
-                PkgView::SystemManagers => self
-                    .cached_flat_packages
-                    .get(self.selected_pkg)
-                    .and_then(|(p, _)| p.path.clone()),
-                PkgView::ProjectDeps => self
-                    .project_deps
-                    .get(self.selected_pkg)
-                    .map(|d| d.deps_dir.as_ref().unwrap_or(&d.path).clone()),
-            },
+            Focus::Packages => {
+                let real_idx = self.pkg_visible_index(self.selected_pkg)?;
+                match self.pkg_view {
+                    PkgView::SystemManagers => self
+                        .cached_flat_packages
+                        .get(real_idx)
+                        .and_then(|(p, _)| p.path.clone()),
+                    PkgView::ProjectDeps => self
+                        .project_deps
+                        .get(real_idx)
+                        .map(|d| d.deps_dir.as_ref().unwrap_or(&d.path).clone()),
+                }
+            }
         }
     }
 }
