@@ -236,7 +236,7 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
                 0
             };
 
-            let name_bytes = if returned_common & ATTR_CMN_NAME != 0 {
+            let name_ref = if returned_common & ATTR_CMN_NAME != 0 {
                 let attr_ref_start = field;
                 let Some(name_off) = read_i32(&buf, entry_end, field).map(|n| n as isize) else {
                     break;
@@ -246,7 +246,7 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
                     break;
                 };
                 field += ATTR_REFERENCE_LEN;
-                read_attr_reference(&buf, entry_end, attr_ref_start, name_off, name_len)
+                Some((attr_ref_start, name_off, name_len))
             } else {
                 None
             };
@@ -282,7 +282,19 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
                 VREG => {
                     let size = SizeInfo::new(totalsize, allocsize);
                     partial.size.add_file(size);
-                    if let Some(name_bytes) = name_bytes {
+                    if top_file_limit == 0 {
+                        continue;
+                    }
+                    if let Some((attr_ref_start, name_off, name_len)) = name_ref {
+                        let Some(name_bytes) = read_attr_reference(
+                            &buf,
+                            entry_end,
+                            attr_ref_start,
+                            name_off,
+                            name_len,
+                        ) else {
+                            continue;
+                        };
                         push_largest_file(
                             &mut partial.largest_files,
                             top_file_limit,
@@ -292,7 +304,12 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
                     }
                 }
                 VDIR => {
-                    let Some(name_bytes) = name_bytes else {
+                    let Some((attr_ref_start, name_off, name_len)) = name_ref else {
+                        continue;
+                    };
+                    let Some(name_bytes) =
+                        read_attr_reference(&buf, entry_end, attr_ref_start, name_off, name_len)
+                    else {
                         continue;
                     };
                     if matches!(name_bytes, b"." | b"..") {
