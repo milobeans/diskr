@@ -291,6 +291,9 @@ Keys:
   Enter           Open selected directory or disk/package path
   Backspace       Go to parent directory
   /               Search files or filter packages
+  i               Show package details (deps, reverse deps)
+  u               Toggle showing only removable packages
+  x               Uninstall selected package via its manager
   Left/Right, h/l Switch pane or package view
   Space           Quick Look selected item
   f               Reveal selected item in Finder
@@ -981,6 +984,46 @@ where
                         }
                         continue;
                     }
+                    if app.confirming_uninstall {
+                        let handled = match key.code {
+                            KeyCode::Char('y') => {
+                                app.confirm_uninstall();
+                                true
+                            }
+                            KeyCode::Char('n') | KeyCode::Esc => {
+                                app.cancel_uninstall();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
+                    if app.pkg_detail {
+                        let handled = match key.code {
+                            KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
+                                app.close_pkg_detail();
+                                true
+                            }
+                            KeyCode::Char('x') => {
+                                app.close_pkg_detail();
+                                app.request_uninstall();
+                                true
+                            }
+                            KeyCode::Char('d') => {
+                                app.close_pkg_detail();
+                                app.request_delete();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
                     if app.search_mode {
                         let handled = match key.code {
                             KeyCode::Esc => {
@@ -1114,8 +1157,8 @@ where
                             true
                         }
                         KeyCode::Enter => {
-                            if app.focus == Focus::Packages {
-                                launch_external_action(app, ExternalAction::Open);
+                            if app.focus == Focus::Packages && app.packages_loaded {
+                                app.open_pkg_detail();
                             } else {
                                 app.enter()?;
                             }
@@ -1162,8 +1205,28 @@ where
                             app.enter_search();
                             true
                         }
-                        KeyCode::Char('/') if app.focus == Focus::Packages && app.packages_loaded => {
+                        KeyCode::Char('/')
+                            if app.focus == Focus::Packages && app.packages_loaded =>
+                        {
                             app.enter_pkg_search();
+                            true
+                        }
+                        KeyCode::Char('i')
+                            if app.focus == Focus::Packages && app.packages_loaded =>
+                        {
+                            app.open_pkg_detail();
+                            true
+                        }
+                        KeyCode::Char('u')
+                            if app.focus == Focus::Packages && app.packages_loaded =>
+                        {
+                            app.toggle_unused_filter();
+                            true
+                        }
+                        KeyCode::Char('x')
+                            if app.focus == Focus::Packages && app.packages_loaded =>
+                        {
+                            app.request_uninstall();
                             true
                         }
                         KeyCode::Left | KeyCode::Char('h') => {

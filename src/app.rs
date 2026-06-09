@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::bulkstat::SizeInfo;
-use crate::packages::{self, ManagerReport, ProjectDeps};
+use crate::packages::{self, DepGraph, ManagerReport, ProjectDeps};
 use crate::scanner::{ScanId, ScanMsg, Scanner};
 
 const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -114,6 +114,16 @@ pub struct App {
     scanner: Scanner,
     active_pkg_scan_id: ScanId,
     pkg_scan_rx: Option<Receiver<PkgScanMsg>>,
+
+    pub dep_graph: Option<DepGraph>,
+    pub deps_loading: bool,
+    dep_scan_rx: Option<Receiver<DepScanMsg>>,
+
+    pub pkg_detail: bool,
+    pub pkg_show_unused: bool,
+    pub confirming_uninstall: bool,
+    pending_uninstall: Option<UninstallTarget>,
+    uninstall_rx: Option<Receiver<UninstallResult>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -127,6 +137,21 @@ struct PkgScanMsg {
     reports: Vec<ManagerReport>,
     project_deps: Vec<ProjectDeps>,
     include_managers: bool,
+}
+
+struct DepScanMsg {
+    graph: DepGraph,
+}
+
+pub struct UninstallTarget {
+    pub manager: packages::Manager,
+    pub name: String,
+    pub display_name: String,
+}
+
+struct UninstallResult {
+    display_name: String,
+    result: Result<String, String>,
 }
 
 impl PkgView {
@@ -174,6 +199,14 @@ impl App {
             scan_rx: rx,
             active_pkg_scan_id: 0,
             pkg_scan_rx: None,
+            dep_graph: None,
+            deps_loading: false,
+            dep_scan_rx: None,
+            pkg_detail: false,
+            pkg_show_unused: false,
+            confirming_uninstall: false,
+            pending_uninstall: None,
+            uninstall_rx: None,
         };
         app.refresh_disks();
         app.reload()?;
@@ -547,11 +580,16 @@ impl App {
             changed = true;
         }
         changed |= self.drain_package_results();
+        changed |= self.drain_dep_results();
         changed
     }
 
     pub fn has_pending_scan_work(&self) -> bool {
-        self.sort_dirty || self.entries.iter().any(|entry| entry.scanning) || self.packages_loading
+        self.sort_dirty
+            || self.entries.iter().any(|entry| entry.scanning)
+            || self.packages_loading
+            || self.deps_loading
+            || self.uninstall_rx.is_some()
     }
 
     pub fn request_delete(&mut self) {
@@ -572,7 +610,9 @@ impl App {
             }
             Focus::Packages => match self.pkg_view {
                 PkgView::SystemManagers => {
-                    let real_idx = self.pkg_visible_index(self.selected_pkg).unwrap_or(usize::MAX);
+                    let real_idx = self
+                        .pkg_visible_index(self.selected_pkg)
+                        .unwrap_or(usize::MAX);
                     let packages = &self.cached_flat_packages;
                     if let Some((package, manager)) = packages.get(real_idx) {
                         if let Some(path) = &package.path {
@@ -588,7 +628,9 @@ impl App {
                     }
                 }
                 PkgView::ProjectDeps => {
-                    let real_idx = self.pkg_visible_index(self.selected_pkg).unwrap_or(usize::MAX);
+                    let real_idx = self
+                        .pkg_visible_index(self.selected_pkg)
+                        .unwrap_or(usize::MAX);
                     if let Some(dep) = self.project_deps.get(real_idx) {
                         if let Some(deps_dir) = &dep.deps_dir {
                             self.pending_delete = Some(DeleteTarget::Package {
@@ -808,20 +850,21 @@ impl App {
                         .min(self.pkg_item_count().saturating_sub(1));
                     self.packages_loading = false;
                     self.pkg_scan_rx = None;
-                    self.status = if msg.include_managers {
+                    if msg.include_managers {
                         let total = self.cached_flat_packages.len();
-                        format!(
-                            "{} packages across {} managers · {} projects",
+                        self.status = format!(
+                            "{} packages across {} managers · {} projects · scanning deps…",
                             total,
                             self.pkg_reports.iter().filter(|r| r.available).count(),
                             self.project_deps.len()
-                        )
+                        );
+                        self.start_dep_scan();
                     } else {
-                        format!(
+                        self.status = format!(
                             "project dependencies refreshed · {} projects",
                             self.project_deps.len()
-                        )
-                    };
+                        );
+                    }
                     return true;
                 }
                 Err(TryRecvError::Empty) => return false,
@@ -851,6 +894,169 @@ impl App {
         self.request_package_scan(false);
     }
 
+    fn start_dep_scan(&mut self) {
+        if self.deps_loading {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reports = self.pkg_reports.clone();
+        self.deps_loading = true;
+        self.dep_scan_rx = Some(rx);
+
+        thread::spawn(move || {
+            let graph = packages::scan_dep_graph(&reports);
+            let _ = tx.send(DepScanMsg { graph });
+        });
+    }
+
+    fn drain_dep_results(&mut self) -> bool {
+        let recv = match self.dep_scan_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return self.drain_uninstall_results(),
+        };
+
+        match recv {
+            Ok(msg) => {
+                let removable = msg.graph.removable_count();
+                self.dep_graph = Some(msg.graph);
+                self.deps_loading = false;
+                self.dep_scan_rx = None;
+                let total = self.cached_flat_packages.len();
+                self.status = format!(
+                    "{total} packages · {removable} removable · u to filter · i for details"
+                );
+                true
+            }
+            Err(TryRecvError::Empty) => self.drain_uninstall_results(),
+            Err(TryRecvError::Disconnected) => {
+                self.deps_loading = false;
+                self.dep_scan_rx = None;
+                self.drain_uninstall_results()
+            }
+        }
+    }
+
+    fn drain_uninstall_results(&mut self) -> bool {
+        let recv = match self.uninstall_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+
+        match recv {
+            Ok(msg) => {
+                self.uninstall_rx = None;
+                match msg.result {
+                    Ok(_) => {
+                        self.status = format!("uninstalled {}", msg.display_name);
+                        self.dep_graph = None;
+                        self.refresh_packages();
+                    }
+                    Err(err) => {
+                        self.status = format!("uninstall failed: {err}");
+                    }
+                }
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.uninstall_rx = None;
+                false
+            }
+        }
+    }
+
+    pub fn toggle_unused_filter(&mut self) {
+        self.pkg_show_unused = !self.pkg_show_unused;
+        self.selected_pkg = 0;
+        self.pkg_search_matches.clear();
+        self.pkg_search_query.clear();
+        self.pkg_search_mode = false;
+        if self.pkg_show_unused {
+            self.status = String::from("showing removable packages only");
+        } else {
+            self.status = String::from("showing all packages");
+        }
+    }
+
+    pub fn open_pkg_detail(&mut self) {
+        if self.pkg_item_count() > 0 {
+            self.pkg_detail = true;
+        }
+    }
+
+    pub fn close_pkg_detail(&mut self) {
+        self.pkg_detail = false;
+    }
+
+    pub fn request_uninstall(&mut self) {
+        if self.confirming_uninstall || self.uninstall_rx.is_some() {
+            return;
+        }
+        let real_idx = match self.pkg_visible_index(self.selected_pkg) {
+            Some(i) => i,
+            None => return,
+        };
+        if self.pkg_view != PkgView::SystemManagers {
+            self.status = String::from("uninstall only works for system packages");
+            return;
+        }
+        let Some((pkg, manager)) = self.cached_flat_packages.get(real_idx) else {
+            return;
+        };
+        self.pending_uninstall = Some(UninstallTarget {
+            manager: *manager,
+            name: pkg.name.clone(),
+            display_name: format!("{} {}", manager.label(), pkg.name),
+        });
+        self.confirming_uninstall = true;
+    }
+
+    pub fn cancel_uninstall(&mut self) {
+        self.confirming_uninstall = false;
+        self.pending_uninstall = None;
+    }
+
+    pub fn confirm_uninstall(&mut self) {
+        self.confirming_uninstall = false;
+        let Some(target) = self.pending_uninstall.take() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.uninstall_rx = Some(rx);
+        self.status = format!("uninstalling {}…", target.display_name);
+
+        thread::spawn(move || {
+            let result = packages::run_uninstall(target.manager, &target.name);
+            let _ = tx.send(UninstallResult {
+                display_name: target.display_name,
+                result,
+            });
+        });
+    }
+
+    pub fn pending_uninstall_name(&self) -> &str {
+        match &self.pending_uninstall {
+            Some(t) => &t.display_name,
+            None => "?",
+        }
+    }
+
+    pub fn selected_pkg_detail(
+        &self,
+    ) -> Option<(
+        &packages::Package,
+        packages::Manager,
+        Option<&packages::DepInfo>,
+    )> {
+        let real_idx = self.pkg_visible_index(self.selected_pkg)?;
+        let (pkg, manager) = self.cached_flat_packages.get(real_idx)?;
+        let dep_info = self
+            .dep_graph
+            .as_ref()
+            .and_then(|g| g.get(*manager, &pkg.name));
+        Some((pkg, *manager, dep_info))
+    }
+
     pub fn toggle_pkg_view(&mut self) {
         self.pkg_view = match self.pkg_view {
             PkgView::SystemManagers => PkgView::ProjectDeps,
@@ -859,22 +1065,44 @@ impl App {
         self.selected_pkg = 0;
     }
 
+    fn pkg_passes_unused_filter(&self, idx: usize) -> bool {
+        if !self.pkg_show_unused {
+            return true;
+        }
+        if self.pkg_view != PkgView::SystemManagers {
+            return true;
+        }
+        let Some(graph) = &self.dep_graph else {
+            return true;
+        };
+        let Some((pkg, manager)) = self.cached_flat_packages.get(idx) else {
+            return false;
+        };
+        graph.is_removable(*manager, &pkg.name)
+    }
+
+    fn base_pkg_indices(&self) -> Vec<usize> {
+        let total = match self.pkg_view {
+            PkgView::SystemManagers => self.cached_flat_packages.len(),
+            PkgView::ProjectDeps => self.project_deps.len(),
+        };
+        (0..total)
+            .filter(|&i| self.pkg_passes_unused_filter(i))
+            .collect()
+    }
+
     pub fn pkg_item_count(&self) -> usize {
         if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
             return self.pkg_search_matches.len();
         }
-        match self.pkg_view {
-            PkgView::SystemManagers => self.cached_flat_packages.len(),
-            PkgView::ProjectDeps => self.project_deps.len(),
-        }
+        self.base_pkg_indices().len()
     }
 
     pub fn pkg_visible_index(&self, visible_index: usize) -> Option<usize> {
         if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
-            self.pkg_search_matches.get(visible_index).copied()
-        } else {
-            Some(visible_index)
+            return self.pkg_search_matches.get(visible_index).copied();
         }
+        self.base_pkg_indices().get(visible_index).copied()
     }
 
     pub fn enter_pkg_search(&mut self) {
@@ -889,7 +1117,8 @@ impl App {
         self.pkg_search_query.clear();
         self.pkg_search_matches.clear();
         if let Some(idx) = real_index {
-            self.selected_pkg = idx;
+            let base = self.base_pkg_indices();
+            self.selected_pkg = base.iter().position(|&i| i == idx).unwrap_or(0);
         }
     }
 
@@ -910,29 +1139,26 @@ impl App {
 
     fn update_pkg_search(&mut self) {
         let query = self.pkg_search_query.to_lowercase();
+        let base = self.base_pkg_indices();
         self.pkg_search_matches = match self.pkg_view {
-            PkgView::SystemManagers => self
-                .cached_flat_packages
-                .iter()
-                .enumerate()
-                .filter(|(_, (pkg, mgr))| {
-                    pkg.name.to_lowercase().contains(&query)
-                        || mgr.label().contains(&query)
+            PkgView::SystemManagers => base
+                .into_iter()
+                .filter(|&i| {
+                    let Some((pkg, mgr)) = self.cached_flat_packages.get(i) else {
+                        return false;
+                    };
+                    pkg.name.to_lowercase().contains(&query) || mgr.label().contains(&query)
                 })
-                .map(|(i, _)| i)
                 .collect(),
-            PkgView::ProjectDeps => self
-                .project_deps
-                .iter()
-                .enumerate()
-                .filter(|(_, dep)| {
-                    dep.path
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .contains(&query)
+            PkgView::ProjectDeps => base
+                .into_iter()
+                .filter(|&i| {
+                    let Some(dep) = self.project_deps.get(i) else {
+                        return false;
+                    };
+                    dep.path.to_string_lossy().to_lowercase().contains(&query)
                         || dep.manager_label.contains(&query)
                 })
-                .map(|(i, _)| i)
                 .collect(),
         };
         self.selected_pkg = 0;
@@ -1321,6 +1547,59 @@ mod tests {
             }
             _ => panic!("expected DeleteTarget::Package"),
         }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removable_package_filter_maps_visible_indices_to_real_packages() {
+        let root = test_root("pkg_unused_filter");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Packages;
+        app.pkg_view = PkgView::SystemManagers;
+        app.cached_flat_packages = vec![
+            (
+                packages::Package {
+                    name: "leaf".into(),
+                    version: "1.0".into(),
+                    size: None,
+                    path: None,
+                },
+                packages::Manager::Brew,
+            ),
+            (
+                packages::Package {
+                    name: "shared-lib".into(),
+                    version: "2.0".into(),
+                    size: None,
+                    path: None,
+                },
+                packages::Manager::Brew,
+            ),
+        ];
+        app.dep_graph = Some(packages::DepGraph::from_entries(vec![
+            (
+                packages::Manager::Brew,
+                "leaf",
+                packages::DepInfo::default(),
+            ),
+            (
+                packages::Manager::Brew,
+                "shared-lib",
+                packages::DepInfo {
+                    dependencies: Vec::new(),
+                    dependents: vec!["app".into()],
+                },
+            ),
+        ]));
+
+        app.toggle_unused_filter();
+
+        assert_eq!(app.pkg_item_count(), 1);
+        assert_eq!(app.pkg_visible_index(0), Some(0));
+        assert_eq!(app.pkg_visible_index(1), None);
 
         fs::remove_dir_all(root).unwrap();
     }

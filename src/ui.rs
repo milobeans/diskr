@@ -57,6 +57,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.confirming_delete {
         draw_confirm(f, app);
     }
+    if app.confirming_uninstall {
+        draw_uninstall_confirm(f, app);
+    }
+    if app.pkg_detail {
+        draw_pkg_detail(f, app);
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -358,6 +364,11 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
             proj_style,
         ),
         Span::styled(total_str, Style::default().fg(Color::Green)),
+        if app.pkg_show_unused {
+            Span::styled(" [removable]", Style::default().fg(Color::Magenta))
+        } else {
+            Span::raw("")
+        },
     ]);
 
     let block = Block::default()
@@ -460,11 +471,16 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
                         .size
                         .map(|s| human(s.allocated))
                         .unwrap_or_else(|| String::from("?"));
+                    let removable = app
+                        .dep_graph
+                        .as_ref()
+                        .map(|g| g.is_removable(*manager, &package.name));
                     Some(package_line_with_version(
                         manager.label(),
                         &package.name,
                         &package.version,
                         &size,
+                        removable,
                         inner_width,
                     ))
                 }
@@ -497,9 +513,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         .highlight_symbol("▶ ");
 
     let mut state = ListState::default();
-    state.select(Some(
-        app.selected_pkg.min(item_count.saturating_sub(1)),
-    ));
+    state.select(Some(app.selected_pkg.min(item_count.saturating_sub(1))));
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -508,6 +522,7 @@ fn package_line_with_version(
     name: &str,
     version: &str,
     size: &str,
+    removable: Option<bool>,
     inner_width: u16,
 ) -> ListItem<'static> {
     let (name_width, size_width) = package_columns(inner_width);
@@ -516,13 +531,25 @@ fn package_line_with_version(
     } else {
         format!("@{version}")
     };
+    let dep_indicator = match removable {
+        Some(true) => "  ",
+        Some(false) => "* ",
+        None => "  ",
+    };
     let mgr_label = format!("{manager} ");
-    let name_budget = name_width.saturating_sub(mgr_label.len());
+    let name_budget = name_width
+        .saturating_sub(mgr_label.len())
+        .saturating_sub(dep_indicator.len());
     let name_ver = format!("{name}{ver_display}");
     let name_truncated = truncate(&name_ver, name_budget);
     let padded_name = format!("{name_truncated:<width$}", width = name_budget);
 
+    let dep_style = match removable {
+        Some(false) => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(Color::DarkGray),
+    };
     let mut spans = vec![
+        Span::styled(dep_indicator, dep_style),
         Span::styled(mgr_label, Style::default().fg(Color::DarkGray)),
         Span::styled(padded_name, Style::default().fg(Color::White)),
     ];
@@ -671,6 +698,15 @@ fn draw_help(f: &mut Frame, area: Rect) {
         key("d"),
         label(" trash"),
         sep(),
+        key("i"),
+        label(" info"),
+        sep(),
+        key("u"),
+        label(" unused"),
+        sep(),
+        key("x"),
+        label(" uninstall"),
+        sep(),
         key("Tab"),
         label(" pane"),
         sep(),
@@ -703,6 +739,174 @@ fn draw_confirm(f: &mut Frame, app: &App) {
             .alignment(Alignment::Center),
         area,
     );
+}
+
+fn draw_uninstall_confirm(f: &mut Frame, app: &App) {
+    let area = centered_rect(60, 20, 44, 6, f.area());
+    f.render_widget(Clear, area);
+    let name = app.pending_uninstall_name();
+    let body = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("Uninstall: {name}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("press  y  to confirm   ·   n  to cancel"),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("uninstall")
+        .border_style(Style::default().fg(Color::Red));
+    f.render_widget(
+        Paragraph::new(body)
+            .block(block)
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
+fn draw_pkg_detail(f: &mut Frame, app: &App) {
+    let Some((pkg, manager, dep_info)) = app.selected_pkg_detail() else {
+        return;
+    };
+
+    let area = centered_rect(75, 60, 50, 14, f.area());
+    f.render_widget(Clear, area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{} ", manager.label()),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            &pkg.name,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        if pkg.version.is_empty() {
+            Span::raw("")
+        } else {
+            Span::styled(
+                format!("@{}", pkg.version),
+                Style::default().fg(Color::Gray),
+            )
+        },
+    ]));
+
+    if let Some(size) = pkg.size {
+        lines.push(Line::from(vec![
+            Span::styled("  Size: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(size_detail(size), Style::default().fg(Color::Green)),
+        ]));
+    }
+    if let Some(path) = &pkg.path {
+        let max_path_len = area.width.saturating_sub(10) as usize;
+        lines.push(Line::from(vec![
+            Span::styled("  Path: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate(&path.display().to_string(), max_path_len),
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+
+    match dep_info {
+        Some(info) => {
+            let dep_text = if info.dependencies.is_empty() {
+                String::from("none")
+            } else {
+                let max_len = area.width.saturating_sub(18) as usize;
+                let joined = info.dependencies.join(", ");
+                truncate(&joined, max_len)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  Dependencies ({}): ", info.dependencies.len()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(dep_text, Style::default().fg(Color::White)),
+            ]));
+
+            let rev_text = if info.dependents.is_empty() {
+                String::from("none (removable)")
+            } else {
+                let max_len = area.width.saturating_sub(14) as usize;
+                let joined = info.dependents.join(", ");
+                truncate(&joined, max_len)
+            };
+            let rev_style = if info.dependents.is_empty() {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  Used by ({}): ", info.dependents.len()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(rev_text, rev_style),
+            ]));
+        }
+        None => {
+            if app.deps_loading {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", spinner_char()),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        "scanning dependency tree…",
+                        Style::default().fg(Color::Gray),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  dependency info not available",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  x",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" uninstall", Style::default().fg(Color::Gray)),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "d",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" trash dir", Style::default().fg(Color::Gray)),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" close", Style::default().fg(Color::Gray)),
+    ]));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" package info ")
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn centered_rect(px: u16, py: u16, min_width: u16, min_height: u16, area: Rect) -> Rect {
@@ -874,7 +1078,9 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
             match app.pkg_view {
                 PkgView::SystemManagers => {
                     let packages = app.flat_packages();
-                    let real_idx = app.pkg_visible_index(app.selected_pkg).unwrap_or(usize::MAX);
+                    let real_idx = app
+                        .pkg_visible_index(app.selected_pkg)
+                        .unwrap_or(usize::MAX);
                     match packages.get(real_idx) {
                         Some((package, manager)) => {
                             let size = package
@@ -902,7 +1108,10 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                         }
                     }
                 }
-                PkgView::ProjectDeps => match app.pkg_visible_index(app.selected_pkg).and_then(|i| app.project_deps.get(i)) {
+                PkgView::ProjectDeps => match app
+                    .pkg_visible_index(app.selected_pkg)
+                    .and_then(|i| app.project_deps.get(i))
+                {
                     Some(dep) => {
                         let size = dep
                             .deps_size

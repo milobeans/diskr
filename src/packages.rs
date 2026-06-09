@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -54,6 +55,61 @@ impl Manager {
         Manager::Cargo,
         Manager::Bun,
     ];
+
+    pub fn uninstall_args(self, name: &str) -> (&'static str, Vec<String>) {
+        match self {
+            Manager::Brew => ("brew", vec!["uninstall".into(), name.into()]),
+            Manager::BrewCask => (
+                "brew",
+                vec!["uninstall".into(), "--cask".into(), name.into()],
+            ),
+            Manager::Npm => ("npm", vec!["uninstall".into(), "-g".into(), name.into()]),
+            Manager::Pip => ("pip3", vec!["uninstall".into(), "-y".into(), name.into()]),
+            Manager::Cargo => ("cargo", vec!["uninstall".into(), name.into()]),
+            Manager::Bun => ("bun", vec!["remove".into(), "-g".into(), name.into()]),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DepInfo {
+    pub dependencies: Vec<String>,
+    pub dependents: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DepGraph {
+    entries: HashMap<(Manager, String), DepInfo>,
+}
+
+impl DepGraph {
+    pub fn get(&self, manager: Manager, name: &str) -> Option<&DepInfo> {
+        self.entries.get(&(manager, name.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: Vec<(Manager, &str, DepInfo)>) -> Self {
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|(manager, name, info)| ((manager, name.to_string()), info))
+                .collect(),
+        }
+    }
+
+    pub fn is_removable(&self, manager: Manager, name: &str) -> bool {
+        match self.entries.get(&(manager, name.to_string())) {
+            Some(info) => info.dependents.is_empty(),
+            None => true,
+        }
+    }
+
+    pub fn removable_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|info| info.dependents.is_empty())
+            .count()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +148,194 @@ pub fn scan_managers() -> Vec<ManagerReport> {
     }
 
     reports.into_iter().flatten().collect()
+}
+
+pub fn scan_dep_graph(reports: &[ManagerReport]) -> DepGraph {
+    let mut graph = DepGraph::default();
+
+    let brew_handle = thread::spawn(|| {
+        if command_exists("brew") {
+            scan_brew_dep_graph()
+        } else {
+            HashMap::new()
+        }
+    });
+
+    let pip_names: Vec<String> = reports
+        .iter()
+        .find(|r| r.manager == Manager::Pip && r.available)
+        .map(|r| r.packages.iter().map(|p| p.name.clone()).collect())
+        .unwrap_or_default();
+    let pip_handle = thread::spawn(move || {
+        if pip_names.is_empty() || !command_exists("pip3") {
+            HashMap::new()
+        } else {
+            scan_pip_dep_graph(&pip_names)
+        }
+    });
+
+    let brew_deps = brew_handle.join().unwrap_or_default();
+    let pip_deps = pip_handle.join().unwrap_or_default();
+
+    for report in reports {
+        if !report.available {
+            continue;
+        }
+        for pkg in &report.packages {
+            let info = match report.manager {
+                Manager::Brew => brew_deps.get(&pkg.name).cloned().unwrap_or_default(),
+                Manager::BrewCask => DepInfo::default(),
+                Manager::Pip => pip_deps.get(&pkg.name).cloned().unwrap_or_default(),
+                _ => DepInfo::default(),
+            };
+            graph
+                .entries
+                .insert((report.manager, pkg.name.clone()), info);
+        }
+    }
+
+    graph
+}
+
+fn scan_brew_dep_graph() -> HashMap<String, DepInfo> {
+    let output = run_command("brew", &["deps", "--installed", "--for-each"]);
+    if output.is_empty() {
+        return HashMap::new();
+    }
+    parse_brew_dep_graph(&output)
+}
+
+fn parse_brew_dep_graph(output: &str) -> HashMap<String, DepInfo> {
+    let mut forward: HashMap<String, Vec<String>> = HashMap::new();
+    let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
+
+    for line in output.lines() {
+        let Some((name, deps_str)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_string();
+        let deps: Vec<String> = deps_str
+            .split_whitespace()
+            .map(String::from)
+            .filter(|s| !s.is_empty())
+            .collect();
+        for dep in &deps {
+            reverse.entry(dep.clone()).or_default().push(name.clone());
+        }
+        forward.insert(name, deps);
+    }
+
+    let mut result: HashMap<String, DepInfo> = HashMap::new();
+    for (name, deps) in &forward {
+        let dependents = reverse.remove(name).unwrap_or_default();
+        result.insert(
+            name.clone(),
+            DepInfo {
+                dependencies: deps.clone(),
+                dependents,
+            },
+        );
+    }
+    for (name, dependents) in reverse {
+        result.entry(name).or_default().dependents = dependents;
+    }
+    result
+}
+
+fn scan_pip_dep_graph(names: &[String]) -> HashMap<String, DepInfo> {
+    let mut args: Vec<&str> = vec!["show"];
+    for name in names {
+        args.push(name);
+    }
+    let output = run_command("pip3", &args);
+    if output.is_empty() {
+        return HashMap::new();
+    }
+    parse_pip_show_output(&output)
+}
+
+fn parse_pip_show_output(output: &str) -> HashMap<String, DepInfo> {
+    let mut result = HashMap::new();
+    let mut current_name = String::new();
+    let mut current_deps = Vec::new();
+    let mut current_rev = Vec::new();
+
+    let flush = |result: &mut HashMap<String, DepInfo>,
+                 name: &mut String,
+                 deps: &mut Vec<String>,
+                 rev: &mut Vec<String>| {
+        if !name.is_empty() {
+            result.insert(
+                std::mem::take(name),
+                DepInfo {
+                    dependencies: std::mem::take(deps),
+                    dependents: std::mem::take(rev),
+                },
+            );
+        }
+    };
+
+    for line in output.lines() {
+        if line == "---" {
+            flush(
+                &mut result,
+                &mut current_name,
+                &mut current_deps,
+                &mut current_rev,
+            );
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("Name: ") {
+            flush(
+                &mut result,
+                &mut current_name,
+                &mut current_deps,
+                &mut current_rev,
+            );
+            current_name = name.trim().to_string();
+        } else if let Some(deps) = line.strip_prefix("Requires: ") {
+            current_deps = deps
+                .split(", ")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        } else if let Some(rev) = line.strip_prefix("Required-by: ") {
+            current_rev = rev
+                .split(", ")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+    }
+    flush(
+        &mut result,
+        &mut current_name,
+        &mut current_deps,
+        &mut current_rev,
+    );
+    result
+}
+
+pub fn run_uninstall(manager: Manager, name: &str) -> Result<String, String> {
+    let (cmd, args) = manager.uninstall_args(name);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let output = Command::new(cmd)
+        .args(&arg_refs)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run {cmd}: {e}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            format!("{cmd} exited with {}", output.status)
+        } else {
+            stderr
+        })
+    }
 }
 
 fn scan_manager(manager: Manager) -> ManagerReport {
@@ -782,6 +1026,58 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert_eq!(labels.len(), unique.len());
+    }
+
+    #[test]
+    fn manager_uninstall_args_use_native_manager_commands() {
+        let (cmd, args) = Manager::Brew.uninstall_args("ripgrep");
+        assert_eq!(cmd, "brew");
+        assert_eq!(args, vec!["uninstall", "ripgrep"]);
+
+        let (cmd, args) = Manager::Pip.uninstall_args("ruff");
+        assert_eq!(cmd, "pip3");
+        assert_eq!(args, vec!["uninstall", "-y", "ruff"]);
+
+        let (cmd, args) = Manager::Npm.uninstall_args("typescript");
+        assert_eq!(cmd, "npm");
+        assert_eq!(args, vec!["uninstall", "-g", "typescript"]);
+    }
+
+    #[test]
+    fn parses_brew_dependency_graph_and_reverse_deps() {
+        let graph = parse_brew_dep_graph(
+            "a: b c\n\
+             b: c\n\
+             c:\n\
+             app: a\n",
+        );
+
+        assert_eq!(graph["a"].dependencies, vec!["b", "c"]);
+        assert_eq!(graph["a"].dependents, vec!["app"]);
+        assert_eq!(graph["b"].dependencies, vec!["c"]);
+        assert_eq!(graph["b"].dependents, vec!["a"]);
+        assert_eq!(graph["c"].dependencies, Vec::<String>::new());
+        assert_eq!(graph["c"].dependents, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parses_pip_show_dependency_fields() {
+        let graph = parse_pip_show_output(
+            "Name: requests\n\
+             Version: 2.32.0\n\
+             Requires: certifi, urllib3\n\
+             Required-by: my-tool\n\
+             ---\n\
+             Name: urllib3\n\
+             Version: 2.0.0\n\
+             Requires:\n\
+             Required-by: requests\n",
+        );
+
+        assert_eq!(graph["requests"].dependencies, vec!["certifi", "urllib3"]);
+        assert_eq!(graph["requests"].dependents, vec!["my-tool"]);
+        assert_eq!(graph["urllib3"].dependencies, Vec::<String>::new());
+        assert_eq!(graph["urllib3"].dependents, vec!["requests"]);
     }
 
     #[test]
