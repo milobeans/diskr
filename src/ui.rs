@@ -773,8 +773,13 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
         return;
     };
 
-    let area = centered_rect(75, 60, 50, 14, f.area());
+    let area = centered_rect(86, 72, 78, 22, f.area());
     f.render_widget(Clear, area);
+
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let col_width = ((inner_width.saturating_sub(14)) / 3).max(18);
+    let center_width = col_width;
+    let side_width = col_width;
 
     let mut lines = Vec::new();
     lines.push(Line::from(""));
@@ -785,7 +790,7 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(
-            &pkg.name,
+            pkg.name.clone(),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -798,6 +803,26 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
                 Style::default().fg(Color::Gray),
             )
         },
+    ]));
+
+    let use_status = match dep_info {
+        Some(info) if info.evidence == DepEvidence::ManagerGraph => {
+            if info.dependents.is_empty() {
+                "dependency leaf in manager graph"
+            } else {
+                "required by installed packages"
+            }
+        }
+        Some(_) => "usage not tracked by this manager",
+        None if app.deps_loading => "dependency graph still scanning",
+        None => "dependency graph unavailable",
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  Status: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            use_status,
+            dependency_status_style(dep_info, app.deps_loading),
+        ),
     ]));
 
     if let Some(size) = pkg.size {
@@ -818,72 +843,131 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
     }
 
     lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Graph",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  evidence-backed package relationship view",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    let selected_title = format!("{} {}", manager.label(), pkg.name);
+    let selected_subtitle = if pkg.version.is_empty() {
+        String::from("selected installation")
+    } else {
+        format!("version {}", pkg.version)
+    };
+    let selected_path = pkg
+        .path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| String::from("path unknown"));
 
     match dep_info {
         Some(info) if info.evidence == DepEvidence::ManagerGraph => {
-            let dep_text = if info.dependencies.is_empty() {
-                String::from("none")
+            let left_title = if info.dependents.is_empty() {
+                "no manager dependents"
             } else {
-                let max_len = area.width.saturating_sub(18) as usize;
-                let joined = info.dependencies.join(", ");
-                truncate(&joined, max_len)
+                "used by packages"
             };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  Dependencies ({}): ", info.dependencies.len()),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(dep_text, Style::default().fg(Color::White)),
-            ]));
-
-            let rev_text = if info.dependents.is_empty() {
-                String::from("none in manager graph")
+            let left_items = diagram_items(
+                &info.dependents,
+                if info.dependents.is_empty() {
+                    "none in manager graph"
+                } else {
+                    "dependent"
+                },
+                6,
+                side_width,
+            );
+            let right_title = if info.dependencies.is_empty() {
+                "no direct deps"
             } else {
-                let max_len = area.width.saturating_sub(14) as usize;
-                let joined = info.dependents.join(", ");
-                truncate(&joined, max_len)
+                "depends on"
             };
-            let rev_style = if info.dependents.is_empty() {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::Yellow)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  Used by ({}): ", info.dependents.len()),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(rev_text, rev_style),
-            ]));
+            let right_items = diagram_items(
+                &info.dependencies,
+                if info.dependencies.is_empty() {
+                    "none in manager graph"
+                } else {
+                    "dependency"
+                },
+                6,
+                side_width,
+            );
+            let center_items = vec![
+                truncate(&selected_subtitle, center_width),
+                truncate(&selected_path, center_width),
+                truncate(&size_summary(pkg.size), center_width),
+            ];
+            push_package_graph(
+                &mut lines,
+                [
+                    GraphColumn::new(left_title, &left_items),
+                    GraphColumn::new(&selected_title, &center_items),
+                    GraphColumn::new(right_title, &right_items),
+                ],
+                side_width,
+            );
         }
         Some(_) => {
-            lines.push(Line::from(Span::styled(
-                "  Usage: not dependency-tracked by this package manager",
-                Style::default().fg(Color::Yellow),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  This can still be a runtime, app, environment, CLI, or manually used tool.",
-                Style::default().fg(Color::Gray),
-            )));
+            let left_items = vec![
+                String::from("no dependency graph"),
+                String::from("not safe to call unused"),
+                String::from("may be a runtime/app/env"),
+                String::from("may be invoked manually"),
+            ];
+            let center_items = vec![
+                truncate(&selected_subtitle, center_width),
+                truncate(&selected_path, center_width),
+                truncate(&size_summary(pkg.size), center_width),
+            ];
+            let right_items = vec![
+                String::from("scan project refs later"),
+                String::from("check env ownership"),
+                String::from("verify before uninstall"),
+            ];
+            push_package_graph(
+                &mut lines,
+                [
+                    GraphColumn::new("evidence", &left_items),
+                    GraphColumn::new(&selected_title, &center_items),
+                    GraphColumn::new("next checks", &right_items),
+                ],
+                side_width,
+            );
         }
         None => {
-            if app.deps_loading {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {} ", spinner_char()),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::styled(
-                        "scanning dependency tree…",
-                        Style::default().fg(Color::Gray),
-                    ),
-                ]));
+            let loading = if app.deps_loading {
+                format!("{} scanning dependency graph", spinner_char())
             } else {
-                lines.push(Line::from(Span::styled(
-                    "  dependency info not available",
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
+                String::from("dependency info unavailable")
+            };
+            let left_items = vec![loading, String::from("no usage claim yet")];
+            let center_items = vec![
+                truncate(&selected_subtitle, center_width),
+                truncate(&selected_path, center_width),
+                truncate(&size_summary(pkg.size), center_width),
+            ];
+            let right_items = vec![
+                String::from("wait for graph scan"),
+                String::from("refresh packages if stale"),
+            ];
+            push_package_graph(
+                &mut lines,
+                [
+                    GraphColumn::new("evidence", &left_items),
+                    GraphColumn::new(&selected_title, &center_items),
+                    GraphColumn::new("actions", &right_items),
+                ],
+                side_width,
+            );
         }
     }
 
@@ -916,9 +1000,121 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" package info ")
+        .title(" package graph ")
         .border_style(Style::default().fg(Color::Cyan));
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn dependency_status_style(dep_info: Option<&crate::packages::DepInfo>, loading: bool) -> Style {
+    match dep_info {
+        Some(info) if info.evidence == DepEvidence::ManagerGraph && info.dependents.is_empty() => {
+            Style::default().fg(Color::Green)
+        }
+        Some(info) if info.evidence == DepEvidence::ManagerGraph => {
+            Style::default().fg(Color::Yellow)
+        }
+        Some(_) => Style::default().fg(Color::Yellow),
+        None if loading => Style::default().fg(Color::Cyan),
+        None => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn size_summary(size: Option<SizeInfo>) -> String {
+    size.map(size_detail)
+        .unwrap_or_else(|| String::from("size unknown"))
+}
+
+fn diagram_items(items: &[String], empty_label: &str, limit: usize, width: usize) -> Vec<String> {
+    if items.is_empty() {
+        return vec![truncate(empty_label, width)];
+    }
+
+    let mut out: Vec<String> = items
+        .iter()
+        .take(limit)
+        .map(|item| truncate(item, width))
+        .collect();
+    if items.len() > limit {
+        out.push(truncate(
+            &format!("+{} more", items.len().saturating_sub(limit)),
+            width,
+        ));
+    }
+    out
+}
+
+struct GraphColumn<'a> {
+    title: &'a str,
+    items: &'a [String],
+}
+
+impl<'a> GraphColumn<'a> {
+    fn new(title: &'a str, items: &'a [String]) -> Self {
+        Self { title, items }
+    }
+}
+
+fn push_package_graph(
+    lines: &mut Vec<Line<'static>>,
+    columns: [GraphColumn<'_>; 3],
+    col_width: usize,
+) {
+    let arrow = "  ->  ";
+    let spacer = "      ";
+    let left_header = node_title(columns[0].title, col_width);
+    let center_header = node_title(columns[1].title, col_width);
+    let right_header = node_title(columns[2].title, col_width);
+
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(left_header, Style::default().fg(Color::DarkGray)),
+        Span::styled(arrow, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            center_header,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(arrow, Style::default().fg(Color::DarkGray)),
+        Span::styled(right_header, Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let rows = columns[0]
+        .items
+        .len()
+        .max(columns[1].items.len())
+        .max(columns[2].items.len())
+        .max(1);
+    for row in 0..rows {
+        let left = node_item(columns[0].items.get(row), col_width);
+        let center = node_item(columns[1].items.get(row), col_width);
+        let right = node_item(columns[2].items.get(row), col_width);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(left, Style::default().fg(Color::Gray)),
+            Span::styled(
+                if row == 0 { arrow } else { spacer },
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(center, Style::default().fg(Color::White)),
+            Span::styled(
+                if row == 0 { arrow } else { spacer },
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(right, Style::default().fg(Color::Gray)),
+        ]));
+    }
+}
+
+fn node_title(title: &str, width: usize) -> String {
+    let title = truncate(title, width.saturating_sub(4));
+    format!("[ {title:<width$} ]", width = width.saturating_sub(4))
+}
+
+fn node_item(item: Option<&String>, width: usize) -> String {
+    let text = item.map(String::as_str).unwrap_or("");
+    let text = truncate(text, width.saturating_sub(2));
+    format!("  {text:<width$}", width = width.saturating_sub(2))
 }
 
 fn centered_rect(px: u16, py: u16, min_width: u16, min_height: u16, area: Rect) -> Rect {
@@ -1285,6 +1481,40 @@ mod tests {
     #[test]
     fn package_columns_hide_size_when_narrow() {
         assert_eq!(package_columns(12), (12, 0));
+    }
+
+    #[test]
+    fn graph_node_rows_keep_fixed_width() {
+        assert_eq!(node_title("selected package", 18).chars().count(), 18);
+        assert_eq!(
+            node_item(Some(&String::from("very-long-package-name")), 18)
+                .chars()
+                .count(),
+            18
+        );
+    }
+
+    #[test]
+    fn diagram_items_caps_long_lists() {
+        let items = vec![
+            String::from("one"),
+            String::from("two"),
+            String::from("three"),
+            String::from("four"),
+        ];
+
+        assert_eq!(
+            diagram_items(&items, "empty", 2, 12),
+            vec![
+                String::from("one"),
+                String::from("two"),
+                String::from("+2 more")
+            ]
+        );
+        assert_eq!(
+            diagram_items(&[], "none in manager graph", 12, 8),
+            vec![String::from("none in…")]
+        );
     }
 
     #[test]
