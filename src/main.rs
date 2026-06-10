@@ -1271,6 +1271,8 @@ where
                 }
                 _ => {}
             }
+        } else if app.has_pending_scan_work() {
+            needs_draw = true;
         }
     }
 }

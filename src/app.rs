@@ -566,6 +566,9 @@ impl App {
                     }
                 }
                 ScanMsg::AllDone { scan_id } if scan_id == self.active_scan_id => {
+                    for entry in &mut self.entries {
+                        entry.scanning = false;
+                    }
                     if self.sort_dirty {
                         self.apply_sort_preserving_selection();
                     }
