@@ -618,7 +618,9 @@ impl App {
                         .unwrap_or(usize::MAX);
                     let packages = &self.cached_flat_packages;
                     if let Some((package, manager)) = packages.get(real_idx) {
-                        if let Some(path) = &package.path {
+                        if *manager == packages::Manager::BrewCask {
+                            self.request_uninstall();
+                        } else if let Some(path) = &package.path {
                             self.pending_delete = Some(DeleteTarget::Package {
                                 name: format!("{} {}", manager.label(), package.name),
                                 path: path.clone(),

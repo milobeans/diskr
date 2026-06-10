@@ -418,8 +418,87 @@ fn scan_brew_formulae() -> Vec<Package> {
 }
 
 fn scan_brew_casks() -> Vec<Package> {
+    let output = run_command("brew", &["info", "--cask", "--json=v2", "--installed"]);
+    if output.is_empty() {
+        return Vec::new();
+    }
     let caskroom = brew_prefix().join("Caskroom");
-    scan_brew_dir(&caskroom)
+    parse_brew_cask_json(&output, &caskroom)
+}
+
+fn parse_brew_cask_json(output: &str, caskroom: &Path) -> Vec<Package> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(output) else {
+        return Vec::new();
+    };
+    let Some(casks) = parsed.get("casks").and_then(|c| c.as_array()).cloned() else {
+        return Vec::new();
+    };
+
+    casks
+        .into_par_iter()
+        .filter_map(|cask| {
+            let token = cask.get("token")?.as_str()?.to_string();
+            let version = cask
+                .get("installed")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let mut is_installer_based = false;
+            let mut app_names = Vec::new();
+
+            if let Some(artifacts) = cask.get("artifacts").and_then(|a| a.as_array()) {
+                for art in artifacts {
+                    if art.get("pkg").is_some() || art.get("installer").is_some() {
+                        is_installer_based = true;
+                    }
+                    if let Some(apps) = art.get("app").and_then(|a| a.as_array()) {
+                        for app in apps {
+                            if let Some(app_str) = app.as_str() {
+                                app_names.push(app_str.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut version_display = version;
+            if is_installer_based {
+                version_display.push_str(" (installer-based)");
+            }
+
+            let pkg_path = caskroom.join(&token);
+            let mut size = if pkg_path.is_dir() {
+                bulkstat::scan_dir(&pkg_path, 0).size
+            } else {
+                SizeInfo::default()
+            };
+
+            if !is_installer_based {
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                for app_name in &app_names {
+                    let mut app_path = PathBuf::from("/Applications").join(app_name);
+                    if !app_path.exists() {
+                        if let Some(ref h) = home {
+                            app_path = h.join("Applications").join(app_name);
+                        }
+                    }
+                    if app_path.exists() {
+                        let app_size = bulkstat::scan_dir(&app_path, 0).size;
+                        size.logical = size.logical.saturating_add(app_size.logical);
+                        size.allocated = size.allocated.saturating_add(app_size.allocated);
+                    }
+                }
+            }
+
+            Some(Package {
+                name: token,
+                version: version_display,
+                size: Some(size),
+                path: Some(pkg_path),
+            })
+        })
+        .collect()
 }
 
 fn scan_brew_dir(install_dir: &Path) -> Vec<Package> {
@@ -1143,6 +1222,49 @@ mod tests {
         assert!(deps[0].deps_size.is_some());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_brew_cask_json_correctly() {
+        let json_data = r#"{
+            "casks": [
+                {
+                    "token": "pdfextractor",
+                    "installed": "1.5",
+                    "artifacts": [
+                        {
+                            "app": ["PDFExtractor.app"]
+                        }
+                    ]
+                },
+                {
+                    "token": "packages",
+                    "installed": "1.2.10",
+                    "artifacts": [
+                        {
+                            "pkg": ["Install Packages.pkg"]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let temp_caskroom = test_root("caskroom");
+        std::fs::create_dir_all(temp_caskroom.join("pdfextractor")).unwrap();
+        std::fs::create_dir_all(temp_caskroom.join("packages")).unwrap();
+
+        let packages = parse_brew_cask_json(json_data, &temp_caskroom);
+        assert_eq!(packages.len(), 2);
+
+        let pdf = packages.iter().find(|p| p.name == "pdfextractor").unwrap();
+        assert_eq!(pdf.version, "1.5");
+        assert_eq!(pdf.path.as_ref().unwrap(), &temp_caskroom.join("pdfextractor"));
+
+        let pkgs = packages.iter().find(|p| p.name == "packages").unwrap();
+        assert_eq!(pkgs.version, "1.2.10 (installer-based)");
+        assert_eq!(pkgs.path.as_ref().unwrap(), &temp_caskroom.join("packages"));
+
+        std::fs::remove_dir_all(temp_caskroom).unwrap();
     }
 
     fn test_root(name: &str) -> PathBuf {
