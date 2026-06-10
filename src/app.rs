@@ -1433,7 +1433,7 @@ fn format_localtime(modified: SystemTime) -> Option<String> {
 }
 
 fn to_local_tm(secs: u64) -> Option<libc::tm> {
-    let mut secs = secs as libc::time_t;
+    let secs = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ptr = unsafe { libc::localtime_r(&secs, &mut tm) };
     if ptr.is_null() {
