@@ -576,10 +576,18 @@ fn format_elapsed(secs: u64) -> String {
     let hours = (secs % 86_400) / 3_600;
     let minutes = (secs % 3_600) / 60;
     if days > 0 {
-        return format!("{days}d {hours}h ago");
+        return if hours > 0 {
+            format!("{days}d {hours}h ago")
+        } else {
+            format!("{days}d ago")
+        };
     }
     if hours > 0 {
-        return format!("{hours}h {minutes}m ago");
+        return if minutes > 0 {
+            format!("{hours}h {minutes}m ago")
+        } else {
+            format!("{hours}h ago")
+        };
     }
     if minutes > 0 {
         return format!("{minutes}m ago");
