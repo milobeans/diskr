@@ -752,6 +752,54 @@ impl App {
         changed
     }
 
+    pub fn save_history_baseline(&mut self) -> Result<()> {
+        let record = history::save(&self.cwd)?;
+        self.history_baseline = Some(record);
+        self.history_diff = None;
+        self.status = String::from("baseline saved");
+        Ok(())
+    }
+
+    pub fn top_files_open(&self) -> bool {
+        self.top_files_open
+    }
+
+    pub fn reclaim_paths_open(&self) -> bool {
+        self.reclaim_paths_open
+    }
+
+    pub fn disk_info_open(&self) -> bool {
+        self.disk_info_open
+    }
+
+    pub fn top_files_loading(&self) -> bool {
+        self.top_files_loading
+    }
+
+    pub fn disk_info_loading(&self) -> bool {
+        self.disk_info_loading
+    }
+
+    pub fn reclaim_paths_selected(&self) -> usize {
+        self.reclaim_paths_selected
+    }
+
+    pub fn set_top_files_selected(&mut self, index: usize) {
+        self.top_files_selected = index.min(self.top_files_count().saturating_sub(1));
+    }
+
+    pub fn set_reclaim_paths_selected(&mut self, index: usize) {
+        self.reclaim_paths_selected = index.min(self.reclaim_paths_count().saturating_sub(1));
+    }
+
+    pub fn top_files_path(&self) -> Option<&Path> {
+        self.top_files_path.as_deref()
+    }
+
+    pub fn top_files_scan(&self) -> Option<&DirScan> {
+        self.top_files_scan.as_ref()
+    }
+
     fn drain_reclaim_results(&mut self) -> bool {
         let recv = match self.reclaim_scan_rx.as_ref() {
             Some(rx) => rx.try_recv(),
@@ -932,6 +980,12 @@ impl App {
             return;
         }
         self.request_reclaim_scan();
+    }
+
+    pub fn selected_reclaim_finding(&self) -> Option<&reclaim::Finding> {
+        self.reclaim_report
+            .as_ref()
+            .and_then(|report| report.findings.get(self.selected_reclaim))
     }
 
     pub fn request_reclaim_scan(&mut self) {

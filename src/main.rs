@@ -291,7 +291,7 @@ Keys:
   Enter           Open selected directory or disk/package path
   Backspace       Go to parent directory
   /               Search files or filter packages
-  i               Show package details (deps, reverse deps)
+  i               Show package details (packages pane) or disk details (disks pane)
   u               Toggle dependency-leaf package filter
   x               Uninstall selected package via its manager
   Left/Right, h/l Switch pane or package view
@@ -303,7 +303,10 @@ Keys:
   p               Open packages pane / switch package view
   .               Toggle hidden files
   d               Move selected item to Trash
-  Tab             Switch files/disks/packages pane
+  R               Re-scan reclaim pane
+  t               Open top-files list for selected directory/cwd
+  B               Save history baseline for current directory
+  Tab             Switch files/disks/packages/reclaim pane
   q, Esc          Quit
 ",
         env!("CARGO_PKG_VERSION")
@@ -1006,6 +1009,141 @@ where
                         }
                         continue;
                     }
+                    if app.top_files_open() {
+                        let handled = match key.code {
+                            KeyCode::Esc => {
+                                app.close_top_files();
+                                true
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.move_top_files(1);
+                                true
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.move_top_files(-1);
+                                true
+                            }
+                            KeyCode::PageDown => {
+                                app.move_top_files(1);
+                                true
+                            }
+                            KeyCode::PageUp => {
+                                app.move_top_files(-1);
+                                true
+                            }
+                            KeyCode::Home => {
+                                app.set_top_files_selected(0);
+                                true
+                            }
+                            KeyCode::End => {
+                                app.set_top_files_selected(app.top_files_count().saturating_sub(1));
+                                true
+                            }
+                            KeyCode::Enter | KeyCode::Char('f') => {
+                                if let Some(path) = app.selected_top_file_path() {
+                                    let result = spawn_reveal_in_finder(&path);
+                                    app.status = match result {
+                                        Ok(()) => String::from("revealed top file in Finder"),
+                                        Err(err) => format!("reveal failed: {err}"),
+                                    };
+                                }
+                                true
+                            }
+                            KeyCode::Char('O') => {
+                                if let Some(path) = app.selected_top_file_path() {
+                                    let result = spawn_open(&path);
+                                    app.status = match result {
+                                        Ok(()) => String::from("opened top file"),
+                                        Err(err) => format!("open failed: {err}"),
+                                    };
+                                }
+                                true
+                            }
+                            KeyCode::Char('d') => {
+                                app.request_delete_top_file();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
+                    if app.reclaim_paths_open() {
+                        let handled = match key.code {
+                            KeyCode::Esc => {
+                                app.close_reclaim_paths();
+                                true
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.move_reclaim_paths(1);
+                                true
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.move_reclaim_paths(-1);
+                                true
+                            }
+                            KeyCode::PageDown => {
+                                app.move_reclaim_paths(1);
+                                true
+                            }
+                            KeyCode::PageUp => {
+                                app.move_reclaim_paths(-1);
+                                true
+                            }
+                            KeyCode::Home => {
+                                app.set_reclaim_paths_selected(0);
+                                true
+                            }
+                            KeyCode::End => {
+                                app.set_reclaim_paths_selected(app.reclaim_paths_count().saturating_sub(1));
+                                true
+                            }
+                            KeyCode::Enter | KeyCode::Char('f') => {
+                                if let Some((_, path)) = app.selected_reclaim_path() {
+                                    let result = spawn_reveal_in_finder(&path);
+                                    app.status = match result {
+                                        Ok(()) => String::from("revealed reclaim path in Finder"),
+                                        Err(err) => format!("reveal failed: {err}"),
+                                    };
+                                }
+                                true
+                            }
+                            KeyCode::Char('O') => {
+                                if let Some((_, path)) = app.selected_reclaim_path() {
+                                    let result = spawn_open(&path);
+                                    app.status = match result {
+                                        Ok(()) => String::from("opened reclaim path"),
+                                        Err(err) => format!("open failed: {err}"),
+                                    };
+                                }
+                                true
+                            }
+                            KeyCode::Char('d') => {
+                                app.request_delete_reclaim_path();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
+                    if app.disk_info_open() {
+                        let handled = match key.code {
+                            KeyCode::Esc => {
+                                app.close_disk_info();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
                     if app.search_mode {
                         let handled = match key.code {
                             KeyCode::Esc => {
@@ -1141,10 +1279,14 @@ where
                         KeyCode::Enter => {
                             if app.focus == Focus::Packages && app.packages_loaded {
                                 app.open_pkg_detail();
+                                true
+                            } else if app.focus == Focus::Reclaim {
+                                app.open_selected_reclaim_paths();
+                                true
                             } else {
                                 app.enter()?;
+                                true
                             }
-                            true
                         }
                         KeyCode::Backspace => {
                             app.go_up()?;
@@ -1174,9 +1316,26 @@ where
                             app.request_delete();
                             true
                         }
+                        KeyCode::Char('R') => {
+                            app.request_reclaim_scan();
+                            true
+                        }
                         KeyCode::Char('o') => {
                             app.cycle_sort();
                             true
+                        }
+                        KeyCode::Char('t') => {
+                            if app.focus == Focus::Files {
+                                let scan_target = app
+                                    .visible_entry(app.selected)
+                                    .filter(|entry| entry.is_dir)
+                                    .map(|entry| entry.path.clone())
+                                    .unwrap_or_else(|| app.cwd.clone());
+                                app.open_top_files_for_path(scan_target);
+                                true
+                            } else {
+                                false
+                            }
                         }
                         KeyCode::Char('p') => {
                             app.focus = Focus::Packages;
@@ -1197,6 +1356,14 @@ where
                             if app.focus == Focus::Packages && app.packages_loaded =>
                         {
                             app.open_pkg_detail();
+                            true
+                        }
+                        KeyCode::Char('i') if app.focus == Focus::Disks => {
+                            app.request_disk_info_for_selected_disk();
+                            true
+                        }
+                        KeyCode::Char('B') => {
+                            app.save_history_baseline()?;
                             true
                         }
                         KeyCode::Char('u')
@@ -1284,6 +1451,9 @@ fn set_focus(app: &mut App, focus: Focus) {
         app.status.clear();
     }
     app.focus = focus;
+    if app.focus == Focus::Reclaim {
+        app.open_reclaim_for_focus();
+    }
     if app.focus == Focus::Packages {
         app.load_packages();
     }

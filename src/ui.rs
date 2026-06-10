@@ -17,6 +17,7 @@ use crate::app::{
     format_modified_time, human, size_sort_key, App, Focus, PkgView, SortMode,
 };
 use crate::bulkstat::SizeInfo;
+use crate::reclaim::Reclaimability;
 use crate::packages::{DepEvidence, PackageUseStatus};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -57,6 +58,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, root[2], app);
     draw_help(f, root[3]);
 
+    if app.focus == Focus::Reclaim && !app.reclaim_paths_open() {
+        draw_reclaim_panel(f, app);
+    }
+    if app.top_files_open() {
+        draw_top_files(f, app);
+    }
+    if app.reclaim_paths_open() {
+        draw_reclaim_paths(f, app);
+    }
+    if app.disk_info_open() {
+        draw_disk_info_modal(f, app);
+    }
+
     if app.confirming_delete {
         draw_confirm(f, app);
     }
@@ -73,7 +87,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         &app.cwd.display().to_string(),
         area.width.saturating_sub(30) as usize,
     );
-    let text = Line::from(vec![
+    let mut spans = vec![
         Span::styled("diskr", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" · "),
         Span::styled(path, Style::default().fg(Color::Cyan)),
@@ -92,7 +106,23 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             format!("hidden {}", if app.show_hidden { "on" } else { "off" }),
             Style::default().fg(Color::Gray),
         ),
-    ]);
+        Span::raw(" · "),
+        Span::styled("history", Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+    ];
+    if let Some(baseline) = app.history_baseline_status() {
+        spans.push(Span::styled(
+            baseline,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(delta) = app.history_delta_status() {
+        spans.push(Span::styled(
+            format!(" · {delta}"),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    let text = Line::from(spans);
     f.render_widget(Paragraph::new(text), area);
 }
 
@@ -334,6 +364,442 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
             .percent(pct.min(100));
         f.render_widget(gauge, rows[visible_i]);
     }
+}
+
+fn draw_reclaim_panel(f: &mut Frame, app: &App) {
+    let area = centered_rect(70, 70, 72, 22, f.area());
+    f.render_widget(Clear, area);
+
+    if app.reclaim_loading {
+        let inner = Block::default().borders(Borders::ALL).title(" reclaim ");
+        let body = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    format!("{} ", spinner_char()),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled("scanning reclaim recommendations…", Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+            Line::from("press Enter on a finding to view recoverable paths"),
+        ])
+        .block(inner)
+        .alignment(Alignment::Center);
+        f.render_widget(body, area);
+        return;
+    }
+
+    let report = match app.reclaim_report.as_ref() {
+        Some(report) => report,
+        None => {
+            let inner = Block::default().borders(Borders::ALL).title(" reclaim ");
+            let body = Paragraph::new("press R to scan reclaim recommendations")
+                .block(inner)
+                .alignment(Alignment::Center);
+            f.render_widget(body, area);
+            return;
+        }
+    };
+
+    let item_count = report.findings.len();
+    if item_count == 0 {
+        let inner = Block::default().borders(Borders::ALL).title(" reclaim ");
+        let body = Paragraph::new("no reclaim candidates found")
+            .block(inner)
+            .alignment(Alignment::Center);
+        f.render_widget(body, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = report
+        .findings
+        .iter()
+        .map(|finding| {
+        let class_style = match finding.class {
+            Reclaimability::Safe => Style::default().fg(Color::Green),
+            Reclaimability::Regenerable => Style::default().fg(Color::Yellow),
+            Reclaimability::Risky => Style::default().fg(Color::Red),
+        };
+            let mut spans = Vec::new();
+            let size = if finding.size.allocated == finding.size.logical {
+                format!("{} ", human(finding.size.allocated))
+            } else {
+                format!(
+                    "{} / {} ",
+                    human(finding.size.allocated),
+                    human(finding.size.logical)
+                )
+            };
+            spans.push(Span::styled(
+                format!("{size:>16}"),
+                Style::default().fg(Color::Green),
+            ));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("{:>11}", finding.class.label()),
+                class_style,
+            ));
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                truncate(&finding.label, area.width.saturating_sub(52) as usize),
+                Style::default().fg(Color::White),
+            ));
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " reclaim {} · {} ",
+                    finding_count_label(item_count),
+                    human(report.total.allocated)
+                ))
+                .title_style(Style::default().fg(Color::DarkGray)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    let mut state = ListState::default();
+    state.select(Some(app.selected_reclaim.min(item_count.saturating_sub(1))));
+    f.render_stateful_widget(list, area, &mut state);
+
+    if let Some(finding) = app.selected_reclaim_finding() {
+        let detail_area = centered_rect(70, 28, 72, 9, f.area());
+        f.render_widget(Clear, detail_area);
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!(
+                    "{} · {} paths",
+                    if finding.size.allocated == finding.size.logical {
+                        human(finding.size.allocated)
+                    } else {
+                        format!("{} / {}", human(finding.size.allocated), human(finding.size.logical))
+                    },
+                    finding.count
+                ),
+                Style::default().fg(Color::Green),
+            )),
+            Line::from(Span::styled(finding.note.clone(), Style::default().fg(Color::Gray))),
+            Line::from(""),
+            Line::from("enter: open paths  ·  d: delete path  ·  esc: close paths"),
+        ];
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" reclaim finding ")
+            .border_style(Style::default().fg(Color::DarkGray));
+        f.render_widget(Paragraph::new(lines).block(block), detail_area);
+    }
+}
+
+fn finding_count_label(count: usize) -> String {
+    if count == 1 {
+        String::from("1 finding")
+    } else {
+        format!("{count} findings")
+    }
+}
+
+fn draw_reclaim_paths(f: &mut Frame, app: &App) {
+    let area = centered_rect(68, 68, 72, 20, f.area());
+    f.render_widget(Clear, area);
+
+    let finding = match app.selected_reclaim_finding() {
+        Some(finding) => finding,
+        None => return,
+    };
+    let item_count = app.reclaim_paths_count();
+    let items: Vec<ListItem> = finding
+        .paths
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            let prefix = if item_count == 0 {
+                String::new()
+            } else {
+                format!("{:>2}. ", idx + 1)
+            };
+            let mut spans = vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    truncate(&path.display().to_string(), area.width.saturating_sub(8) as usize),
+                    Style::default().fg(Color::White),
+                ),
+            ];
+            if idx == app.reclaim_paths_selected() {
+                spans.push(Span::styled("  (current)", Style::default().fg(Color::DarkGray)));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    if item_count == 0 {
+        let block = Block::default().borders(Borders::ALL).title(" reclaim paths ");
+        let body = Paragraph::new("no reclaim paths found")
+            .block(block)
+            .alignment(Alignment::Center);
+        f.render_widget(body, area);
+        return;
+    }
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " {} ({}) · {} ",
+                    finding.label,
+                    finding.class.label(),
+                    finding.count
+                )),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = ListState::default();
+    state.select(Some(app.reclaim_paths_selected().min(item_count.saturating_sub(1))));
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_top_files(f: &mut Frame, app: &App) {
+    let area = centered_rect(70, 70, 74, 20, f.area());
+    f.render_widget(Clear, area);
+
+    if app.top_files_loading() {
+        let block = Block::default().borders(Borders::ALL).title(" top files ");
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    format!("{} ", spinner_char()),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    "scanning top files…",
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+        ];
+        if let Some(path) = app.top_files_path() {
+            lines.push(Line::from(format!("path: {}", path.display())));
+        }
+        let body = Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center);
+        f.render_widget(body, area);
+        return;
+    }
+    let scan = match app.top_files_scan() {
+        Some(scan) => scan,
+        None => {
+            let block = Block::default().borders(Borders::ALL).title(" top files ");
+            let body = Paragraph::new("no scan in progress")
+                .block(block)
+                .alignment(Alignment::Center);
+            f.render_widget(body, area);
+            return;
+        }
+    };
+    if scan.largest_files.is_empty() {
+        let block = Block::default().borders(Borders::ALL).title(" top files ");
+        let body = Paragraph::new("no regular files found")
+            .block(block)
+            .alignment(Alignment::Center);
+        f.render_widget(body, area);
+        return;
+    }
+
+    let title = app
+        .top_files_path()
+        .map(|path| format!(" top files · {} ", path.display()))
+        .unwrap_or_else(|| String::from(" top files "));
+
+    let items: Vec<ListItem> = scan
+        .largest_files
+        .iter()
+        .enumerate()
+        .map(|(idx, file)| {
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:>2}. ", idx + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    truncate(&file.path.display().to_string(), area.width.saturating_sub(34) as usize),
+                    Style::default().fg(Color::White),
+                ),
+            ];
+            spans.push(Span::raw("  "));
+            let size = if file.size.allocated == file.size.logical {
+                human(file.size.allocated)
+            } else {
+                format!(
+                    "{} / {}",
+                    human(file.size.allocated),
+                    human(file.size.logical)
+                )
+            };
+            spans.push(Span::styled(
+                format!("{size:>20}"),
+                Style::default().fg(Color::Green),
+            ));
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_style(Style::default().fg(Color::DarkGray)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = ListState::default();
+    state.select(Some(app.top_files_selected.min(scan.largest_files.len().saturating_sub(1))));
+    f.render_stateful_widget(list, area, &mut state);
+
+    let total = if scan.size.allocated == scan.size.logical {
+        human(scan.size.allocated)
+    } else {
+        format!("{} / {}", human(scan.size.allocated), human(scan.size.logical))
+    };
+    let mut footer = vec![Line::from(Span::styled(
+        format!("total: {total}"),
+        Style::default().fg(Color::Green),
+    ))];
+    footer.push(Line::from("f/enter: reveal  ·  d: trash  ·  esc: close"));
+    let footer_area = Rect {
+        x: area.x + 1,
+        y: area.y + area.height.saturating_sub(2),
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(footer), footer_area);
+}
+
+fn draw_disk_info_modal(f: &mut Frame, app: &App) {
+    let area = centered_rect(65, 62, 60, 18, f.area());
+    f.render_widget(Clear, area);
+
+    if app.disk_info_loading() {
+        let block = Block::default().borders(Borders::ALL).title(" disk info ");
+        let body = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    format!("{} ", spinner_char()),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled("loading disk details…", Style::default().fg(Color::White)),
+            ]),
+        ])
+        .block(block)
+        .alignment(Alignment::Center);
+        f.render_widget(body, area);
+        return;
+    }
+
+    let Some(report) = app.disk_info_report.as_ref() else {
+        let block = Block::default().borders(Borders::ALL).title(" disk info ");
+        let body = Paragraph::new("no disk details available")
+            .block(block)
+            .alignment(Alignment::Center);
+        f.render_widget(body, area);
+        return;
+    };
+
+    let used = report.used;
+    let gap = report.unavailable_free();
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("mount ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}  ({}, {})", report.mount.display(), report.fs_type, report.device),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("total ", Style::default().fg(Color::DarkGray)),
+        Span::styled(human(report.total), Style::default().fg(Color::Green)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("used ", Style::default().fg(Color::DarkGray)),
+        Span::styled(human(used), Style::default().fg(Color::Green)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("free ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}  (available: {})", human(report.free), human(report.available)), Style::default().fg(Color::Green)),
+    ]));
+    if gap > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("free-not-available ", Style::default().fg(Color::DarkGray)),
+            Span::styled(human(gap), Style::default().fg(Color::Yellow)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    if let Some(container) = &report.apfs_container {
+        lines.push(Line::from(vec![
+            Span::styled("apfs container ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} free of {}", human(container.free), human(container.size)),
+                Style::default().fg(Color::Green),
+            ),
+        ]));
+    }
+    match report.local_snapshots.error.as_deref() {
+        Some(err) => {
+            lines.push(Line::from(vec![
+                Span::styled("snapshots ", Style::default().fg(Color::DarkGray)),
+                Span::styled(err, Style::default().fg(Color::Red)),
+            ]));
+        }
+        _ => {
+            let names = &report.local_snapshots.names;
+            if names.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "snapshots: none",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("snapshots: {}", names.len()),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for name in names.iter().take(6) {
+                    lines.push(Line::from(Span::styled(
+                        truncate(name, area.width.saturating_sub(6) as usize),
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
+            }
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("esc closes this panel"));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" disk details ");
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
