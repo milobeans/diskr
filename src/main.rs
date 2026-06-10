@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 
-use app::{human, App, Focus};
+use app::{format_elapsed, human, App, Focus};
 use terminal_backend::CrosstermBackend;
 
 fn main() -> Result<()> {
@@ -566,25 +566,6 @@ fn format_signed_bytes(delta: i128) -> String {
     let magnitude = delta.unsigned_abs().min(u128::from(u64::MAX)) as u64;
     let sign = if delta < 0 { "-" } else { "+" };
     format!("{sign}{}", human(magnitude))
-}
-
-fn format_elapsed(secs: u64) -> String {
-    if secs == 0 {
-        return String::from("just now");
-    }
-    let days = secs / 86_400;
-    let hours = (secs % 86_400) / 3_600;
-    let minutes = (secs % 3_600) / 60;
-    if days > 0 {
-        return format!("{days}d {hours}h ago");
-    }
-    if hours > 0 {
-        return format!("{hours}h {minutes}m ago");
-    }
-    if minutes > 0 {
-        return format!("{minutes}m ago");
-    }
-    format!("{secs}s ago")
 }
 
 fn print_space(path: PathBuf, json: bool) -> Result<()> {

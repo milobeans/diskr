@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bulkstat::SizeInfo;
 use crate::packages::{self, DepGraph, ManagerReport, ProjectDeps};
@@ -84,6 +84,7 @@ pub struct App {
 
     pub pkg_reports: Vec<ManagerReport>,
     pub project_deps: Vec<ProjectDeps>,
+    project_deps_cwd: Option<PathBuf>,
     pub pkg_view: PkgView,
     pub packages_loaded: bool,
     pub packages_loading: bool,
@@ -175,6 +176,7 @@ impl App {
             confirming_delete: false,
             pkg_reports: Vec::new(),
             project_deps: Vec::new(),
+            project_deps_cwd: None,
             pkg_view: PkgView::SystemManagers,
             packages_loaded: false,
             packages_loading: false,
@@ -849,6 +851,7 @@ impl App {
                         self.packages_loaded = true;
                     }
                     self.project_deps = msg.project_deps;
+                    self.project_deps_cwd = Some(self.cwd.clone());
                     self.rebuild_flat_packages();
                     self.selected_pkg = self
                         .selected_pkg
@@ -885,7 +888,9 @@ impl App {
 
     pub fn load_packages(&mut self) {
         if self.packages_loaded {
-            self.reload_project_deps();
+            if self.project_deps_cwd.as_deref() != Some(self.cwd.as_path()) {
+                self.reload_project_deps();
+            }
             return;
         }
         self.request_package_scan(true);
@@ -1337,6 +1342,89 @@ pub fn human(bytes: u64) -> String {
 
 pub fn size_sort_key(size: SizeInfo) -> u64 {
     size.allocated
+}
+
+pub fn format_elapsed(secs: u64) -> String {
+    if secs == 0 {
+        return String::from("just now");
+    }
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    if days > 0 {
+        return format!("{days}d {hours}h ago");
+    }
+    if hours > 0 {
+        return format!("{hours}h {minutes}m ago");
+    }
+    if minutes > 0 {
+        return format!("{minutes}m ago");
+    }
+    format!("{secs}s ago")
+}
+
+pub fn format_modified_time(modified: Option<SystemTime>) -> String {
+    modified
+        .and_then(format_localtime)
+        .unwrap_or_else(|| String::from("?"))
+}
+
+fn format_localtime(modified: SystemTime) -> Option<String> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const SECOND: u64 = 1;
+    const MINUTE: u64 = 60 * SECOND;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    const RELATIVE_THRESHOLD: u64 = 30 * DAY;
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let target_secs = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    if now_secs >= target_secs {
+        let age = now_secs.saturating_sub(target_secs);
+        if age < MINUTE {
+            return Some(format!("{}s", age));
+        }
+        if age < HOUR {
+            return Some(format!("{}m", age / MINUTE));
+        }
+        if age < DAY {
+            return Some(format!("{}h", age / HOUR));
+        }
+        if age < RELATIVE_THRESHOLD {
+            return Some(format!("{}d", age / DAY));
+        }
+    }
+
+    let now_tm = to_local_tm(now_secs)?;
+    let target_tm = to_local_tm(target_secs)?;
+
+    if now_tm.tm_year == target_tm.tm_year {
+        if let Some(month) = MONTHS.get(target_tm.tm_mon as usize) {
+            return Some(format!("{} {}", month, target_tm.tm_mday));
+        }
+    }
+
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        target_tm.tm_year + 1900,
+        target_tm.tm_mon + 1,
+        target_tm.tm_mday
+    ))
+}
+
+fn to_local_tm(secs: u64) -> Option<libc::tm> {
+    let mut secs = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ptr = unsafe { libc::localtime_r(&secs, &mut tm) };
+    if ptr.is_null() {
+        return None;
+    }
+    Some(tm)
 }
 
 fn disk_info() -> Vec<DiskInfo> {

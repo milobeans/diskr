@@ -13,7 +13,9 @@ use ratatui_widgets::{
     paragraph::{Paragraph, Wrap},
 };
 
-use crate::app::{human, size_sort_key, App, Focus, PkgView};
+use crate::app::{
+    format_modified_time, human, size_sort_key, App, Focus, PkgView, SortMode,
+};
 use crate::bulkstat::SizeInfo;
 use crate::packages::{DepEvidence, PackageUseStatus};
 
@@ -101,7 +103,9 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Color::DarkGray
     };
-    let (name_width, size_width) = file_columns(area.width.saturating_sub(2));
+    let show_modified = app.sort == SortMode::Modified;
+    let (name_width, size_width, modified_width) =
+        file_columns(area.width.saturating_sub(2), show_modified);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!("files ({})", app.entries.len()))
@@ -166,6 +170,14 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                 spans.push(Span::styled(
                     format!("{size_str:>size_width$}"),
                     Style::default().fg(Color::Green),
+                ));
+            }
+            if show_modified && modified_width > 0 {
+                let modified = format_modified_time(e.modified);
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("{modified:>modified_width$}"),
+                    Style::default().fg(Color::DarkGray),
                 ));
             }
             let line = Line::from(spans);
@@ -987,6 +999,11 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                     " · scanning size",
                     Style::default().fg(Color::Gray),
                 ));
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    format_modified_time(entry.modified),
+                    Style::default().fg(Color::Gray),
+                ));
             }
             Some(entry) if entry.is_dir => {
                 spans.push(Span::styled("dir ", Style::default().fg(Color::DarkGray)));
@@ -1002,6 +1019,11 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                     .map(size_detail)
                     .unwrap_or_else(|| String::from("—"));
                 spans.push(Span::styled(size, Style::default().fg(Color::Green)));
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    format_modified_time(entry.modified),
+                    Style::default().fg(Color::Gray),
+                ));
             }
             Some(entry) if entry.is_symlink => {
                 spans.push(Span::styled("link ", Style::default().fg(Color::DarkGray)));
@@ -1017,6 +1039,11 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                     .map(size_detail)
                     .unwrap_or_else(|| String::from("symlink"));
                 spans.push(Span::styled(size, Style::default().fg(Color::Green)));
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    format_modified_time(entry.modified),
+                    Style::default().fg(Color::Gray),
+                ));
             }
             Some(entry) => {
                 spans.push(Span::styled("file ", Style::default().fg(Color::DarkGray)));
@@ -1032,6 +1059,11 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                     .map(size_detail)
                     .unwrap_or_else(|| String::from("?"));
                 spans.push(Span::styled(size, Style::default().fg(Color::Green)));
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    format_modified_time(entry.modified),
+                    Style::default().fg(Color::Gray),
+                ));
             }
             None => {
                 spans.push(Span::styled(
@@ -1200,25 +1232,70 @@ fn size_detail(size: SizeInfo) -> String {
     )
 }
 
-fn file_columns(inner_width: u16) -> (usize, usize) {
+fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize) {
     const ICON_WIDTH: usize = 2;
     const GAP_WIDTH: usize = 2;
     const MIN_NAME_WIDTH: usize = 8;
     const MIN_SIZE_WIDTH: usize = 4;
     const PREFERRED_SIZE_WIDTH: usize = 12;
+    const MIN_MODIFIED_WIDTH: usize = 4;
+    const PREFERRED_MODIFIED_WIDTH: usize = 8;
 
     let inner_width = inner_width as usize;
-    let bare_name_width = inner_width.saturating_sub(ICON_WIDTH).max(1);
-    let room_for_size = inner_width.saturating_sub(ICON_WIDTH + GAP_WIDTH + MIN_NAME_WIDTH);
-    if room_for_size < MIN_SIZE_WIDTH {
-        return (bare_name_width, 0);
+    let content_width = inner_width.saturating_sub(ICON_WIDTH);
+    if !show_modified {
+        let bare_name_width = content_width.max(1);
+        let room_for_size = content_width.saturating_sub(MIN_NAME_WIDTH);
+        if room_for_size < MIN_SIZE_WIDTH {
+            return (bare_name_width, 0, 0);
+        }
+
+        let size_width = room_for_size.min(PREFERRED_SIZE_WIDTH);
+        let name_width = content_width
+            .saturating_sub(GAP_WIDTH + size_width)
+            .max(1);
+        return (name_width, size_width, 0);
     }
 
-    let size_width = room_for_size.min(PREFERRED_SIZE_WIDTH);
-    let name_width = inner_width
-        .saturating_sub(ICON_WIDTH + GAP_WIDTH + size_width)
+    let room_for_name_and_meta = content_width;
+    let min_for_modified_only = MIN_NAME_WIDTH + GAP_WIDTH + MIN_MODIFIED_WIDTH;
+    if room_for_name_and_meta < min_for_modified_only {
+        return (content_width.max(1), 0, 0);
+    }
+
+    let min_for_size_and_modified = MIN_NAME_WIDTH
+        + GAP_WIDTH
+        + MIN_SIZE_WIDTH
+        + GAP_WIDTH
+        + MIN_MODIFIED_WIDTH;
+    if room_for_name_and_meta >= min_for_size_and_modified && inner_width >= 50 {
+        let mut size_width = PREFERRED_SIZE_WIDTH;
+        let mut modified_width = PREFERRED_MODIFIED_WIDTH;
+        let mut required = MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + modified_width;
+        if required > room_for_name_and_meta {
+            let mut overflow = required - room_for_name_and_meta;
+            let shrink_modified = modified_width.saturating_sub(MIN_MODIFIED_WIDTH).min(overflow);
+            modified_width -= shrink_modified;
+            overflow -= shrink_modified;
+            size_width = size_width.saturating_sub(overflow).max(MIN_SIZE_WIDTH);
+            required = MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + modified_width;
+        }
+        if required <= room_for_name_and_meta {
+            let name_width = content_width
+                .saturating_sub(GAP_WIDTH + size_width + GAP_WIDTH + modified_width)
+                .max(1);
+            return (name_width, size_width, modified_width);
+        }
+    }
+
+    let modified_width = room_for_name_and_meta
+        .saturating_sub(MIN_NAME_WIDTH + GAP_WIDTH)
+        .min(PREFERRED_MODIFIED_WIDTH)
+        .max(MIN_MODIFIED_WIDTH);
+    let name_width = content_width
+        .saturating_sub(GAP_WIDTH + modified_width)
         .max(1);
-    (name_width, size_width)
+    (name_width, 0, modified_width)
 }
 
 fn package_columns(inner_width: u16) -> (usize, usize) {
@@ -1274,12 +1351,28 @@ mod tests {
 
     #[test]
     fn file_columns_hide_size_on_narrow_widths() {
-        assert_eq!(file_columns(10), (8, 0));
+        assert_eq!(file_columns(10, false), (8, 0, 0));
     }
 
     #[test]
     fn file_columns_keep_size_when_space_allows() {
-        assert_eq!(file_columns(30), (14, 12));
+        assert_eq!(file_columns(30, false), (14, 12, 0));
+    }
+
+    #[test]
+    fn file_columns_show_modified_in_wide_view() {
+        let (name_width, size_width, modified_width) = file_columns(60, true);
+        assert!(size_width > 0);
+        assert!(modified_width > 0);
+        assert_eq!(name_width + size_width + modified_width + 6, 60);
+    }
+
+    #[test]
+    fn file_columns_swap_modified_when_space_is_limited() {
+        let (name_width, size_width, modified_width) = file_columns(35, true);
+        assert!(size_width == 0);
+        assert_eq!(name_width + modified_width + 4, 35);
+        assert!(modified_width >= 4);
     }
 
     #[test]
