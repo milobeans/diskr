@@ -9,18 +9,21 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::bulkstat::SizeInfo;
+use crate::bulkstat::{self, DirScan, SizeInfo};
+use crate::{history, reclaim, space};
 use crate::packages::{self, DepGraph, ManagerReport, ProjectDeps};
 use crate::scanner::{ScanId, ScanMsg, Scanner};
 
 const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
 const AUTO_SCAN_LIMIT: usize = 4;
+const TOP_FILES_LIMIT: usize = 50;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Files,
     Disks,
     Packages,
+    Reclaim,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,8 +63,35 @@ pub enum DeleteTarget {
         path: PathBuf,
         is_project_dep: bool,
     },
+    TopFile {
+        name: String,
+        path: PathBuf,
+    },
+    ReclaimPath {
+        finding_index: usize,
+        name: String,
+        path: PathBuf,
+    },
 }
 
+struct ReclaimMsg {
+    scan_id: ScanId,
+    report: reclaim::ReclaimReport,
+}
+
+struct TopFilesMsg {
+    scan_id: ScanId,
+    path: PathBuf,
+    scan: DirScan,
+}
+
+struct DiskInfoMsg {
+    scan_id: ScanId,
+    path: PathBuf,
+    result: Result<space::SpaceReport, String>,
+}
+
+#[derive(Clone)]
 pub struct DiskInfo {
     pub name: String,
     pub mount: PathBuf,
@@ -110,6 +140,35 @@ pub struct App {
     last_sort: Instant,
     sort_dirty: bool,
     active_scan_id: ScanId,
+
+    active_reclaim_scan_id: ScanId,
+    reclaim_scan_rx: Option<Receiver<ReclaimMsg>>,
+    pub reclaim_report: Option<reclaim::ReclaimReport>,
+    pub reclaim_loading: bool,
+    pub selected_reclaim: usize,
+
+    reclaim_paths_open: bool,
+    reclaim_paths_selected: usize,
+    reclaim_paths_finding: usize,
+    reclaim_path_list_offset: usize,
+
+    top_files_open: bool,
+    top_files_loading: bool,
+    top_files_scan_id: ScanId,
+    top_files_scan_rx: Option<Receiver<TopFilesMsg>>,
+    top_files_scan: Option<DirScan>,
+    top_files_path: Option<PathBuf>,
+    pub top_files_selected: usize,
+    top_files_offset: usize,
+
+    disk_info_open: bool,
+    disk_info_loading: bool,
+    disk_info_id: ScanId,
+    disk_info_scan_rx: Option<Receiver<DiskInfoMsg>>,
+    pub disk_info_report: Option<space::SpaceReport>,
+
+    pub history_baseline: Option<history::ScanRecord>,
+    pub history_diff: Option<history::DiffReport>,
 
     scan_rx: Receiver<ScanMsg>,
     scanner: Scanner,
@@ -197,6 +256,30 @@ impl App {
             last_sort: Instant::now(),
             sort_dirty: false,
             active_scan_id: 0,
+            active_reclaim_scan_id: 0,
+            reclaim_scan_rx: None,
+            reclaim_report: None,
+            reclaim_loading: false,
+            selected_reclaim: 0,
+            reclaim_paths_open: false,
+            reclaim_paths_selected: 0,
+            reclaim_paths_finding: 0,
+            reclaim_path_list_offset: 0,
+            top_files_open: false,
+            top_files_loading: false,
+            top_files_scan_id: 0,
+            top_files_scan_rx: None,
+            top_files_scan: None,
+            top_files_path: None,
+            top_files_selected: 0,
+            top_files_offset: 0,
+            disk_info_open: false,
+            disk_info_loading: false,
+            disk_info_id: 0,
+            disk_info_scan_rx: None,
+            disk_info_report: None,
+            history_baseline: None,
+            history_diff: None,
             scanner: Scanner::new(tx.clone()),
             scan_rx: rx,
             active_pkg_scan_id: 0,
@@ -212,7 +295,51 @@ impl App {
         };
         app.refresh_disks();
         app.reload()?;
+        app.refresh_history_state();
         Ok(app)
+    }
+
+    pub fn refresh_history_state(&mut self) {
+        self.history_baseline = match history::load_record_for_path(&self.cwd) {
+            Ok(record) => record,
+            Err(_) => None,
+        };
+        self.history_diff = if self.history_baseline.is_some() {
+            history::diff(&self.cwd).ok()
+        } else {
+            None
+        };
+    }
+
+    pub fn history_baseline_status(&self) -> Option<String> {
+        let record = self.history_baseline.as_ref()?;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|now| now.as_secs())
+            .unwrap_or(0);
+        let age = now_secs.saturating_sub(record.timestamp);
+        Some(format!("baseline saved {} ago", format_elapsed(age)))
+    }
+
+    pub fn history_delta_status(&self) -> Option<String> {
+        let diff = self.history_diff.as_ref()?;
+        let delta = diff.total_delta_allocated();
+        let bytes = delta
+            .unsigned_abs()
+            .min(u128::from(u64::MAX)) as u64;
+        let delta_label = if delta > 0 {
+            format!("+{}", human(bytes))
+        } else if delta < 0 {
+            format!("-{}", human(bytes))
+        } else {
+            String::from("±0")
+        };
+        let age = format_elapsed(
+            diff.current_timestamp
+                .saturating_sub(diff.baseline_timestamp),
+        );
+        Some(format!("{delta_label} in {age}"))
     }
 
     pub fn reload(&mut self) -> Result<()> {
@@ -381,6 +508,14 @@ impl App {
                 let s = self.selected_pkg as i32 + delta;
                 self.selected_pkg = s.rem_euclid(n) as usize;
             }
+            Focus::Reclaim => {
+                let n = self.reclaim_item_count() as i32;
+                if n == 0 {
+                    return;
+                }
+                let s = self.selected_reclaim as i32 + delta;
+                self.selected_reclaim = s.rem_euclid(n) as usize;
+            }
         }
     }
 
@@ -397,6 +532,7 @@ impl App {
             }
             Focus::Disks => self.selected_disk = 0,
             Focus::Packages => self.selected_pkg = 0,
+            Focus::Reclaim => self.selected_reclaim = 0,
         }
     }
 
@@ -419,6 +555,12 @@ impl App {
                 let n = self.pkg_item_count();
                 if n > 0 {
                     self.selected_pkg = n - 1;
+                }
+            }
+            Focus::Reclaim => {
+                let n = self.reclaim_item_count();
+                if n > 0 {
+                    self.selected_reclaim = n - 1;
                 }
             }
         }
@@ -460,6 +602,7 @@ impl App {
                             self.cwd = entry.path;
                             self.selected = 0;
                             self.reload()?;
+                            self.refresh_history_state();
                         }
                     }
                 }
@@ -470,9 +613,13 @@ impl App {
                     self.focus = Focus::Files;
                     self.selected = 0;
                     self.reload()?;
+                    self.refresh_history_state();
                 }
             }
             Focus::Packages => {}
+            Focus::Reclaim => {
+                self.open_selected_reclaim_paths();
+            }
         }
         Ok(())
     }
@@ -485,6 +632,7 @@ impl App {
         if let Some(parent) = self.cwd.parent().map(|p| p.to_path_buf()) {
             self.cwd = parent;
             self.reload_with_selection(Some(previous_cwd), self.selected)?;
+            self.refresh_history_state();
         }
         Ok(())
     }
@@ -598,12 +746,352 @@ impl App {
         }
         changed |= self.drain_package_results();
         changed |= self.drain_dep_results();
+        changed |= self.drain_reclaim_results();
+        changed |= self.drain_top_files_results();
+        changed |= self.drain_disk_info_results();
         changed
     }
+
+    fn drain_reclaim_results(&mut self) -> bool {
+        let recv = match self.reclaim_scan_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+
+        match recv {
+            Ok(msg) if msg.scan_id == self.active_reclaim_scan_id => {
+                self.reclaim_report = Some(msg.report);
+                self.reclaim_loading = false;
+                self.reclaim_scan_rx = None;
+                self.reclaim_paths_open = false;
+                self.reclaim_paths_selected = 0;
+                self.reclaim_path_list_offset = 0;
+                self.selected_reclaim =
+                    self.selected_reclaim
+                        .min(self.reclaim_item_count().saturating_sub(1));
+                self.status = String::from("reclaim scan complete");
+                true
+            }
+            Ok(_) => true,
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.reclaim_loading = false;
+                self.reclaim_scan_rx = None;
+                self.status = String::from("reclaim scan failed");
+                true
+            }
+        }
+    }
+
+    fn drain_top_files_results(&mut self) -> bool {
+        let recv = match self.top_files_scan_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+
+        match recv {
+            Ok(msg) if msg.scan_id == self.top_files_scan_id => {
+                self.top_files_scan = Some(msg.scan);
+                self.top_files_path = Some(msg.path);
+                self.top_files_loading = false;
+                self.top_files_scan_rx = None;
+                self.top_files_selected = 0;
+                self.top_files_offset = 0;
+                self.status = String::from("top files scan complete");
+                true
+            }
+            Ok(_) => true,
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.top_files_loading = false;
+                self.top_files_scan_rx = None;
+                self.status = String::from("top files scan failed");
+                true
+            }
+        }
+    }
+
+    fn drain_disk_info_results(&mut self) -> bool {
+        let recv = match self.disk_info_scan_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+
+        match recv {
+            Ok(msg) if msg.scan_id == self.disk_info_id => {
+                self.disk_info_loading = false;
+                self.disk_info_scan_rx = None;
+                match msg.result {
+                    Ok(report) => {
+                        self.disk_info_report = Some(report);
+                        self.disk_info_open = true;
+                        self.status = String::new();
+                    }
+                    Err(err) => {
+                        self.disk_info_report = None;
+                        self.disk_info_open = true;
+                        self.status = format!("failed to load disk info: {err}");
+                    }
+                }
+                true
+            }
+            Ok(_) => true,
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.disk_info_loading = false;
+                self.disk_info_scan_rx = None;
+                self.disk_info_open = true;
+                self.status = String::from("disk info scan failed");
+                true
+            }
+        }
+    }
+
+    fn next_reclaim_scan_id(&mut self) -> ScanId {
+        self.active_reclaim_scan_id = self.active_reclaim_scan_id.saturating_add(1);
+        self.active_reclaim_scan_id
+    }
+
+    fn next_top_files_scan_id(&mut self) -> ScanId {
+        self.top_files_scan_id = self.top_files_scan_id.saturating_add(1);
+        self.top_files_scan_id
+    }
+
+    fn next_disk_info_scan_id(&mut self) -> ScanId {
+        self.disk_info_id = self.disk_info_id.saturating_add(1);
+        self.disk_info_id
+    }
+
+    pub fn reclaim_item_count(&self) -> usize {
+        self.reclaim_report
+            .as_ref()
+            .map(|report| report.findings.len())
+            .unwrap_or(0)
+    }
+
+    pub fn reclaim_paths_count(&self) -> usize {
+        self.reclaim_report
+            .as_ref()
+            .and_then(|report| report.findings.get(self.reclaim_paths_finding))
+            .map(|finding| finding.paths.len())
+            .unwrap_or(0)
+    }
+
+    pub fn move_reclaim_paths(&mut self, delta: i32) {
+        let n = self.reclaim_paths_count() as i32;
+        if n == 0 {
+            return;
+        }
+        let s = self.reclaim_paths_selected as i32 + delta;
+        self.reclaim_paths_selected = s.rem_euclid(n) as usize;
+    }
+
+    pub fn top_files_count(&self) -> usize {
+        self.top_files_scan
+            .as_ref()
+            .map(|scan| scan.largest_files.len())
+            .unwrap_or(0)
+    }
+
+    pub fn move_top_files(&mut self, delta: i32) {
+        let n = self.top_files_count() as i32;
+        if n == 0 {
+            return;
+        }
+        let s = self.top_files_selected as i32 + delta;
+        self.top_files_selected = s.rem_euclid(n) as usize;
+    }
+
+    pub fn selected_top_file_path(&self) -> Option<PathBuf> {
+        let idx = self.top_files_selected;
+        self.top_files_scan
+            .as_ref()
+            .and_then(|scan| scan.largest_files.get(idx))
+            .map(|file| file.path.clone())
+    }
+
+    pub fn selected_reclaim_path(&self) -> Option<(String, PathBuf)> {
+        self.reclaim_report.as_ref().and_then(|report| {
+            report
+                .findings
+                .get(self.reclaim_paths_finding)
+                .and_then(|finding| finding.paths.get(self.reclaim_paths_selected))
+                .map(|path| {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|name| name.to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    (name, path.clone())
+                })
+        })
+    }
+
+    pub fn open_reclaim_for_focus(&mut self) {
+        if self.reclaim_loading || self.reclaim_report.is_some() {
+            return;
+        }
+        self.request_reclaim_scan();
+    }
+
+    pub fn request_reclaim_scan(&mut self) {
+        if self.reclaim_loading {
+            return;
+        }
+        let cwd = self.cwd.clone();
+        let scan_id = self.next_reclaim_scan_id();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        self.reclaim_loading = true;
+        self.reclaim_scan_rx = Some(rx);
+        self.status = String::from("scanning reclaim recommendations…");
+
+        thread::spawn(move || {
+            let report = reclaim::report(&cwd);
+            let _ = tx.send(ReclaimMsg { scan_id, report });
+        });
+    }
+
+    pub fn open_selected_reclaim_paths(&mut self) {
+        if self.reclaim_item_count() == 0 {
+            self.status = String::from("no reclaim findings loaded");
+            return;
+        }
+        self.reclaim_paths_open = true;
+        self.reclaim_paths_selected = 0;
+        self.reclaim_path_list_offset = 0;
+        self.reclaim_paths_finding = self.selected_reclaim.min(self.reclaim_item_count().saturating_sub(1));
+        let label = self
+            .reclaim_report
+            .as_ref()
+            .and_then(|report| report.findings.get(self.reclaim_paths_finding))
+            .map(|finding| finding.label.as_str())
+            .unwrap_or("finding");
+        self.status = format!("opened reclaim paths: {label}");
+    }
+
+    pub fn request_delete_reclaim_path(&mut self) {
+        if let Some((name, path)) = self.selected_reclaim_path() {
+            self.pending_delete = Some(DeleteTarget::ReclaimPath {
+                finding_index: self.reclaim_paths_finding,
+                name,
+                path,
+            });
+            self.confirming_delete = true;
+            return;
+        }
+        self.status = String::from("no reclaim path selected");
+    }
+
+    pub fn rescan_reclaim_finding(&mut self, finding_index: usize) {
+        if self.reclaim_item_count() == 0 {
+            return;
+        }
+        self.selected_reclaim = finding_index.min(self.reclaim_item_count().saturating_sub(1));
+        self.request_reclaim_scan();
+    }
+
+    pub fn request_delete_top_file(&mut self) {
+        if self.top_files_loading {
+            self.status = String::from("top files scan in progress");
+            return;
+        }
+        let Some(path) = self.selected_top_file_path() else {
+            self.status = String::from("no top file selected");
+            return;
+        };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("top file");
+        self.pending_delete = Some(DeleteTarget::TopFile {
+            name: name.to_string(),
+            path,
+        });
+        self.confirming_delete = true;
+    }
+
+    pub fn close_top_files(&mut self) {
+        self.top_files_open = false;
+        self.top_files_loading = false;
+        self.top_files_scan = None;
+        self.top_files_scan_rx = None;
+        self.top_files_path = None;
+        self.top_files_selected = 0;
+        self.top_files_offset = 0;
+    }
+
+    pub fn close_reclaim_paths(&mut self) {
+        self.reclaim_paths_open = false;
+        self.reclaim_paths_selected = 0;
+        self.reclaim_path_list_offset = 0;
+    }
+
+    pub fn close_disk_info(&mut self) {
+        self.disk_info_open = false;
+        self.disk_info_loading = false;
+        self.disk_info_scan_rx = None;
+    }
+
+    pub fn open_top_files_for_path(&mut self, path: PathBuf) {
+        if self.top_files_loading {
+            self.top_files_scan = None;
+            self.top_files_scan_rx = None;
+            self.top_files_loading = false;
+        }
+        let scan_id = self.next_top_files_scan_id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.top_files_path = Some(path.clone());
+        self.top_files_open = true;
+        self.top_files_selected = 0;
+        self.top_files_offset = 0;
+        self.top_files_loading = true;
+        self.status = String::from("scanning top files…");
+        self.top_files_scan = None;
+        self.top_files_scan_rx = Some(rx);
+
+        thread::spawn(move || {
+            let scan = bulkstat::scan_dir(&path, TOP_FILES_LIMIT);
+            let _ = tx.send(TopFilesMsg {
+                scan_id,
+                path,
+                scan,
+            });
+        });
+    }
+
+    pub fn request_disk_info_for_selected_disk(&mut self) {
+        let Some(disk) = self.disks.get(self.selected_disk).cloned() else {
+            self.status = String::from("no disk selected");
+            return;
+        };
+        let path = disk.mount.clone();
+        let scan_id = self.next_disk_info_scan_id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.disk_info_id = scan_id;
+        self.disk_info_loading = true;
+        self.disk_info_report = None;
+        self.disk_info_open = true;
+        self.status = String::from("loading disk info…");
+        self.disk_info_scan_rx = Some(rx);
+
+        thread::spawn(move || {
+            let result = space::report_for_path(&path).map_err(|e| e.to_string());
+            let _ = tx.send(DiskInfoMsg {
+                scan_id,
+                path,
+                result,
+            });
+        });
+    }
+
 
     pub fn has_pending_scan_work(&self) -> bool {
         self.sort_dirty
             || self.entries.iter().any(|entry| entry.scanning)
+            || self.top_files_loading
+            || self.reclaim_loading
+            || self.disk_info_loading
             || self.packages_loading
             || self.deps_loading
             || self.uninstall_rx.is_some()
@@ -624,6 +1112,13 @@ impl App {
             }
             Focus::Disks => {
                 self.status = String::from("cannot delete a disk mount");
+            }
+            Focus::Reclaim => {
+                if self.reclaim_paths_open {
+                    self.request_delete_reclaim_path();
+                } else {
+                    self.status = String::from("press Enter on a reclaim finding to list paths");
+                }
             }
             Focus::Packages => match self.pkg_view {
                 PkgView::SystemManagers => {
@@ -682,6 +1177,8 @@ impl App {
     pub fn confirm_delete(&mut self) -> Result<()> {
         self.confirming_delete = false;
         if let Some(target) = self.pending_delete.take() {
+            let top_files_path = self.top_files_path.clone();
+            let _reclaim_finding = self.reclaim_paths_finding;
             match target {
                 DeleteTarget::FileEntry(entry) => {
                     match crate::fs_ops::delete_to_trash(&entry.path) {
@@ -692,25 +1189,56 @@ impl App {
                             let status = self.status.clone();
                             self.reload()?;
                             self.status = status;
+                            self.refresh_history_state();
                         }
                         Err(e) => self.status = format!("delete failed: {e}"),
                     }
                 }
+                DeleteTarget::TopFile { name, path } => match crate::fs_ops::delete_to_trash(&path) {
+                        Ok(()) => {
+                            self.status = format!("moved to trash: {name}");
+                            self.invalidate_cache_for(&path);
+                            self.refresh_disks();
+                            if let Some(path) = top_files_path {
+                                self.open_top_files_for_path(path);
+                            }
+                            self.refresh_history_state();
+                        }
+                    Err(e) => self.status = format!("delete failed: {e}"),
+                },
+                DeleteTarget::ReclaimPath {
+                    finding_index,
+                    name,
+                    path,
+                } => match crate::fs_ops::delete_to_trash(&path) {
+                        Ok(()) => {
+                            self.status = format!("moved to trash: {name}");
+                            self.invalidate_cache_for(&path);
+                            self.refresh_disks();
+                            self.rescan_reclaim_finding(finding_index);
+                            self.selected_reclaim = finding_index.min(self.reclaim_item_count().saturating_sub(1));
+                            self.refresh_history_state();
+                        }
+                    Err(e) => {
+                        self.status = format!("delete failed: {e}");
+                    }
+                },
                 DeleteTarget::Package {
                     name,
                     path,
                     is_project_dep,
                 } => match crate::fs_ops::delete_to_trash(&path) {
-                    Ok(()) => {
-                        self.status = format!("moved to trash: {name}");
-                        self.invalidate_cache_for(&path);
-                        self.refresh_disks();
-                        if is_project_dep {
-                            self.reload_project_deps();
-                        } else {
-                            self.refresh_packages();
+                        Ok(()) => {
+                            self.status = format!("moved to trash: {name}");
+                            self.invalidate_cache_for(&path);
+                            self.refresh_disks();
+                            if is_project_dep {
+                                self.reload_project_deps();
+                            } else {
+                                self.refresh_packages();
+                            }
+                            self.refresh_history_state();
                         }
-                    }
                     Err(e) => self.status = format!("delete failed: {e}"),
                 },
             }
@@ -722,6 +1250,8 @@ impl App {
         match &self.pending_delete {
             Some(DeleteTarget::FileEntry(entry)) => &entry.name,
             Some(DeleteTarget::Package { name, .. }) => name,
+            Some(DeleteTarget::TopFile { name, .. }) => name,
+            Some(DeleteTarget::ReclaimPath { name, .. }) => name,
             None => "?",
         }
     }
@@ -1312,6 +1842,7 @@ impl App {
         match self.focus {
             Focus::Files => self.visible_entry(self.selected).map(|e| e.path.clone()),
             Focus::Disks => self.disks.get(self.selected_disk).map(|d| d.mount.clone()),
+            Focus::Reclaim => self.selected_reclaim_path().map(|(_, path)| path),
             Focus::Packages => {
                 let real_idx = self.pkg_visible_index(self.selected_pkg)?;
                 match self.pkg_view {

@@ -94,7 +94,7 @@ pub fn save(path: &Path) -> Result<ScanRecord> {
 /// Compare a fresh scan of `path` against the saved baseline.
 pub fn diff(path: &Path) -> Result<DiffReport> {
     validate_dir(path)?;
-    let Some(baseline) = load_record(path)? else {
+    let Some(baseline) = load_record_for_path(path)? else {
         bail!(
             "no saved baseline for {}; run `diskr --save {}` first",
             path.display(),
@@ -238,7 +238,8 @@ fn load_history() -> Result<serde_json::Map<String, serde_json::Value>> {
     }
 }
 
-fn load_record(path: &Path) -> Result<Option<ScanRecord>> {
+/// Load the saved baseline for a path if one exists.
+pub fn load_record_for_path(path: &Path) -> Result<Option<ScanRecord>> {
     let canonical = path
         .canonicalize()
         .with_context(|| format!("resolve {}", path.display()))?;

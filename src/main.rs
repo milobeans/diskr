@@ -859,6 +859,7 @@ fn selected_action_target(app: &App) -> Option<(PathBuf, String)> {
                 }),
             }
         }
+        Focus::Reclaim => app.selected_reclaim_path().map(|(name, path)| (path, name)),
     }
 }
 
@@ -1262,7 +1263,8 @@ fn focus_next(app: &mut App) {
     let next = match app.focus {
         Focus::Files => Focus::Disks,
         Focus::Disks => Focus::Packages,
-        Focus::Packages => Focus::Files,
+        Focus::Packages => Focus::Reclaim,
+        Focus::Reclaim => Focus::Files,
     };
     set_focus(app, next);
 }
@@ -1272,6 +1274,7 @@ fn focus_previous(app: &mut App) {
         Focus::Files => Focus::Packages,
         Focus::Disks => Focus::Files,
         Focus::Packages => Focus::Disks,
+        Focus::Reclaim => Focus::Packages,
     };
     set_focus(app, previous);
 }

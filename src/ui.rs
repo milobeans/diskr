@@ -104,7 +104,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
         Color::DarkGray
     };
     let show_modified = app.sort == SortMode::Modified;
-    let (name_width, size_width, modified_width) =
+    let (name_width, size_width, modified_width, bar_width) =
         file_columns(area.width.saturating_sub(2), show_modified);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -127,9 +127,21 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     let (offset, end) =
         file_window_bounds(app.selected, visible_count, app.file_list_offset, max_rows);
     app.file_list_offset = offset;
-
-    let items: Vec<ListItem> = (offset..end)
+    let visible_entries: Vec<&crate::app::Entry> = (offset..end)
         .filter_map(|visible_index| app.visible_entry(visible_index))
+        .collect();
+    let max_visible_size = visible_entries
+        .iter()
+        .filter_map(|entry| entry.size.map(size_sort_key))
+        .max()
+        .unwrap_or(0);
+    let total_visible_size: u64 = visible_entries
+        .iter()
+        .filter_map(|entry| entry.size.map(size_sort_key))
+        .sum();
+
+    let items: Vec<ListItem> = visible_entries
+        .into_iter()
         .map(|e| {
             let size_str = match (e.is_dir, e.size, e.scanning) {
                 (true, _, true) => format!("{} scanning…", spinner_char()),
@@ -165,11 +177,26 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                     name_style,
                 ),
             ];
+            let (bar_text, bar_percent, bar_style) = file_size_bar(
+                e.size.map(size_sort_key),
+                max_visible_size,
+                total_visible_size,
+                bar_width,
+            );
             if size_width > 0 {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
                     format!("{size_str:>size_width$}"),
                     Style::default().fg(Color::Green),
+                ));
+            }
+            if bar_width > 0 && !e.scanning {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(bar_text, bar_style));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    bar_percent,
+                    Style::default().fg(Color::DarkGray),
                 ));
             }
             if show_modified && modified_width > 0 {
@@ -1100,6 +1127,30 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                 ));
             }
         },
+        Focus::Reclaim => {
+            if let Some((name, path)) = app.selected_reclaim_path() {
+                spans.push(Span::styled(
+                    "reclaim ",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                spans.push(Span::styled(
+                    truncate(&name, 28),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    truncate(path.to_string_lossy().as_ref(), 34),
+                    Style::default().fg(Color::Gray),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "no reclaim path selected",
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+        }
         Focus::Packages => {
             if app.packages_loading {
                 spans.push(Span::styled(
@@ -1232,7 +1283,7 @@ fn size_detail(size: SizeInfo) -> String {
     )
 }
 
-fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize) {
+fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize, usize) {
     const ICON_WIDTH: usize = 2;
     const GAP_WIDTH: usize = 2;
     const MIN_NAME_WIDTH: usize = 8;
@@ -1240,27 +1291,65 @@ fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize) 
     const PREFERRED_SIZE_WIDTH: usize = 12;
     const MIN_MODIFIED_WIDTH: usize = 4;
     const PREFERRED_MODIFIED_WIDTH: usize = 8;
+    const MIN_BAR_WIDTH: usize = 8;
+    const MAX_BAR_WIDTH: usize = 14;
+    const PREFERRED_BAR_WIDTH: usize = 10;
+    const BAR_THRESHOLD_WIDTH: usize = 55;
 
     let inner_width = inner_width as usize;
     let content_width = inner_width.saturating_sub(ICON_WIDTH);
+    let show_bar = inner_width >= BAR_THRESHOLD_WIDTH;
+    let preferred_bar_width = if show_bar {
+        PREFERRED_BAR_WIDTH
+            .min(MAX_BAR_WIDTH)
+            .max(MIN_BAR_WIDTH)
+    } else {
+        0
+    };
+
     if !show_modified {
         let bare_name_width = content_width.max(1);
         let room_for_size = content_width.saturating_sub(MIN_NAME_WIDTH);
         if room_for_size < MIN_SIZE_WIDTH {
-            return (bare_name_width, 0, 0);
+            return (bare_name_width, 0, 0, 0);
+        }
+
+        if preferred_bar_width > 0 {
+            let minimum_width = MIN_NAME_WIDTH + GAP_WIDTH + MIN_SIZE_WIDTH + GAP_WIDTH + MIN_BAR_WIDTH;
+            if room_for_size >= minimum_width.saturating_sub(MIN_NAME_WIDTH) {
+                let mut size_width = PREFERRED_SIZE_WIDTH.min(room_for_size);
+                let mut bar_width = preferred_bar_width;
+                let mut required =
+                    MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + bar_width;
+                if required > content_width {
+                    let mut overflow = required - content_width;
+                    let shrink_bar = (bar_width.saturating_sub(MIN_BAR_WIDTH)).min(overflow);
+                    bar_width -= shrink_bar;
+                    overflow -= shrink_bar;
+                    size_width = size_width.saturating_sub(overflow).max(MIN_SIZE_WIDTH);
+                    required =
+                        MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + bar_width;
+                }
+                if required <= content_width {
+                    let name_width = content_width
+                        .saturating_sub(GAP_WIDTH + size_width + GAP_WIDTH + bar_width)
+                        .max(1);
+                    return (name_width, size_width, 0, bar_width);
+                }
+            }
         }
 
         let size_width = room_for_size.min(PREFERRED_SIZE_WIDTH);
         let name_width = content_width
             .saturating_sub(GAP_WIDTH + size_width)
             .max(1);
-        return (name_width, size_width, 0);
+        return (name_width, size_width, 0, 0);
     }
 
     let room_for_name_and_meta = content_width;
     let min_for_modified_only = MIN_NAME_WIDTH + GAP_WIDTH + MIN_MODIFIED_WIDTH;
     if room_for_name_and_meta < min_for_modified_only {
-        return (content_width.max(1), 0, 0);
+        return (content_width.max(1), 0, 0, 0);
     }
 
     let min_for_size_and_modified = MIN_NAME_WIDTH
@@ -1268,9 +1357,11 @@ fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize) 
         + MIN_SIZE_WIDTH
         + GAP_WIDTH
         + MIN_MODIFIED_WIDTH;
+    let mut size_width = 0;
+    let mut modified_width = 0;
     if room_for_name_and_meta >= min_for_size_and_modified && inner_width >= 50 {
-        let mut size_width = PREFERRED_SIZE_WIDTH;
-        let mut modified_width = PREFERRED_MODIFIED_WIDTH;
+        size_width = PREFERRED_SIZE_WIDTH;
+        modified_width = PREFERRED_MODIFIED_WIDTH;
         let mut required = MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + modified_width;
         if required > room_for_name_and_meta {
             let mut overflow = required - room_for_name_and_meta;
@@ -1284,7 +1375,39 @@ fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize) 
             let name_width = content_width
                 .saturating_sub(GAP_WIDTH + size_width + GAP_WIDTH + modified_width)
                 .max(1);
-            return (name_width, size_width, modified_width);
+            if preferred_bar_width == 0 {
+                return (name_width, size_width, modified_width, 0);
+            }
+
+            let mut bar_width = preferred_bar_width;
+            let mut required =
+                MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + modified_width + GAP_WIDTH + bar_width;
+            if required > room_for_name_and_meta {
+                let mut overflow = required - room_for_name_and_meta;
+                let shrink_bar = (bar_width.saturating_sub(MIN_BAR_WIDTH)).min(overflow);
+                bar_width -= shrink_bar;
+                overflow -= shrink_bar;
+                let shrink_modified = (modified_width.saturating_sub(MIN_MODIFIED_WIDTH)).min(overflow);
+                modified_width -= shrink_modified;
+                overflow -= shrink_modified;
+                size_width = size_width.saturating_sub(overflow).max(MIN_SIZE_WIDTH);
+                required = MIN_NAME_WIDTH
+                    + GAP_WIDTH
+                    + size_width
+                    + GAP_WIDTH
+                    + modified_width
+                    + GAP_WIDTH
+                    + bar_width;
+            }
+
+            if required <= room_for_name_and_meta {
+                let name_width = content_width
+                    .saturating_sub(
+                        GAP_WIDTH + size_width + GAP_WIDTH + modified_width + GAP_WIDTH + bar_width,
+                    )
+                    .max(1);
+                return (name_width, size_width, modified_width, bar_width);
+            }
         }
     }
 
@@ -1295,7 +1418,26 @@ fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize) 
     let name_width = content_width
         .saturating_sub(GAP_WIDTH + modified_width)
         .max(1);
-    (name_width, 0, modified_width)
+    let bar_width = if preferred_bar_width == 0 {
+        0
+    } else {
+        let mut bar_width = preferred_bar_width;
+        let mut required = MIN_NAME_WIDTH + GAP_WIDTH + modified_width + GAP_WIDTH + bar_width;
+        if required > room_for_name_and_meta {
+            let overflow = required - room_for_name_and_meta;
+            bar_width = bar_width.saturating_sub(overflow).max(MIN_BAR_WIDTH);
+            required = MIN_NAME_WIDTH + GAP_WIDTH + modified_width + GAP_WIDTH + bar_width;
+        }
+        if required <= room_for_name_and_meta {
+            bar_width
+        } else {
+            0
+        }
+    };
+    if bar_width == 0 {
+        return (name_width, 0, modified_width, 0);
+    }
+    (name_width, 0, modified_width, bar_width)
 }
 
 fn package_columns(inner_width: u16) -> (usize, usize) {
@@ -1313,6 +1455,72 @@ fn package_columns(inner_width: u16) -> (usize, usize) {
     let size_width = room_for_size.min(PREFERRED_SIZE_WIDTH);
     let name_width = inner_width.saturating_sub(GAP_WIDTH + size_width).max(1);
     (name_width, size_width)
+}
+
+fn file_size_bar(
+    size: Option<u64>,
+    max_visible_size: u64,
+    total_visible_size: u64,
+    bar_width: usize,
+) -> (String, String, Style) {
+    if bar_width == 0 {
+        return (String::new(), String::new(), Style::default());
+    }
+
+    let Some(size) = size else {
+        let blank = format!("{: <bar_width$}", " ");
+        return (blank, String::from(" --%"), Style::default().fg(Color::DarkGray));
+    };
+
+    if max_visible_size == 0 {
+        let blank = format!("{: <bar_width$}", " ");
+        return (
+            blank,
+            format!("{:>3}%", 0),
+            Style::default().fg(Color::DarkGray),
+        );
+    }
+
+    let percent_of_max = if size >= max_visible_size {
+        100
+    } else if max_visible_size == 0 {
+        0
+    } else {
+        ((size.saturating_mul(100) + max_visible_size / 2) / max_visible_size).min(100)
+    };
+    let percent_of_sum = if total_visible_size == 0 {
+        0
+    } else {
+        ((size.saturating_mul(100) + total_visible_size / 2) / total_visible_size).min(100)
+    };
+    let filled = if size == 0 {
+        0
+    } else {
+        let numerator = size.saturating_mul(u64::try_from(bar_width).unwrap_or(0));
+        if max_visible_size == 0 || numerator == 0 {
+            0
+        } else {
+            numerator
+                .saturating_div(max_visible_size)
+                .max(1)
+                .min(u64::try_from(bar_width).unwrap_or(u64::MAX))
+        }
+    };
+    let filled = usize::try_from(filled).unwrap_or(0).min(bar_width);
+
+    let style = if percent_of_max >= 50 {
+        Style::default().fg(Color::Red)
+    } else if percent_of_max >= 25 {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let bar_text = format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat(bar_width.saturating_sub(filled)),
+    );
+    (bar_text, format!("{percent_of_sum:>3}%"), style)
 }
 
 #[allow(clippy::items_after_test_module)]
@@ -1351,28 +1559,53 @@ mod tests {
 
     #[test]
     fn file_columns_hide_size_on_narrow_widths() {
-        assert_eq!(file_columns(10, false), (8, 0, 0));
+        assert_eq!(file_columns(10, false), (8, 0, 0, 0));
     }
 
     #[test]
     fn file_columns_keep_size_when_space_allows() {
-        assert_eq!(file_columns(30, false), (14, 12, 0));
+        assert_eq!(file_columns(30, false), (14, 12, 0, 0));
     }
 
     #[test]
     fn file_columns_show_modified_in_wide_view() {
-        let (name_width, size_width, modified_width) = file_columns(60, true);
+        let (name_width, size_width, modified_width, bar_width) = file_columns(60, true);
         assert!(size_width > 0);
         assert!(modified_width > 0);
-        assert_eq!(name_width + size_width + modified_width + 6, 60);
+        assert!(bar_width > 0);
+        assert_eq!(name_width + size_width + modified_width + bar_width + 6, 60);
+        assert_eq!(bar_width, 10);
     }
 
     #[test]
     fn file_columns_swap_modified_when_space_is_limited() {
-        let (name_width, size_width, modified_width) = file_columns(35, true);
+        let (name_width, size_width, modified_width, bar_width) = file_columns(35, true);
         assert!(size_width == 0);
         assert_eq!(name_width + modified_width + 4, 35);
         assert!(modified_width >= 4);
+        assert_eq!(bar_width, 0);
+    }
+
+    #[test]
+    fn file_columns_show_bar_at_wide_width() {
+        let (name_width, size_width, modified_width, bar_width) = file_columns(90, false);
+        assert_eq!(modified_width, 0);
+        assert_eq!(bar_width, 10);
+        assert_eq!(name_width + size_width + bar_width + 4, 90);
+    }
+
+    #[test]
+    fn file_size_bar_renders_scaled_blocks() {
+        let (bar, percent, _style) = file_size_bar(Some(50), 100, 200, 10);
+        assert_eq!(bar.len(), 10);
+        assert_eq!(percent, " 25%");
+    }
+
+    #[test]
+    fn file_size_bar_handles_unknown_size() {
+        let (bar, percent, _style) = file_size_bar(None, 100, 200, 10);
+        assert_eq!(bar.len(), 10);
+        assert_eq!(percent, " --%");
     }
 
     #[test]
