@@ -316,12 +316,24 @@ impl App {
     }
 
     fn apply_sort_preserving_selection(&mut self) {
-        let sp = self.entries.get(self.selected).map(|e| e.path.clone());
+        let selected_path = self.visible_entry(self.selected).map(|entry| entry.path.clone());
+        let fallback_selected = self.selected.min(self.entries.len().saturating_sub(1));
         self.apply_sort();
-        if let Some(sp) = sp {
-            if let Some(idx) = self.entries.iter().position(|e| e.path == sp) {
+        if let Some(path) = selected_path {
+            if self.search_mode && !self.search_query.is_empty() {
+                self.update_search();
+                self.selected = self
+                    .search_matches
+                    .iter()
+                    .position(|&idx| self.entries[idx].path == path)
+                    .unwrap_or(0);
+            } else if let Some(idx) = self.entries.iter().position(|e| e.path == path) {
                 self.selected = idx;
+            } else {
+                self.selected = fallback_selected;
             }
+        } else {
+            self.selected = fallback_selected;
         }
     }
 
@@ -762,7 +774,10 @@ impl App {
     }
 
     fn scan_selected_missing_dir(&mut self) {
-        let Some(entry) = self.entries.get(self.selected) else {
+        let Some(entry_idx) = self.visible_entry_index(self.selected) else {
+            return;
+        };
+        let Some(entry) = self.entries.get(entry_idx) else {
             return;
         };
         if !entry.is_dir || entry.size.is_some() || entry.scanning {
@@ -1863,6 +1878,84 @@ mod tests {
 
         assert!(app.entries[app.selected].scanning);
         assert!(app.status.contains("scanning selected directory"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_selected_missing_dir_uses_visible_mapping_during_search() {
+        let root = test_root("search_selected_scan");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join("aaa")).unwrap();
+        fs::create_dir_all(root.join("bbb")).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        for entry in &mut app.entries {
+            entry.size = None;
+            entry.scanning = false;
+        }
+
+        app.enter_search();
+        app.search_push('b');
+
+        app.move_cursor(0);
+
+        let aaa_scanning = app
+            .entries
+            .iter()
+            .find(|entry| entry.name == "aaa")
+            .unwrap()
+            .scanning;
+        let bbb_scanning = app
+            .entries
+            .iter()
+            .find(|entry| entry.name == "bbb")
+            .unwrap()
+            .scanning;
+
+        assert!(bbb_scanning);
+        assert!(!aaa_scanning);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_sort_preserving_selection_rebuilds_search_matches() {
+        let root = test_root("search_sort_rebuild_matches");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b-small")).unwrap();
+        fs::create_dir_all(root.join("b-big")).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+
+        for entry in &mut app.entries {
+            let size = match entry.name.as_str() {
+                "b-big" => Some(SizeInfo::new(200, 32)),
+                "b-small" => Some(SizeInfo::new(100, 16)),
+                _ => Some(SizeInfo::new(1, 8)),
+            };
+            entry.size = size;
+        }
+
+        app.enter_search();
+        app.search_push('b');
+        app.move_cursor(1);
+
+        app.sort = SortMode::SizeDesc;
+        app.apply_sort_preserving_selection();
+
+        let visible_matches: Vec<String> = app
+            .search_matches
+            .iter()
+            .map(|&idx| app.entries[idx].name.clone())
+            .collect();
+
+        assert_eq!(visible_matches, vec!["b-big", "b-small"]);
+
         fs::remove_dir_all(root).unwrap();
     }
 
