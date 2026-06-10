@@ -188,141 +188,149 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
         fileattr: ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE,
         forkattr: 0,
     };
-    let mut buf = vec![0u8; 64 * 1024];
+    thread_local! {
+        static SCAN_BUF: std::cell::RefCell<Vec<u8>> =
+            std::cell::RefCell::new(vec![0u8; 64 * 1024]);
+    }
     let mut partial = DirectoryScan::default();
 
-    loop {
-        let n = unsafe {
-            libc::getattrlistbulk(
-                fd,
-                &mut attrlist as *mut _ as *mut libc::c_void,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-                FSOPT_PACK_INVAL_ATTRS,
-            )
-        };
-        if n <= 0 {
-            break;
-        }
+    SCAN_BUF.with(|cell| {
+        let mut buf_ref = cell.borrow_mut();
+        let buf = &mut *buf_ref;
 
-        let mut offset: usize = 0;
-        for _ in 0..n {
-            let entry_start = offset;
-            if entry_start + 4 + ATTRIBUTE_SET_LEN > buf.len() {
+        loop {
+            let n = unsafe {
+                libc::getattrlistbulk(
+                    fd,
+                    &mut attrlist as *mut _ as *mut libc::c_void,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    FSOPT_PACK_INVAL_ATTRS,
+                )
+            };
+            if n <= 0 {
                 break;
             }
-            let Some(length) = read_u32(&buf, buf.len(), entry_start).map(|n| n as usize) else {
-                break;
-            };
-            if length == 0 || entry_start + length > buf.len() {
-                break;
-            }
-            let entry_end = entry_start + length;
-            let Some(returned_common) = read_u32(&buf, entry_end, entry_start + 4) else {
-                break;
-            };
-            let Some(returned_file) = read_u32(&buf, entry_end, entry_start + 16) else {
-                break;
-            };
-            let mut field = entry_start + 4 + ATTRIBUTE_SET_LEN;
 
-            let err = if returned_common & ATTR_CMN_ERROR != 0 {
-                let Some(err) = read_u32(&buf, entry_end, field) else {
+            let mut offset: usize = 0;
+            for _ in 0..n {
+                let entry_start = offset;
+                if entry_start + 4 + ATTRIBUTE_SET_LEN > buf.len() {
+                    break;
+                }
+                let Some(length) = read_u32(buf, buf.len(), entry_start).map(|n| n as usize) else {
                     break;
                 };
-                field += 4;
-                err
-            } else {
-                0
-            };
-
-            let name_ref = if returned_common & ATTR_CMN_NAME != 0 {
-                let attr_ref_start = field;
-                let Some(name_off) = read_i32(&buf, entry_end, field).map(|n| n as isize) else {
+                if length == 0 || entry_start + length > buf.len() {
+                    break;
+                }
+                let entry_end = entry_start + length;
+                let Some(returned_common) = read_u32(buf, entry_end, entry_start + 4) else {
                     break;
                 };
-                let Some(name_len) = read_u32(&buf, entry_end, field + 4).map(|n| n as usize)
-                else {
+                let Some(returned_file) = read_u32(buf, entry_end, entry_start + 16) else {
                     break;
                 };
-                field += ATTR_REFERENCE_LEN;
-                Some((attr_ref_start, name_off, name_len))
-            } else {
-                None
-            };
+                let mut field = entry_start + 4 + ATTRIBUTE_SET_LEN;
 
-            let objtype = if returned_common & ATTR_CMN_OBJTYPE != 0 {
-                let Some(objtype) = read_u32(&buf, entry_end, field) else {
-                    break;
+                let err = if returned_common & ATTR_CMN_ERROR != 0 {
+                    let Some(err) = read_u32(buf, entry_end, field) else {
+                        break;
+                    };
+                    field += 4;
+                    err
+                } else {
+                    0
                 };
-                field += 4;
-                objtype
-            } else {
-                0
-            };
 
-            let totalsize = if returned_file & ATTR_FILE_TOTALSIZE != 0 {
-                let value = read_u64(&buf, entry_end, field).unwrap_or(0);
-                field += 8;
-                value
-            } else {
-                0
-            };
-            let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
-                read_u64(&buf, entry_end, field).unwrap_or(0)
-            } else {
-                0
-            };
-            offset += length;
+                let name_ref = if returned_common & ATTR_CMN_NAME != 0 {
+                    let attr_ref_start = field;
+                    let Some(name_off) = read_i32(buf, entry_end, field).map(|n| n as isize) else {
+                        break;
+                    };
+                    let Some(name_len) = read_u32(buf, entry_end, field + 4).map(|n| n as usize)
+                    else {
+                        break;
+                    };
+                    field += ATTR_REFERENCE_LEN;
+                    Some((attr_ref_start, name_off, name_len))
+                } else {
+                    None
+                };
 
-            if err != 0 {
-                continue;
-            }
-            match objtype {
-                VREG => {
-                    let size = SizeInfo::new(totalsize, allocsize);
-                    partial.size.add_file(size);
-                    if top_file_limit == 0 {
-                        continue;
+                let objtype = if returned_common & ATTR_CMN_OBJTYPE != 0 {
+                    let Some(objtype) = read_u32(buf, entry_end, field) else {
+                        break;
+                    };
+                    field += 4;
+                    objtype
+                } else {
+                    0
+                };
+
+                let totalsize = if returned_file & ATTR_FILE_TOTALSIZE != 0 {
+                    let value = read_u64(buf, entry_end, field).unwrap_or(0);
+                    field += 8;
+                    value
+                } else {
+                    0
+                };
+                let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
+                    read_u64(buf, entry_end, field).unwrap_or(0)
+                } else {
+                    0
+                };
+                offset += length;
+
+                if err != 0 {
+                    continue;
+                }
+                match objtype {
+                    VREG => {
+                        let size = SizeInfo::new(totalsize, allocsize);
+                        partial.size.add_file(size);
+                        if top_file_limit == 0 {
+                            continue;
+                        }
+                        if let Some((attr_ref_start, name_off, name_len)) = name_ref {
+                            let Some(name_bytes) = read_attr_reference(
+                                buf,
+                                entry_end,
+                                attr_ref_start,
+                                name_off,
+                                name_len,
+                            ) else {
+                                continue;
+                            };
+                            push_largest_file(
+                                &mut partial.largest_files,
+                                top_file_limit,
+                                dir.join(OsStr::from_bytes(name_bytes)),
+                                size,
+                            );
+                        }
                     }
-                    if let Some((attr_ref_start, name_off, name_len)) = name_ref {
-                        let Some(name_bytes) = read_attr_reference(
-                            &buf,
-                            entry_end,
-                            attr_ref_start,
-                            name_off,
-                            name_len,
-                        ) else {
+                    VDIR => {
+                        let Some((attr_ref_start, name_off, name_len)) = name_ref else {
                             continue;
                         };
-                        push_largest_file(
-                            &mut partial.largest_files,
-                            top_file_limit,
-                            dir.join(OsStr::from_bytes(name_bytes)),
-                            size,
-                        );
+                        let Some(name_bytes) =
+                            read_attr_reference(buf, entry_end, attr_ref_start, name_off, name_len)
+                        else {
+                            continue;
+                        };
+                        if matches!(name_bytes, b"." | b"..") {
+                            continue;
+                        }
+                        partial
+                            .subdirs
+                            .push(dir.join(OsStr::from_bytes(name_bytes)));
                     }
+                    _ => {} // VLNK, VSOCK, VBLK, VCHR, VFIFO: ignore
                 }
-                VDIR => {
-                    let Some((attr_ref_start, name_off, name_len)) = name_ref else {
-                        continue;
-                    };
-                    let Some(name_bytes) =
-                        read_attr_reference(&buf, entry_end, attr_ref_start, name_off, name_len)
-                    else {
-                        continue;
-                    };
-                    if matches!(name_bytes, b"." | b"..") {
-                        continue;
-                    }
-                    partial
-                        .subdirs
-                        .push(dir.join(OsStr::from_bytes(name_bytes)));
-                }
-                _ => {} // VLNK, VSOCK, VBLK, VCHR, VFIFO: ignore
             }
         }
-    }
+    });
 
     unsafe { libc::close(fd) };
     partial
