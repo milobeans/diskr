@@ -64,7 +64,22 @@ impl Manager {
                 vec!["uninstall".into(), "--cask".into(), name.into()],
             ),
             Manager::Npm => ("npm", vec!["uninstall".into(), "-g".into(), name.into()]),
-            Manager::Pip => ("pip3", vec!["uninstall".into(), "-y".into(), name.into()]),
+            Manager::Pip => {
+                if command_exists("pip3") {
+                    ("pip3", vec!["uninstall".into(), "-y".into(), name.into()])
+                } else {
+                    (
+                        "python3",
+                        vec![
+                            "-m".into(),
+                            "pip".into(),
+                            "uninstall".into(),
+                            "-y".into(),
+                            name.into(),
+                        ],
+                    )
+                }
+            }
             Manager::Cargo => ("cargo", vec!["uninstall".into(), name.into()]),
             Manager::Bun => ("bun", vec!["remove".into(), "-g".into(), name.into()]),
         }
@@ -212,7 +227,7 @@ pub fn scan_dep_graph(reports: &[ManagerReport]) -> DepGraph {
         .map(|r| r.packages.iter().map(|p| p.name.clone()).collect())
         .unwrap_or_default();
     let pip_handle = thread::spawn(move || {
-        if pip_names.is_empty() || !command_exists("pip3") {
+        if pip_names.is_empty() || pip_command().is_none() {
             HashMap::new()
         } else {
             scan_pip_dep_graph(&pip_names)
@@ -289,7 +304,7 @@ fn scan_pip_dep_graph(names: &[String]) -> HashMap<String, DepInfo> {
     for name in names {
         args.push(name);
     }
-    let output = run_command("pip3", &args);
+    let output = run_pip_command(&args);
     if output.is_empty() {
         return HashMap::new();
     }
@@ -378,7 +393,12 @@ pub fn run_uninstall(manager: Manager, name: &str) -> Result<String, String> {
 }
 
 fn scan_manager(manager: Manager) -> ManagerReport {
-    if !command_exists(manager.command()) {
+    let available = if manager == Manager::Pip {
+        pip_command().is_some()
+    } else {
+        command_exists(manager.command())
+    };
+    if !available {
         return ManagerReport {
             manager,
             packages: Vec::new(),
@@ -638,7 +658,7 @@ fn find_npm_global_root() -> PathBuf {
 }
 
 fn scan_pip() -> Vec<Package> {
-    let output = run_command("pip3", &["list", "--format=json"]);
+    let output = run_pip_command(&["list", "--format=json"]);
     if output.is_empty() {
         return Vec::new();
     }
@@ -668,19 +688,7 @@ fn scan_pip() -> Vec<Package> {
         .into_par_iter()
         .map(|(name, version)| {
             let (size, path) = if let Some(sp) = &site_packages {
-                let pkg_dir = sp.join(&name);
-                let pkg_dir_alt = sp.join(name.replace('-', "_"));
-                let actual = if pkg_dir.is_dir() {
-                    Some(pkg_dir)
-                } else if pkg_dir_alt.is_dir() {
-                    Some(pkg_dir_alt)
-                } else {
-                    None
-                };
-                match actual {
-                    Some(dir) => (Some(bulkstat::scan_dir(&dir, 0).size), Some(dir)),
-                    None => (None, None),
-                }
+                find_pip_package_size_and_path(sp, &name)
             } else {
                 (None, None)
             };
@@ -704,42 +712,91 @@ fn scan_cargo() -> Vec<Package> {
     let cargo_bin = home.as_ref().map(|h| h.join(".cargo/bin"));
 
     let mut packages = Vec::new();
+    let mut current_name = String::new();
+    let mut current_version = String::new();
+    let mut current_bins: Vec<String> = Vec::new();
+
+    let flush = |name: &str,
+                     version: &str,
+                     bins: &mut Vec<String>,
+                     packages: &mut Vec<Package>,
+                     cargo_bin: &Option<PathBuf>| {
+        if name.is_empty() {
+            return;
+        }
+
+        let mut size = SizeInfo::default();
+        let mut path = None;
+        let mut has_bin = false;
+
+        if let Some(bin_dir) = cargo_bin {
+            for bin in bins.iter() {
+                let bin_path = bin_dir.join(bin);
+                if !bin_path.exists() {
+                    continue;
+                }
+                if path.is_none() {
+                    path = Some(bin_path.clone());
+                }
+                if let Some(meta) = std::fs::symlink_metadata(&bin_path).ok() {
+                    size.logical = size.logical.saturating_add(meta.len());
+                    size.allocated = size
+                        .allocated
+                        .saturating_add(allocated_size_from_metadata(&meta));
+                    has_bin = true;
+                }
+            }
+        }
+
+        packages.push(Package {
+            name: name.to_string(),
+            version: version.to_string(),
+            size: if has_bin { Some(size) } else { None },
+            path,
+        });
+    };
+
     for line in output.lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(bin_name) = line
+                .split_whitespace()
+                .find(|token| !token.is_empty() && !token.starts_with('('))
+            {
+                current_bins.push(bin_name.to_string());
+            }
             continue;
         }
+
+        flush(
+            &current_name,
+            &current_version,
+            &mut current_bins,
+            &mut packages,
+            &cargo_bin,
+        );
+
         let mut parts = line.split_whitespace();
         let Some(name) = parts.next() else {
             continue;
         };
-        let version = parts
+        current_name = name.to_string();
+        current_version = parts
             .next()
             .unwrap_or("")
             .trim_start_matches('v')
             .trim_end_matches(':')
             .to_string();
-        let (size, path) = if let Some(bin_dir) = &cargo_bin {
-            let bin_path = bin_dir.join(name);
-            if bin_path.exists() {
-                let meta = std::fs::metadata(&bin_path).ok();
-                let size = meta.map(|m| {
-                    use std::os::unix::fs::MetadataExt;
-                    SizeInfo::new(m.len(), m.blocks().saturating_mul(512))
-                });
-                (size, Some(bin_path))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
-        packages.push(Package {
-            name: name.to_string(),
-            version,
-            size,
-            path,
-        });
+        current_bins.clear();
     }
+
+    flush(
+        &current_name,
+        &current_version,
+        &mut current_bins,
+        &mut packages,
+        &cargo_bin,
+    );
+
     packages
 }
 
@@ -1072,6 +1129,188 @@ fn run_command(cmd: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+fn run_pip_command(args: &[&str]) -> String {
+    match pip_command() {
+        Some(PipCommand::Pip3) => run_command("pip3", args),
+        Some(PipCommand::Python3Module) => {
+            let mut pip_args: Vec<&str> = vec!["-m", "pip"];
+            pip_args.extend_from_slice(args);
+            run_command("python3", &pip_args)
+        }
+        None => String::new(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PipCommand {
+    Pip3,
+    Python3Module,
+}
+
+fn pip_command() -> Option<PipCommand> {
+    if command_exists("pip3") {
+        return Some(PipCommand::Pip3);
+    }
+    let has_python_pip = !run_command("python3", &["-m", "pip", "--version"])
+        .trim()
+        .is_empty();
+    if command_exists("python3") && has_python_pip {
+        return Some(PipCommand::Python3Module);
+    }
+    None
+}
+
+fn find_pip_package_size_and_path(site_packages: &Path, package: &str) -> (Option<SizeInfo>, Option<PathBuf>) {
+    let Some(dist_info_path) = find_pip_dist_info(site_packages, package) else {
+        return (None, infer_pip_package_dir(site_packages, package));
+    };
+
+    let size = parse_pip_record_size(site_packages, &dist_info_path);
+    let path = find_pip_top_level_path(site_packages, &dist_info_path)
+        .or_else(|| infer_pip_package_dir(site_packages, package));
+
+    (size, path)
+}
+
+fn infer_pip_package_dir(site_packages: &Path, package: &str) -> Option<PathBuf> {
+    let direct = site_packages.join(package);
+    if direct.is_dir() {
+        return Some(direct);
+    }
+    let underscored = site_packages.join(package.replace('-', "_"));
+    if underscored.is_dir() {
+        return Some(underscored);
+    }
+    None
+}
+
+fn find_pip_dist_info(site_packages: &Path, package: &str) -> Option<PathBuf> {
+    let needle = normalize_dist_name(package);
+    let read = std::fs::read_dir(site_packages).ok()?;
+
+    for entry in read.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.ends_with(".dist-info") {
+            continue;
+        }
+        let prefix = &name[..name.len() - ".dist-info".len()];
+        let normalized = normalize_dist_name(prefix);
+        let exact = normalized == needle;
+        let versioned = normalized
+            .strip_prefix(&(needle.clone() + "-"))
+            .is_some();
+        if exact || versioned {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+fn find_pip_top_level_path(site_packages: &Path, dist_info: &Path) -> Option<PathBuf> {
+    let top_level = dist_info.join("top_level.txt");
+    let content = std::fs::read_to_string(top_level).ok()?;
+    for line in content.lines() {
+        let entry = line.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let candidate = site_packages.join(entry);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn parse_pip_record_size(site_packages: &Path, dist_info: &Path) -> Option<SizeInfo> {
+    let record = std::fs::read_to_string(dist_info.join("RECORD")).ok()?;
+    let mut logical = 0u64;
+    let mut allocated = 0u64;
+
+    for row in record.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = split_csv_row(row);
+        if fields.len() < 3 {
+            continue;
+        }
+        let rel_path = fields[0].trim();
+        if rel_path.is_empty() {
+            continue;
+        }
+
+        if let Ok(bytes) = fields[2].trim().parse::<u64>() {
+            logical = logical.saturating_add(bytes);
+        }
+
+        let full_path = site_packages.join(rel_path);
+        if let Ok(meta) = std::fs::symlink_metadata(&full_path) {
+            allocated = allocated.saturating_add(allocated_size_from_metadata(&meta));
+        }
+    }
+
+    Some(SizeInfo { logical, allocated })
+}
+
+fn split_csv_row(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            if in_quotes && matches!(chars.peek(), Some('"')) {
+                chars.next();
+                current.push('"');
+            } else {
+                in_quotes = !in_quotes;
+            }
+        } else if ch == ',' && !in_quotes {
+            fields.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    fields.push(current);
+    fields
+}
+
+fn normalize_dist_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in name.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch == '-' || ch == '_' || ch == '.' {
+            if !last_dash && !out.is_empty() {
+                out.push('-');
+            }
+            last_dash = true;
+        } else {
+            out.push(ch);
+            last_dash = false;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+fn allocated_size_from_metadata(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    #[cfg(unix)]
+    {
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
 fn brew_prefix() -> PathBuf {
     if cfg!(target_arch = "aarch64") {
         PathBuf::from("/opt/homebrew")
@@ -1153,12 +1392,71 @@ mod tests {
         assert_eq!(args, vec!["uninstall", "ripgrep"]);
 
         let (cmd, args) = Manager::Pip.uninstall_args("ruff");
-        assert_eq!(cmd, "pip3");
-        assert_eq!(args, vec!["uninstall", "-y", "ruff"]);
+        if cmd == "pip3" {
+            assert_eq!(args, vec!["uninstall", "-y", "ruff"]);
+        } else {
+            assert_eq!(cmd, "python3");
+            assert_eq!(args, vec!["-m", "pip", "uninstall", "-y", "ruff"]);
+        }
 
         let (cmd, args) = Manager::Npm.uninstall_args("typescript");
         assert_eq!(cmd, "npm");
         assert_eq!(args, vec!["uninstall", "-g", "typescript"]);
+    }
+
+    #[test]
+    fn normalizes_pip_distribution_names() {
+        assert_eq!(normalize_dist_name("PyYAML"), "pyyaml");
+        assert_eq!(normalize_dist_name("ruff"), "ruff");
+        assert_eq!(normalize_dist_name("typing_extensions"), "typing-extensions");
+    }
+
+    #[test]
+    fn finds_pip_dist_info_and_top_level_path() {
+        let root = test_root("pip_dist_info");
+        let dist_info = root.join("PyYAML-6.0.1.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        let top_level = dist_info.join("top_level.txt");
+        std::fs::write(&top_level, "yaml\n").unwrap();
+        std::fs::create_dir_all(root.join("yaml")).unwrap();
+        std::fs::write(root.join("yaml").join("__init__.py"), b"").unwrap();
+
+        assert_eq!(find_pip_dist_info(&root, "PyYAML"), Some(dist_info.clone()));
+        assert_eq!(
+            find_pip_top_level_path(&root, &dist_info),
+            Some(root.join("yaml"))
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn splits_csv_fields_with_quoted_values() {
+        let fields = split_csv_row("path,to,script.py,sha256=abc,12");
+        assert_eq!(fields, vec!["path", "to", "script.py", "sha256=abc", "12"]);
+        let fields = split_csv_row("\"hello,world\",sha256=abc,7");
+        assert_eq!(fields, vec!["hello,world", "sha256=abc", "7"]);
+    }
+
+    #[test]
+    fn parses_pip_record_sizes_from_manifest() {
+        let root = test_root("pip_record_sizes");
+        let dist_info = root.join("requests-2.32.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::create_dir_all(root.join("requests")).unwrap();
+        std::fs::write(root.join("requests").join("__init__.py"), b"print('requests')").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "requests/__init__.py,sha256=abc,13\n\
+             requests-2.32.0.dist-info/RECORD,sha256=def,7\n",
+        )
+        .unwrap();
+
+        let size = parse_pip_record_size(&root, &dist_info).unwrap();
+        assert_eq!(size.logical, 20);
+        assert!(size.allocated > 0);
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
