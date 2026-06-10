@@ -532,7 +532,7 @@ impl App {
             self.status = String::from("refresh complete · no directories to rescan");
             return;
         }
-        let dirs = self.scan_candidates(AUTO_SCAN_LIMIT, &missing);
+        let dirs = self.scan_candidates(missing.len(), &missing);
         let status = limited_scan_status("refresh scan", dirs.len(), missing.len());
         self.start_scan(dirs, status);
     }
@@ -1687,6 +1687,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("a.txt"), b"a").unwrap();
         fs::write(root.join("c.txt"), b"ccc").unwrap();
+        for i in 0..6 {
+            fs::create_dir_all(root.join(format!("dir-{i}"))).unwrap();
+        }
 
         let mut app = App::new(root.clone()).unwrap();
         app.sort = SortMode::Name;
@@ -1699,6 +1702,9 @@ mod tests {
 
         assert!(app.entries.iter().any(|entry| entry.name == "b.txt"));
         assert_eq!(app.entries[app.selected].path, selected_before);
+
+        let scanning_dirs_count = app.entries.iter().filter(|entry| entry.is_dir && entry.scanning).count();
+        assert_eq!(scanning_dirs_count, 6);
 
         fs::remove_dir_all(root).unwrap();
     }
