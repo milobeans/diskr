@@ -1029,11 +1029,11 @@ where
                                 true
                             }
                             KeyCode::PageDown => {
-                                app.move_top_files(1);
+                                app.page_move_top_files(1);
                                 true
                             }
                             KeyCode::PageUp => {
-                                app.move_top_files(-1);
+                                app.page_move_top_files(-1);
                                 true
                             }
                             KeyCode::Home => {

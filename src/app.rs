@@ -153,6 +153,7 @@ pub struct App {
 
     pub files_area: ratatui_core::layout::Rect,
     pub file_list_offset: usize,
+    pub top_files_area: ratatui_core::layout::Rect,
 
     pending_delete: Option<DeleteTarget>,
     marked: HashSet<PathBuf>,
@@ -275,6 +276,7 @@ impl App {
             scan_completed: 0,
             files_area: ratatui_core::layout::Rect::default(),
             file_list_offset: 0,
+            top_files_area: ratatui_core::layout::Rect::default(),
             pending_delete: None,
             marked: HashSet::new(),
             size_cache: HashMap::new(),
@@ -975,6 +977,11 @@ impl App {
         }
         let s = self.top_files_selected as i32 + delta;
         self.top_files_selected = s.rem_euclid(n) as usize;
+    }
+
+    pub fn page_move_top_files(&mut self, pages: i32) {
+        let height = self.top_files_area.height.saturating_sub(2).max(1) as i32;
+        self.move_top_files(pages * height);
     }
 
     pub fn selected_top_file_path(&self) -> Option<PathBuf> {

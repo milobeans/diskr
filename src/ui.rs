@@ -591,8 +591,9 @@ fn draw_reclaim_paths(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_top_files(f: &mut Frame, app: &App) {
+fn draw_top_files(f: &mut Frame, app: &mut App) {
     let area = centered_rect(70, 70, 74, 20, f.area());
+    app.top_files_area = area;
     f.render_widget(Clear, area);
 
     if app.top_files_loading() {
