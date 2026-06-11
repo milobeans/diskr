@@ -33,6 +33,15 @@ pub enum SortMode {
     Modified,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    None,
+    Search,
+    PkgSearch,
+    Rename,
+    Mkdir,
+}
+
 impl SortMode {
     pub fn label(self) -> &'static str {
         match self {
@@ -41,6 +50,12 @@ impl SortMode {
             SortMode::Modified => "mtime",
         }
     }
+}
+
+#[derive(Clone)]
+pub enum InputAction {
+    Rename(PathBuf),
+    Mkdir(PathBuf),
 }
 
 #[derive(Clone)]
@@ -72,6 +87,7 @@ pub enum DeleteTarget {
         name: String,
         path: PathBuf,
     },
+    Batch,
 }
 
 struct ReclaimMsg {
@@ -119,6 +135,11 @@ pub struct App {
     pub packages_loaded: bool,
     pub packages_loading: bool,
 
+    pub input_mode: InputMode,
+    pub input_prompt: String,
+    pub input_buffer: String,
+    pub input_on_commit: Option<InputAction>,
+
     pub search_mode: bool,
     pub search_query: String,
     pub search_matches: Vec<usize>,
@@ -134,6 +155,7 @@ pub struct App {
     pub file_list_offset: usize,
 
     pending_delete: Option<DeleteTarget>,
+    marked: HashSet<PathBuf>,
     size_cache: HashMap<PathBuf, SizeInfo>,
     entry_index: HashMap<PathBuf, usize>,
     cached_flat_packages: Vec<(packages::Package, packages::Manager)>,
@@ -239,6 +261,10 @@ impl App {
             pkg_view: PkgView::SystemManagers,
             packages_loaded: false,
             packages_loading: false,
+            input_mode: InputMode::None,
+            input_prompt: String::new(),
+            input_buffer: String::new(),
+            input_on_commit: None,
             search_mode: false,
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -250,6 +276,7 @@ impl App {
             files_area: ratatui_core::layout::Rect::default(),
             file_list_offset: 0,
             pending_delete: None,
+            marked: HashSet::new(),
             size_cache: HashMap::new(),
             entry_index: HashMap::new(),
             cached_flat_packages: Vec::new(),
@@ -1087,6 +1114,24 @@ impl App {
         self.disk_info_scan_rx = None;
     }
 
+    pub fn request_empty_trash(&mut self) {
+        if self.confirming_delete {
+            return;
+        }
+        match crate::fs_ops::empty_trash() {
+            Ok(()) => {
+                self.status = String::from("Trash emptied");
+                self.refresh_disks();
+                if self.focus == Focus::Reclaim {
+                    self.request_reclaim_scan();
+                }
+            }
+            Err(e) => {
+                self.status = format!("empty trash failed: {e}");
+            }
+        }
+    }
+
     pub fn open_top_files_for_path(&mut self, path: PathBuf) {
         if self.top_files_loading {
             self.top_files_scan = None;
@@ -1295,6 +1340,27 @@ impl App {
                         }
                     Err(e) => self.status = format!("delete failed: {e}"),
                 },
+                DeleteTarget::Batch => {
+                    let marked = self.marked.clone();
+                    self.marked.clear();
+                    let mut failures = Vec::new();
+                    for path in marked {
+                        if let Err(e) = crate::fs_ops::delete_to_trash(&path) {
+                            failures.push((path, e));
+                        } else {
+                            self.invalidate_cache_for(&path);
+                        }
+                    }
+                    self.refresh_disks();
+                    self.reload()?;
+                    self.refresh_history_state();
+                    if failures.is_empty() {
+                        self.status = String::from("moved marked items to trash");
+                    } else {
+                        let names: Vec<String> = failures.iter().filter_map(|(p, _)| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
+                        self.status = format!("some items failed: {}", names.join(", "));
+                    }
+                }
             }
         }
         Ok(())
@@ -1306,6 +1372,7 @@ impl App {
             Some(DeleteTarget::Package { name, .. }) => name,
             Some(DeleteTarget::TopFile { name, .. }) => name,
             Some(DeleteTarget::ReclaimPath { name, .. }) => name,
+            Some(DeleteTarget::Batch) => "marked items",
             None => "?",
         }
     }
@@ -1866,6 +1933,179 @@ impl App {
         self.file_list_offset = 0;
     }
 
+    fn enter_input_mode(&mut self, mode: InputMode, prompt: &str, initial: &str, action: InputAction) {
+        self.input_mode = mode;
+        self.input_prompt = prompt.to_string();
+        self.input_buffer = initial.to_string();
+        self.input_on_commit = Some(action);
+    }
+
+    pub fn exit_input_mode(&mut self) {
+        self.input_mode = InputMode::None;
+        self.input_prompt.clear();
+        self.input_buffer.clear();
+        self.input_on_commit = None;
+    }
+
+    pub fn input_push(&mut self, ch: char) {
+        if ch == '/' || ch == '\0' {
+            return;
+        }
+        self.input_buffer.push(ch);
+    }
+
+    pub fn input_pop(&mut self) {
+        self.input_buffer.pop();
+    }
+
+    pub fn input_commit(&mut self) -> Result<()> {
+        if let Some(action) = self.input_on_commit.take() {
+            match action {
+                InputAction::Rename(old_path) => {
+                    let new_name = self.input_buffer.trim();
+                    if new_name.is_empty() {
+                        self.status = String::from("rename cancelled: empty name");
+                        self.exit_input_mode();
+                        return Ok(());
+                    }
+                    if new_name.contains('/') {
+                        self.status = String::from("rename failed: name cannot contain '/'");
+                        self.exit_input_mode();
+                        return Ok(());
+                    }
+                    let new_path = old_path.parent().unwrap().join(new_name);
+                    if new_path.exists() {
+                        self.status = format!("rename failed: {} already exists", new_name);
+                        self.exit_input_mode();
+                        return Ok(());
+                    }
+                    match std::fs::rename(&old_path, &new_path) {
+                        Ok(()) => {
+                            self.status = format!("renamed: {} → {}", old_path.file_name().unwrap().to_string_lossy(), new_name);
+                            self.invalidate_cache_for(&old_path);
+                            self.invalidate_cache_for(&new_path);
+                            self.reload()?;
+                            self.refresh_history_state();
+                        }
+                        Err(e) => {
+                            self.status = format!("rename failed: {e}");
+                        }
+                    }
+                }
+                InputAction::Mkdir(parent) => {
+                    let new_name = self.input_buffer.trim();
+                    if new_name.is_empty() {
+                        self.status = String::from("mkdir cancelled: empty name");
+                        self.exit_input_mode();
+                        return Ok(());
+                    }
+                    if new_name.contains('/') {
+                        self.status = String::from("mkdir failed: name cannot contain '/'");
+                        self.exit_input_mode();
+                        return Ok(());
+                    }
+                    let new_path = parent.join(new_name);
+                    if new_path.exists() {
+                        self.status = format!("mkdir failed: {} already exists", new_name);
+                        self.exit_input_mode();
+                        return Ok(());
+                    }
+                    match std::fs::create_dir(&new_path) {
+                        Ok(()) => {
+                            self.status = format!("created directory: {}", new_name);
+                            self.reload()?;
+                            if let Some(idx) = self.entries.iter().position(|e| e.path == new_path) {
+                                self.selected = idx;
+                            }
+                            self.refresh_history_state();
+                        }
+                        Err(e) => {
+                            self.status = format!("mkdir failed: {e}");
+                        }
+                    }
+                }
+            }
+        }
+        self.exit_input_mode();
+        Ok(())
+    }
+
+    pub fn request_rename(&mut self) {
+        if self.confirming_delete {
+            return;
+        }
+        if let Some(entry_idx) = self.visible_entry_index(self.selected) {
+            if let Some(entry) = self.entries.get(entry_idx).cloned() {
+                let name = entry.name.clone();
+                let path = entry.path.clone();
+                self.enter_input_mode(InputMode::Rename, "Rename:", &name, InputAction::Rename(path));
+            }
+        }
+    }
+
+    pub fn request_mkdir(&mut self) {
+        if self.confirming_delete {
+            return;
+        }
+        self.enter_input_mode(InputMode::Mkdir, "New directory:", "", InputAction::Mkdir(self.cwd.clone()));
+    }
+
+    pub fn toggle_mark(&mut self) {
+        if self.confirming_delete {
+            return;
+        }
+        if let Some(entry_idx) = self.visible_entry_index(self.selected) {
+            if let Some(entry) = self.entries.get(entry_idx) {
+                let path = entry.path.clone();
+                if self.marked.contains(&path) {
+                    self.marked.remove(&path);
+                    self.status = format!("unmarked: {}", entry.name);
+                } else {
+                    self.marked.insert(path);
+                    self.status = format!("marked: {}", entry.name);
+                }
+            }
+        }
+    }
+
+    pub fn mark_all_visible(&mut self) {
+        if self.confirming_delete {
+            return;
+        }
+        let count = self.visible_entry_count();
+        for i in 0..count {
+            if let Some(entry) = self.visible_entry(i) {
+                self.marked.insert(entry.path.clone());
+            }
+        }
+        self.status = format!("marked all {} visible entries", count);
+    }
+
+    pub fn clear_marks(&mut self) {
+        let count = self.marked.len();
+        self.marked.clear();
+        self.status = format!("cleared {} marks", count);
+    }
+
+    pub fn request_batch_delete(&mut self) {
+        if self.confirming_delete {
+            return;
+        }
+        if self.marked.is_empty() {
+            self.status = String::from("nothing marked for deletion");
+            return;
+        }
+        let total_size: u64 = self.marked.iter().filter_map(|p| self.size_cache.get(p)).map(|s| s.allocated).sum();
+        let size_str = if total_size > 0 {
+            format!(" ({})", human(total_size))
+        } else {
+            String::new()
+        };
+        self.status = format!("Trash {} items{}? (y/n)", self.marked.len(), size_str);
+        self.confirming_delete = true;
+        self.pending_delete = Some(DeleteTarget::Batch);
+    }
+
     #[allow(dead_code)]
     pub fn copy_path_to_clipboard(&mut self) {
         let Some(path) = self.selected_path() else {
@@ -2179,6 +2419,9 @@ mod tests {
         let get_path = |t: &DeleteTarget| match t {
             DeleteTarget::FileEntry(e) => e.path.clone(),
             DeleteTarget::Package { path, .. } => path.clone(),
+            DeleteTarget::TopFile { path, .. } => path.clone(),
+            DeleteTarget::ReclaimPath { path, .. } => path.clone(),
+            DeleteTarget::Batch => panic!("Batch not expected in this test"),
         };
 
         assert!(app.confirming_delete);

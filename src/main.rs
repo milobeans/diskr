@@ -303,11 +303,16 @@ Keys:
   p               Open packages pane / switch package view
   .               Toggle hidden files
   d               Move selected item to Trash
+  c               Rename selected item (files pane)
+  n               Create new directory (files pane)
+  v               Toggle mark on selected item (files pane)
+  a               Mark all visible items (files pane)
   R               Re-scan reclaim pane
   t               Open top-files list for selected directory/cwd
   B               Save history baseline for current directory
+  E               Empty Trash (reclaim pane)
   Tab             Switch files/disks/packages/reclaim pane
-  q, Esc          Quit
+  q, Esc          Quit (Esc in input mode cancels)
 ",
         env!("CARGO_PKG_VERSION")
     );
@@ -1144,6 +1149,31 @@ where
                         }
                         continue;
                     }
+                    if app.input_mode != app::InputMode::None {
+                        let handled = match key.code {
+                            KeyCode::Esc => {
+                                app.exit_input_mode();
+                                true
+                            }
+                            KeyCode::Enter => {
+                                app.input_commit()?;
+                                true
+                            }
+                            KeyCode::Backspace => {
+                                app.input_pop();
+                                true
+                            }
+                            KeyCode::Char(ch) => {
+                                app.input_push(ch);
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
                     if app.search_mode {
                         let handled = match key.code {
                             KeyCode::Esc => {
@@ -1315,6 +1345,46 @@ where
                         KeyCode::Char('d') => {
                             app.request_delete();
                             true
+                        }
+                        KeyCode::Char('c') => {
+                            if app.focus == Focus::Files {
+                                app.request_rename();
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        KeyCode::Char('n') => {
+                            if app.focus == Focus::Files {
+                                app.request_mkdir();
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        KeyCode::Char('v') => {
+                            if app.focus == Focus::Files {
+                                app.toggle_mark();
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        KeyCode::Char('a') => {
+                            if app.focus == Focus::Files {
+                                app.mark_all_visible();
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        KeyCode::Char('E') => {
+                            if app.focus == Focus::Reclaim {
+                                app.request_empty_trash();
+                                true
+                            } else {
+                                false
+                            }
                         }
                         KeyCode::Char('R') => {
                             app.request_reclaim_scan();

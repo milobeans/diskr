@@ -14,7 +14,7 @@ use ratatui_widgets::{
 };
 
 use crate::app::{
-    format_modified_time, human, size_sort_key, App, Focus, PkgView, SortMode,
+    format_modified_time, human, size_sort_key, App, Focus, InputMode, PkgView, SortMode,
 };
 use crate::bulkstat::SizeInfo;
 use crate::reclaim::Reclaimability;
@@ -80,6 +80,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.pkg_detail {
         draw_pkg_detail(f, app);
     }
+    if app.input_mode != InputMode::None {
+        draw_input_overlay(f, app);
+    }
+}
+
+fn draw_input_overlay(f: &mut Frame, app: &App) {
+    let area = centered_rect(50, 20, 40, 6, f.area());
+    let block = Block::default()
+        .title(app.input_prompt.as_str())
+        .borders(Borders::ALL);
+    let text = vec![
+        Line::from(""),
+        Line::from(app.input_buffer.as_str()),
+    ];
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, area);
+    f.render_widget(paragraph, area);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -2039,7 +2058,8 @@ mod tests {
         assert!(size_width > 0);
         assert!(modified_width > 0);
         assert!(bar_width > 0);
-        assert_eq!(name_width + size_width + modified_width + bar_width + 6, 60);
+        // Account for ICON_WIDTH (2) + GAP_WIDTH (2) * 3 = 8
+        assert_eq!(name_width + size_width + modified_width + bar_width + 8, 60);
         assert_eq!(bar_width, 10);
     }
 
@@ -2057,13 +2077,15 @@ mod tests {
         let (name_width, size_width, modified_width, bar_width) = file_columns(90, false);
         assert_eq!(modified_width, 0);
         assert_eq!(bar_width, 10);
-        assert_eq!(name_width + size_width + bar_width + 4, 90);
+        // Account for ICON_WIDTH (2) + GAP_WIDTH (2) * 2 = 6
+        assert_eq!(name_width + size_width + bar_width + 6, 90);
     }
 
     #[test]
     fn file_size_bar_renders_scaled_blocks() {
         let (bar, percent, _style) = file_size_bar(Some(50), 100, 200, 10);
-        assert_eq!(bar.len(), 10);
+        // bar.len() returns bytes (█ is 3 bytes), use chars().count() for visual width
+        assert_eq!(bar.chars().count(), 10);
         assert_eq!(percent, " 25%");
     }
 
