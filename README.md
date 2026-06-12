@@ -81,7 +81,7 @@ diskr --thin-snapshots 10G --yes ~ # execute it
 | d | Move selected item to Trash |
 | Tab | Switch files/disks/packages pane |
 | q | Quit |
-| Esc | Focus Files pane / cancel modals and search |
+| Esc / Ctrl+C | Focus Files pane / cancel modals and search |
 
 ## How it works
 

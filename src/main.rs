@@ -334,7 +334,7 @@ Keys:
   E               Empty Trash (reclaim pane)
   Tab             Switch files/disks/packages/reclaim pane
   q               Quit
-  Esc             Return to Files pane / close modals and search modes
+  Esc, Ctrl+C     Return to Files pane / close modals and search modes
 ",
         env!("CARGO_PKG_VERSION")
     );

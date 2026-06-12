@@ -9,11 +9,33 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+## [0.1.48] - 2026-06-12
+
 ### Changed
 
 - Overhauled development docs: added this changelog and an issue tracker
   (`docs/ISSUES.md`), froze `docs/AUDIT.md` as a historical archive, and added
   an agent workflow protocol in `AGENTS.md`.
+
+### Fixed
+
+- Character keys carrying Control/Alt/Super no longer match plain-key
+  actions: Ctrl+C cannot trigger rename, Ctrl+D cannot arm Trash deletion,
+  and modified characters are not inserted into text inputs. Ctrl+C now
+  cancels the active input mode, confirmation, or overlay like Esc; README
+  and `--help` key lists updated. (#51)
+- A panic now restores the terminal (raw mode off, alternate screen left)
+  before the panic message prints, including release builds where
+  `panic = "abort"` skips destructors. (#54)
+- Reclaim reports no longer double-count nested fixed cache categories:
+  parent categories containing other findings are marked as `[subtotal]`
+  roll-up rows and excluded from the report total; JSON findings gain a
+  `rollup` field. (#46)
+- The package detail modal in the Projects view shows the selected project
+  dependency row instead of an unrelated system package. (#60)
+- `empty_trash` runs `osascript` through an injectable runner; the test suite
+  can no longer touch the real Trash, and its doc comment no longer claims
+  emptying is reversible. (#44)
 
 ## [0.1.47] - 2026-06-12
 
