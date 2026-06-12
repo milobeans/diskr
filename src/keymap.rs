@@ -35,7 +35,7 @@ const GLOBAL: &[KeyBinding] = &[
     },
     KeyBinding {
         key: "Esc, Ctrl+C",
-        action: "Close modal/search or focus Files",
+        action: "Close modal or clear search/filter",
         footer: None,
     },
 ];
@@ -96,7 +96,7 @@ const NAVIGATION: &[KeyBinding] = &[
 const FILES: &[KeyBinding] = &[
     KeyBinding {
         key: "/",
-        action: "Search files or filter packages",
+        action: "Search files or filter packages; Enter keeps, Esc clears",
         footer: Some(FooterBinding {
             key: "/",
             action: "search",
@@ -130,7 +130,7 @@ const FILES: &[KeyBinding] = &[
     },
     KeyBinding {
         key: "S",
-        action: "Scan missing visible directory sizes",
+        action: "Scan missing or stale visible directory sizes",
         footer: Some(FooterBinding {
             key: "S",
             action: "scan all",
@@ -233,7 +233,7 @@ const RECLAIM_REPORTS: &[KeyBinding] = &[
     },
     KeyBinding {
         key: "E",
-        action: "Empty Trash from Reclaim pane",
+        action: "Empty Trash (when the report lists Trash)",
         footer: None,
     },
     KeyBinding {
