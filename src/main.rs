@@ -1735,6 +1735,30 @@ mod tests {
     }
 
     #[test]
+    fn canonical_dir_resolves_dotted_paths() {
+        let root = test_root("canonical_dir");
+        fs::create_dir_all(&root).unwrap();
+
+        let resolved = canonical_dir(root.join(".")).unwrap();
+
+        assert_eq!(resolved, root.canonicalize().unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reverse_focus_from_files_goes_to_reclaim() {
+        let root = test_root("reverse_focus");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Files;
+        focus_previous(&mut app);
+
+        assert!(app.focus == Focus::Reclaim);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn external_action_target_uses_selected_file_disk_or_package() {
         let root = test_root("external_target");
         let file = root.join("visible.txt");

@@ -2946,6 +2946,118 @@ mod tests {
     }
 
     #[test]
+    fn app_new_preserves_caller_path() {
+        let root = test_root("canonical_start");
+        fs::create_dir_all(&root).unwrap();
+
+        let start = root.join(".");
+        let app = App::new(start.clone()).unwrap();
+
+        assert_eq!(app.cwd, start);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn history_baseline_status_does_not_duplicate_ago() {
+        let root = test_root("history_status");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.history_baseline = Some(history::ScanRecord {
+            path: root.clone(),
+            timestamp: now_secs().saturating_sub(60),
+            children: Vec::new(),
+        });
+
+        let status = app.history_baseline_status().unwrap();
+        assert!(status.starts_with("baseline saved "));
+        assert!(!status.contains("ago ago"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_reclaim_scan_result_is_ignored_after_cwd_change() {
+        let root_a = test_root("stale_reclaim_a");
+        let root_b = test_root("stale_reclaim_b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+
+        let mut app = App::new(root_a.clone()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.active_reclaim_scan_id = 7;
+        app.reclaim_scan_rx = Some(rx);
+        app.reclaim_loading = true;
+        app.cwd = root_b.clone();
+
+        tx.send(ReclaimMsg {
+            scan_id: 7,
+            root: root_a.clone(),
+            report: reclaim::ReclaimReport {
+                root: root_a.clone(),
+                findings: Vec::new(),
+                total: SizeInfo::default(),
+                inaccessible: 0,
+            },
+        })
+        .unwrap();
+
+        assert!(app.drain_reclaim_results());
+        assert!(app.reclaim_report.is_none());
+        assert!(!app.reclaim_loading);
+        assert!(app.status.contains("stale reclaim"));
+
+        fs::remove_dir_all(root_a).unwrap();
+        fs::remove_dir_all(root_b).unwrap();
+    }
+
+    #[test]
+    fn stale_package_scan_result_is_ignored_after_cwd_change() {
+        let root_a = test_root("stale_pkg_a");
+        let root_b = test_root("stale_pkg_b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+
+        let mut app = App::new(root_a.clone()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.active_pkg_scan_id = 11;
+        app.pkg_scan_rx = Some(rx);
+        app.packages_loading = true;
+        app.cwd = root_b.clone();
+
+        tx.send(PkgScanMsg {
+            scan_id: 11,
+            cwd: root_a.clone(),
+            reports: Vec::new(),
+            project_deps: vec![ProjectDeps {
+                path: root_a.clone(),
+                manager_label: "cargo",
+                manifest: "Cargo.toml",
+                dep_count: 1,
+                deps_size: None,
+                deps_dir: Some(root_a.join("target")),
+            }],
+            include_managers: false,
+        })
+        .unwrap();
+
+        assert!(app.drain_package_results());
+        assert!(app.project_deps.is_empty());
+        assert!(app.project_deps_cwd.is_none());
+        assert!(!app.packages_loading);
+        assert!(app.status.contains("stale package") || app.status.contains("discarded stale"));
+
+        fs::remove_dir_all(root_a).unwrap();
+        fs::remove_dir_all(root_b).unwrap();
+    }
+
+    #[test]
+    fn modal_window_bounds_keeps_selection_visible() {
+        assert_eq!(modal_window_bounds(0, 50, 0, 10), (0, 10));
+        assert_eq!(modal_window_bounds(12, 50, 0, 10), (3, 13));
+        assert_eq!(modal_window_bounds(49, 50, 3, 10), (40, 50));
+    }
+
+    #[test]
     fn force_rescan_refreshes_entries_and_preserves_selection() {
         let root = test_root("refresh");
         fs::create_dir_all(&root).unwrap();

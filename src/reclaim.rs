@@ -472,6 +472,23 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
+    #[test]
+    fn fixed_findings_accept_dotted_home_root() {
+        let home = test_root("reclaim_dotted_home");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join("Library/Caches")).unwrap();
+        fs::write(home.join("Library/Caches/c.bin"), vec![0u8; 4096]).unwrap();
+
+        let report = report_with_home(&home.join("."), Some(&home));
+
+        assert_eq!(
+            class_for(&report, "User caches"),
+            Some(Reclaimability::Safe)
+        );
+        assert_eq!(report.root, home.canonicalize().unwrap());
+        fs::remove_dir_all(home).unwrap();
+    }
+
     fn test_root(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
