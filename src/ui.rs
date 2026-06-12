@@ -1939,7 +1939,7 @@ fn draw_project_dep_detail(f: &mut Frame, app: &App) {
 
     lines.push(Line::from(vec![
         Span::styled("  Manifest: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(dep.manifest, Style::default().fg(Color::Gray)),
+        Span::styled(dep.manifest.as_str(), Style::default().fg(Color::Gray)),
     ]));
 
     lines.push(Line::from(vec![

@@ -1951,8 +1951,8 @@ mod tests {
         }];
         app.project_deps = vec![packages::ProjectDeps {
             path: root.clone(),
-            manager_label: "cargo",
-            manifest: "Cargo.toml",
+            manager_label: String::from("cargo"),
+            manifest: String::from("Cargo.toml"),
             dep_count: 3,
             deps_size: None,
             deps_dir: Some(root.join("target")),

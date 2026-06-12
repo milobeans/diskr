@@ -190,8 +190,8 @@ pub struct ManagerReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectDeps {
     pub path: PathBuf,
-    pub manager_label: &'static str,
-    pub manifest: &'static str,
+    pub manager_label: String,
+    pub manifest: String,
     pub dep_count: usize,
     pub deps_size: Option<SizeInfo>,
     pub deps_dir: Option<PathBuf>,
@@ -920,7 +920,10 @@ pub fn find_project_deps(root: &Path, max_depth: usize) -> Vec<ProjectDeps> {
     results.sort_by(|a, b| {
         let a_size = a.deps_size.map(|s| s.allocated).unwrap_or(0);
         let b_size = b.deps_size.map(|s| s.allocated).unwrap_or(0);
-        b_size.cmp(&a_size).then(a.path.cmp(&b.path))
+        b_size
+            .cmp(&a_size)
+            .then(a.path.cmp(&b.path))
+            .then(a.manifest.cmp(&b.manifest))
     });
     results
 }
@@ -935,6 +938,34 @@ const PROJECT_MANIFESTS: &[(&str, &str, &str)] = &[
     ("composer.json", "composer", "vendor"),
 ];
 
+#[derive(Debug)]
+struct ProjectManifestGroup {
+    deps_path: Option<PathBuf>,
+    manager_labels: Vec<&'static str>,
+    manifests: Vec<&'static str>,
+}
+
+impl ProjectManifestGroup {
+    fn new(
+        deps_path: Option<PathBuf>,
+        manager_label: &'static str,
+        manifest: &'static str,
+    ) -> Self {
+        Self {
+            deps_path,
+            manager_labels: vec![manager_label],
+            manifests: vec![manifest],
+        }
+    }
+
+    fn add(&mut self, manager_label: &'static str, manifest: &'static str) {
+        if !self.manager_labels.contains(&manager_label) {
+            self.manager_labels.push(manager_label);
+        }
+        self.manifests.push(manifest);
+    }
+}
+
 fn scan_project_dir(
     dir: &Path,
     depth: usize,
@@ -947,7 +978,7 @@ fn scan_project_dir(
     };
 
     let mut children = Vec::new();
-    let mut found_manifests: Vec<(&str, &str, &str)> = Vec::new();
+    let mut found_manifests: Vec<(usize, &str, &str, &str)> = Vec::new();
 
     for entry in read.flatten() {
         let Ok(file_type) = entry.file_type() else {
@@ -959,9 +990,9 @@ fn scan_project_dir(
         };
 
         if file_type.is_file() {
-            for (manifest, mgr, deps_dir) in PROJECT_MANIFESTS {
+            for (index, (manifest, mgr, deps_dir)) in PROJECT_MANIFESTS.iter().enumerate() {
                 if name_str == *manifest {
-                    found_manifests.push((manifest, mgr, deps_dir));
+                    found_manifests.push((index, *manifest, *mgr, *deps_dir));
                 }
             }
         } else if file_type.is_dir()
@@ -974,25 +1005,38 @@ fn scan_project_dir(
         }
     }
 
-    let new_deps = pool::par_map(found_manifests, |(manifest, mgr, deps_dir_name)| {
-        let dep_count = count_manifest_deps(dir, manifest);
-        let (deps_size, deps_dir) = if !deps_dir_name.is_empty() {
-            let deps_path = dir.join(deps_dir_name);
-            if deps_path.is_dir() {
-                (
-                    Some(bulkstat::scan_dir(&deps_path, 0).size),
-                    Some(deps_path),
-                )
-            } else {
-                (None, None)
-            }
+    found_manifests.sort_by_key(|(index, _, _, _)| *index);
+    let mut groups: Vec<ProjectManifestGroup> = Vec::new();
+    for (_, manifest, mgr, deps_dir_name) in found_manifests {
+        let deps_path = if deps_dir_name.is_empty() {
+            None
         } else {
-            (None, None)
+            Some(dir.join(deps_dir_name))
+        };
+        if let Some(group) = groups.iter_mut().find(|group| group.deps_path == deps_path) {
+            group.add(mgr, manifest);
+        } else {
+            groups.push(ProjectManifestGroup::new(deps_path, mgr, manifest));
+        }
+    }
+
+    let new_deps = pool::par_map(groups, |group| {
+        let dep_count = group
+            .manifests
+            .iter()
+            .map(|manifest| count_manifest_deps(dir, manifest))
+            .sum();
+        let (deps_size, deps_dir) = match group.deps_path {
+            Some(deps_path) if deps_path.is_dir() => (
+                Some(bulkstat::scan_dir(&deps_path, 0).size),
+                Some(deps_path),
+            ),
+            _ => (None, None),
         };
         ProjectDeps {
             path: dir.to_path_buf(),
-            manager_label: mgr,
-            manifest,
+            manager_label: group.manager_labels.join(", "),
+            manifest: group.manifests.join(", "),
             dep_count,
             deps_size,
             deps_dir,
@@ -1644,6 +1688,32 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].manifest, "package.json");
         assert_eq!(deps[0].dep_count, 1);
+        assert!(deps[0].deps_size.is_some());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_deps_merge_manifests_that_share_deps_dir() {
+        let root = test_root("project_deps_shared_dir");
+        let _ = std::fs::remove_dir_all(&root);
+        let proj = root.join("pyapp");
+        std::fs::create_dir_all(proj.join(".venv/lib")).unwrap();
+        std::fs::write(proj.join("requirements.txt"), "requests\nflask\n").unwrap();
+        std::fs::write(
+            proj.join("pyproject.toml"),
+            "[project.dependencies]\nclick = \"8\"\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join(".venv/lib/site.py"), b"python deps").unwrap();
+
+        let deps = find_project_deps(&root, 3);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].path, proj);
+        assert_eq!(deps[0].manager_label, "pip, pip/uv");
+        assert_eq!(deps[0].manifest, "requirements.txt, pyproject.toml");
+        assert_eq!(deps[0].dep_count, 3);
+        assert_eq!(deps[0].deps_dir.as_ref(), Some(&root.join("pyapp/.venv")));
         assert!(deps[0].deps_size.is_some());
 
         std::fs::remove_dir_all(root).unwrap();

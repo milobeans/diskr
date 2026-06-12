@@ -9,6 +9,13 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- Project dependency reports now merge multiple manifests that point at the
+  same dependency directory, so Python projects with both `requirements.txt`
+  and `pyproject.toml` count one `.venv` once while preserving both manifest
+  labels. (#34)
+
 ## [0.1.54] - 2026-06-12
 
 ### Fixed

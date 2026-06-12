@@ -3797,8 +3797,8 @@ mod tests {
         let mut app = App::new(root.clone()).unwrap();
         app.project_deps = vec![ProjectDeps {
             path: root.clone(),
-            manager_label: "cargo",
-            manifest: "Cargo.toml",
+            manager_label: String::from("cargo"),
+            manifest: String::from("Cargo.toml"),
             dep_count: 5,
             deps_size: None,
             deps_dir: Some(root.join("target")),
@@ -3989,16 +3989,16 @@ mod tests {
         app.project_deps = vec![
             ProjectDeps {
                 path: root.join("Cargo.toml"),
-                manager_label: "cargo",
-                manifest: "Cargo.toml",
+                manager_label: String::from("cargo"),
+                manifest: String::from("Cargo.toml"),
                 dep_count: 4,
                 deps_size: Some(SizeInfo::new(100, 100)),
                 deps_dir: Some(root.join("target")),
             },
             ProjectDeps {
                 path: root.join("package.json"),
-                manager_label: "npm/bun/yarn",
-                manifest: "package.json",
+                manager_label: String::from("npm/bun/yarn"),
+                manifest: String::from("package.json"),
                 dep_count: 8,
                 deps_size: Some(SizeInfo::new(200, 200)),
                 deps_dir: Some(root.join("node_modules")),
@@ -4333,8 +4333,8 @@ mod tests {
             reports: Vec::new(),
             project_deps: vec![ProjectDeps {
                 path: root_a.clone(),
-                manager_label: "cargo",
-                manifest: "Cargo.toml",
+                manager_label: String::from("cargo"),
+                manifest: String::from("Cargo.toml"),
                 dep_count: 1,
                 deps_size: None,
                 deps_dir: Some(root_a.join("target")),
@@ -5127,8 +5127,8 @@ mod tests {
         app.cached_flat_packages = vec![make_flat_package("alpha"), make_flat_package("beta")];
         app.project_deps = vec![packages::ProjectDeps {
             path: root.join("Cargo.toml"),
-            manager_label: "cargo",
-            manifest: "Cargo.toml",
+            manager_label: String::from("cargo"),
+            manifest: String::from("Cargo.toml"),
             dep_count: 3,
             deps_size: None,
             deps_dir: None,
@@ -5166,16 +5166,16 @@ mod tests {
         app.project_deps = vec![
             packages::ProjectDeps {
                 path: root.join("Cargo.toml"),
-                manager_label: "cargo",
-                manifest: "Cargo.toml",
+                manager_label: String::from("cargo"),
+                manifest: String::from("Cargo.toml"),
                 dep_count: 3,
                 deps_size: None,
                 deps_dir: Some(root.join("target")),
             },
             packages::ProjectDeps {
                 path: root.join("package.json"),
-                manager_label: "npm/bun/yarn",
-                manifest: "package.json",
+                manager_label: String::from("npm/bun/yarn"),
+                manifest: String::from("package.json"),
                 dep_count: 10,
                 deps_size: None,
                 deps_dir: Some(root.join("node_modules")),
@@ -5224,8 +5224,8 @@ mod tests {
         app.pkg_view = PkgView::ProjectDeps;
         app.project_deps = vec![packages::ProjectDeps {
             path: root.join("Cargo.toml"),
-            manager_label: "cargo",
-            manifest: "Cargo.toml",
+            manager_label: String::from("cargo"),
+            manifest: String::from("Cargo.toml"),
             dep_count: 2,
             deps_size: None,
             deps_dir: None,
