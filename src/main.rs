@@ -12,7 +12,7 @@ mod ui;
 
 use anyhow::{bail, Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -1019,6 +1019,19 @@ where
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
+                    // Ctrl+C cancels the active mode/modal like Esc in every state.
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        cancel_active_state(app);
+                        needs_draw = true;
+                        continue;
+                    }
+                    // Ignore character keys carrying CONTROL, ALT, or SUPER (keep SHIFT,
+                    // which is how uppercase letters and symbols arrive).
+                    if char_modifier_inhibited(&key) {
+                        continue;
+                    }
                     if app.confirming_delete {
                         let handled = match key.code {
                             KeyCode::Char('y') => {
@@ -1661,6 +1674,47 @@ fn set_focus(app: &mut App, focus: Focus) {
     }
 }
 
+// Returns true if a key event is a Char key modified by CONTROL, ALT, or SUPER.
+// Such events must be dropped before plain-character match arms are reached.
+// SHIFT is allowed: it is how uppercase letters and symbols (e.g. `?`, `!`) arrive.
+fn char_modifier_inhibited(key: &crossterm::event::KeyEvent) -> bool {
+    const INHIBIT: KeyModifiers = KeyModifiers::CONTROL
+        .union(KeyModifiers::ALT)
+        .union(KeyModifiers::SUPER);
+    matches!(key.code, KeyCode::Char(_)) && key.modifiers.intersects(INHIBIT)
+}
+
+// Cancel whatever active state the app is in, mirroring Esc in each mode.
+// Used by Ctrl+C so it always acts as a safe "get me out of here" chord.
+fn cancel_active_state(app: &mut App) {
+    if app.confirming_delete {
+        app.cancel_delete();
+    } else if app.confirming_uninstall {
+        app.cancel_uninstall();
+    } else if app.confirming_empty_trash {
+        app.cancel_empty_trash();
+    } else if app.pkg_detail {
+        app.close_pkg_detail();
+    } else if app.top_files_open() {
+        app.close_top_files();
+    } else if app.reclaim_paths_open() {
+        app.close_reclaim_paths();
+    } else if app.disk_info_open() {
+        app.close_disk_info();
+    } else if app.file_info_open {
+        app.close_file_info();
+    } else if app.input_mode != app::InputMode::None {
+        app.exit_input_mode();
+    } else if app.search_mode {
+        app.exit_search();
+    } else if app.pkg_search_mode {
+        app.exit_pkg_search();
+    } else if app.focus != Focus::Files {
+        app.focus = Focus::Files;
+    }
+    // In the base Files-focused state Esc is a no-op, so Ctrl+C is too.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1940,5 +1994,141 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    // ---- modifier guard tests (#51) ----
+
+    fn key_char(ch: char, mods: KeyModifiers) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(ch), mods)
+    }
+
+    fn key_nonchar(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn char_with_control_is_inhibited() {
+        assert!(char_modifier_inhibited(&key_char(
+            'c',
+            KeyModifiers::CONTROL
+        )));
+        assert!(char_modifier_inhibited(&key_char(
+            'd',
+            KeyModifiers::CONTROL
+        )));
+        assert!(char_modifier_inhibited(&key_char(
+            'r',
+            KeyModifiers::CONTROL
+        )));
+        assert!(char_modifier_inhibited(&key_char(
+            'v',
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn char_with_alt_or_super_is_inhibited() {
+        assert!(char_modifier_inhibited(&key_char('c', KeyModifiers::ALT)));
+        assert!(char_modifier_inhibited(&key_char('x', KeyModifiers::SUPER)));
+    }
+
+    #[test]
+    fn plain_char_and_shift_char_are_not_inhibited() {
+        assert!(!char_modifier_inhibited(&key_char('c', KeyModifiers::NONE)));
+        assert!(!char_modifier_inhibited(&key_char(
+            'S',
+            KeyModifiers::SHIFT
+        )));
+        assert!(!char_modifier_inhibited(&key_char(
+            'O',
+            KeyModifiers::SHIFT
+        )));
+    }
+
+    #[test]
+    fn non_char_keys_with_control_are_not_inhibited() {
+        // Only Char(_) keys are blocked; Esc/Enter with modifiers pass through.
+        let esc = crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL);
+        assert!(!char_modifier_inhibited(&esc));
+        let _ = key_nonchar(KeyCode::Enter); // satisfies unused-variable lint
+    }
+
+    #[test]
+    fn ctrl_c_exits_input_mode_via_cancel_active_state() {
+        let root = test_root("ctrl_c_input_mode");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file.txt"), b"x").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.request_rename();
+        assert!(matches!(app.input_mode, app::InputMode::Rename));
+
+        cancel_active_state(&mut app);
+        assert!(matches!(app.input_mode, app::InputMode::None));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ctrl_c_cancels_delete_confirmation() {
+        let root = test_root("ctrl_c_delete_confirm");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file.txt"), b"x").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.request_delete();
+        assert!(app.confirming_delete);
+
+        cancel_active_state(&mut app);
+        assert!(!app.confirming_delete);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ctrl_c_cancels_empty_trash_confirmation() {
+        let root = test_root("ctrl_c_empty_trash_confirm");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.request_empty_trash();
+        assert!(app.confirming_empty_trash);
+
+        cancel_active_state(&mut app);
+        assert!(!app.confirming_empty_trash);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ctrl_c_in_search_mode_exits_search() {
+        let root = test_root("ctrl_c_search");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.enter_search();
+        assert!(app.search_mode);
+
+        cancel_active_state(&mut app);
+        assert!(!app.search_mode);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ctrl_c_in_base_files_state_is_noop() {
+        let root = test_root("ctrl_c_base_state");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        assert!(matches!(app.focus, Focus::Files));
+
+        // Should not panic or change meaningful state.
+        cancel_active_state(&mut app);
+        assert!(matches!(app.focus, Focus::Files));
+        assert!(matches!(app.input_mode, app::InputMode::None));
+        assert!(!app.confirming_delete);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
