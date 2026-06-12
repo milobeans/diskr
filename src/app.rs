@@ -626,6 +626,7 @@ impl App {
                         if entry.is_dir {
                             self.exit_search();
                             self.cwd = entry.path;
+                            self.reset_cwd_scoped_state();
                             self.selected = 0;
                             self.reload()?;
                             self.refresh_history_state();
@@ -636,6 +637,7 @@ impl App {
             Focus::Disks => {
                 if let Some(disk) = self.disks.get(self.selected_disk) {
                     self.cwd = disk.mount.clone();
+                    self.reset_cwd_scoped_state();
                     self.focus = Focus::Files;
                     self.selected = 0;
                     self.reload()?;
@@ -657,6 +659,7 @@ impl App {
         let previous_cwd = self.cwd.clone();
         if let Some(parent) = self.cwd.parent().map(|p| p.to_path_buf()) {
             self.cwd = parent;
+            self.reset_cwd_scoped_state();
             self.reload_with_selection(Some(previous_cwd), self.selected)?;
             self.refresh_history_state();
         }
@@ -668,6 +671,7 @@ impl App {
             return Ok(());
         }
         self.show_hidden = !self.show_hidden;
+        self.marked.clear();
         self.reload()
     }
 
@@ -2173,7 +2177,6 @@ impl App {
         self.pending_delete = Some(DeleteTarget::Batch);
     }
 
-    #[allow(dead_code)]
     pub fn copy_path_to_clipboard(&mut self) {
         let Some(path) = self.selected_path() else {
             self.status = String::from("nothing selected");
@@ -2185,16 +2188,28 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
     pub fn open_shell(&mut self) -> Result<()> {
-        let shell = std::env::var_os("SHELL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/bin/zsh"));
-        Command::new(&shell)
-            .current_dir(&self.cwd)
+        let Some(path) = self.selected_path() else {
+            self.status = String::from("nothing selected");
+            return Ok(());
+        };
+        let shell_path = if path.is_dir() {
+            path
+        } else {
+            path.parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.cwd.clone())
+        };
+        Command::new("open")
+            .arg("-a")
+            .arg("Terminal")
+            .arg(&shell_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .context("open shell")?;
-        self.status = format!("opened {}", shell.display());
+        self.status = format!("opening terminal: {}", shell_path.display());
         Ok(())
     }
 
