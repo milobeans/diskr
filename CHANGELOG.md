@@ -11,11 +11,16 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ### Fixed
 
-- Search and package-filter Enter now keeps the narrowed view active while
-  leaving input mode; Esc and Ctrl+C clear the kept filter. (#53)
 - `S` and the selected-directory scan path now rescan stale cached directory
   sizes instead of only directories with no cached size, so one suspicious
   row can be verified without invalidating the whole view. (#83)
+
+## [0.1.53] - 2026-06-12
+
+### Fixed
+
+- Search and package-filter Enter now keeps the narrowed view active while
+  leaving input mode; Esc and Ctrl+C clear the kept filter. (#53)
 
 ## [0.1.52] - 2026-06-12
 
