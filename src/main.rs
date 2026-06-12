@@ -298,7 +298,7 @@ Keys:
   Space           Quick Look selected item
   f               Reveal selected item in Finder
   O               Open selected item with default app
-  r               Refresh view and scan nearby directory sizes
+  r               Refresh view and scan all visible directory sizes
   o               Cycle sort mode
   p               Open packages pane / switch package view
   .               Toggle hidden files
@@ -344,6 +344,7 @@ fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
             "limit": limit,
             "total_logical": scan.size.logical,
             "total_allocated": scan.size.allocated,
+            "inaccessible": scan.inaccessible,
             "files": files,
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -360,6 +361,12 @@ fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
         human(scan.size.allocated),
         human(scan.size.logical)
     );
+    if scan.inaccessible > 0 {
+        println!(
+            "Warning: {} directories were unreadable; totals are lower bounds.",
+            scan.inaccessible
+        );
+    }
     if scan.largest_files.is_empty() {
         println!("No regular files found.");
         return Ok(());
@@ -387,6 +394,15 @@ fn top_size_label(size: bulkstat::SizeInfo) -> String {
     }
 }
 
+fn reclaim_size_label(finding: &reclaim::Finding) -> String {
+    let label = top_size_label(finding.size);
+    if finding.inaccessible > 0 {
+        format!("≥{label}")
+    } else {
+        label
+    }
+}
+
 fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
     if !path.exists() {
         bail!("path does not exist: {}", path.display());
@@ -407,6 +423,7 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
                     "count": finding.count,
                     "logical": finding.size.logical,
                     "allocated": finding.size.allocated,
+                    "inaccessible": finding.inaccessible,
                     "note": finding.note,
                     "paths": finding
                         .paths
@@ -420,6 +437,7 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
             "root": report.root.to_string_lossy(),
             "total_logical": report.total.logical,
             "total_allocated": report.total.allocated,
+            "inaccessible": report.inaccessible,
             "findings": findings,
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -432,6 +450,12 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
         human(report.total.allocated),
         human(report.total.logical)
     );
+    if report.inaccessible > 0 {
+        println!(
+            "Warning: {} directories were unreadable; totals are lower bounds.",
+            report.inaccessible
+        );
+    }
     if report.findings.is_empty() {
         println!("No known reclaimable caches or build artifacts found.");
         return Ok(());
@@ -444,7 +468,7 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
         };
         println!(
             "{:>22}  [{:^11}]  {}{}",
-            top_size_label(finding.size),
+            reclaim_size_label(finding),
             finding.class.label(),
             finding.label,
             count
@@ -1102,7 +1126,9 @@ where
                                 true
                             }
                             KeyCode::End => {
-                                app.set_reclaim_paths_selected(app.reclaim_paths_count().saturating_sub(1));
+                                app.set_reclaim_paths_selected(
+                                    app.reclaim_paths_count().saturating_sub(1),
+                                );
                                 true
                             }
                             KeyCode::Enter | KeyCode::Char('f') => {

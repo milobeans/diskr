@@ -17,8 +17,8 @@ use crate::app::{
     format_modified_time, human, size_sort_key, App, Focus, InputMode, PkgView, SortMode,
 };
 use crate::bulkstat::SizeInfo;
-use crate::reclaim::Reclaimability;
 use crate::packages::{DepEvidence, PackageUseStatus};
+use crate::reclaim::Reclaimability;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::default()
@@ -90,13 +90,8 @@ fn draw_input_overlay(f: &mut Frame, app: &App) {
     let block = Block::default()
         .title(app.input_prompt.as_str())
         .borders(Borders::ALL);
-    let text = vec![
-        Line::from(""),
-        Line::from(app.input_buffer.as_str()),
-    ];
-    let paragraph = Paragraph::new(text)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let text = vec![Line::from(""), Line::from(app.input_buffer.as_str())];
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
     f.render_widget(Clear, area);
     f.render_widget(paragraph, area);
 }
@@ -112,11 +107,6 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(path, Style::default().fg(Color::Cyan)),
         Span::raw(" · "),
         Span::styled(
-            format!("{} items", app.entries.len()),
-            Style::default().fg(Color::White),
-        ),
-        Span::raw(" · "),
-        Span::styled(
             format!("sort {}", app.sort.label()),
             Style::default().fg(Color::Gray),
         ),
@@ -125,15 +115,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             format!("hidden {}", if app.show_hidden { "on" } else { "off" }),
             Style::default().fg(Color::Gray),
         ),
-        Span::raw(" · "),
-        Span::styled("history", Style::default().fg(Color::DarkGray)),
-        Span::raw(" "),
     ];
     if let Some(baseline) = app.history_baseline_status() {
-        spans.push(Span::styled(
-            baseline,
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled(baseline, Style::default().fg(Color::DarkGray)));
     }
     if let Some(delta) = app.history_delta_status() {
         spans.push(Span::styled(
@@ -194,7 +178,9 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|e| {
             let size_str = match (e.is_dir, e.size, e.scanning) {
                 (true, _, true) => format!("{} scanning…", spinner_char()),
-                (true, Some(size), _) => human(size_sort_key(size)),
+                (true, Some(size), _) => {
+                    size_with_access_marker(size_sort_key(size), e.inaccessible)
+                }
                 (true, None, _) => String::from("—"),
                 (false, Some(size), _) if e.is_symlink => human(size_sort_key(size)),
                 (false, None, _) if e.is_symlink => String::from("link"),
@@ -398,7 +384,10 @@ fn draw_reclaim_panel(f: &mut Frame, app: &App) {
                     format!("{} ", spinner_char()),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::styled("scanning reclaim recommendations…", Style::default().fg(Color::White)),
+                Span::styled(
+                    "scanning reclaim recommendations…",
+                    Style::default().fg(Color::White),
+                ),
             ]),
             Line::from(""),
             Line::from("press Enter on a finding to view recoverable paths"),
@@ -435,11 +424,11 @@ fn draw_reclaim_panel(f: &mut Frame, app: &App) {
         .findings
         .iter()
         .map(|finding| {
-        let class_style = match finding.class {
-            Reclaimability::Safe => Style::default().fg(Color::Green),
-            Reclaimability::Regenerable => Style::default().fg(Color::Yellow),
-            Reclaimability::Risky => Style::default().fg(Color::Red),
-        };
+            let class_style = match finding.class {
+                Reclaimability::Safe => Style::default().fg(Color::Green),
+                Reclaimability::Regenerable => Style::default().fg(Color::Yellow),
+                Reclaimability::Risky => Style::default().fg(Color::Red),
+            };
             let mut spans = Vec::new();
             let size = if finding.size.allocated == finding.size.logical {
                 format!("{} ", human(finding.size.allocated))
@@ -449,6 +438,11 @@ fn draw_reclaim_panel(f: &mut Frame, app: &App) {
                     human(finding.size.allocated),
                     human(finding.size.logical)
                 )
+            };
+            let size = if finding.inaccessible > 0 {
+                format!("≥{size}")
+            } else {
+                size
             };
             spans.push(Span::styled(
                 format!("{size:>16}"),
@@ -493,24 +487,40 @@ fn draw_reclaim_panel(f: &mut Frame, app: &App) {
     if let Some(finding) = app.selected_reclaim_finding() {
         let detail_area = centered_rect(70, 28, 72, 9, f.area());
         f.render_widget(Clear, detail_area);
-        let lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(
+        let size_line = format!(
+            "{} · {} paths",
+            if finding.size.allocated == finding.size.logical {
+                human(finding.size.allocated)
+            } else {
                 format!(
-                    "{} · {} paths",
-                    if finding.size.allocated == finding.size.logical {
-                        human(finding.size.allocated)
-                    } else {
-                        format!("{} / {}", human(finding.size.allocated), human(finding.size.logical))
-                    },
-                    finding.count
-                ),
-                Style::default().fg(Color::Green),
-            )),
-            Line::from(Span::styled(finding.note.clone(), Style::default().fg(Color::Gray))),
+                    "{} / {}",
+                    human(finding.size.allocated),
+                    human(finding.size.logical)
+                )
+            },
+            finding.count
+        );
+        let mut lines = vec![
             Line::from(""),
-            Line::from("enter: open paths  ·  d: delete path  ·  esc: close paths"),
+            Line::from(Span::styled(size_line, Style::default().fg(Color::Green))),
+            Line::from(Span::styled(
+                finding.note.clone(),
+                Style::default().fg(Color::Gray),
+            )),
         ];
+        if finding.inaccessible > 0 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} unreadable directories; size is a lower bound",
+                    finding.inaccessible
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "enter: open paths  ·  d: delete path  ·  esc: close paths",
+        ));
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" reclaim finding ")
@@ -549,19 +559,27 @@ fn draw_reclaim_paths(f: &mut Frame, app: &App) {
             let mut spans = vec![
                 Span::styled(prefix, Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    truncate(&path.display().to_string(), area.width.saturating_sub(8) as usize),
+                    truncate(
+                        &path.display().to_string(),
+                        area.width.saturating_sub(8) as usize,
+                    ),
                     Style::default().fg(Color::White),
                 ),
             ];
             if idx == app.reclaim_paths_selected() {
-                spans.push(Span::styled("  (current)", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    "  (current)",
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
             ListItem::new(Line::from(spans))
         })
         .collect();
 
     if item_count == 0 {
-        let block = Block::default().borders(Borders::ALL).title(" reclaim paths ");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" reclaim paths ");
         let body = Paragraph::new("no reclaim paths found")
             .block(block)
             .alignment(Alignment::Center);
@@ -570,16 +588,12 @@ fn draw_reclaim_paths(f: &mut Frame, app: &App) {
     }
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(
-                    " {} ({}) · {} ",
-                    finding.label,
-                    finding.class.label(),
-                    finding.count
-                )),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " {} ({}) · {} ",
+            finding.label,
+            finding.class.label(),
+            finding.count
+        )))
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -587,7 +601,10 @@ fn draw_reclaim_paths(f: &mut Frame, app: &App) {
         )
         .highlight_symbol("▶ ");
     let mut state = ListState::default();
-    state.select(Some(app.reclaim_paths_selected().min(item_count.saturating_sub(1))));
+    state.select(Some(
+        app.reclaim_paths_selected()
+            .min(item_count.saturating_sub(1)),
+    ));
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -604,10 +621,7 @@ fn draw_top_files(f: &mut Frame, app: &App) {
                     format!("{} ", spinner_char()),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::styled(
-                    "scanning top files…",
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled("scanning top files…", Style::default().fg(Color::White)),
             ]),
         ];
         if let Some(path) = app.top_files_path() {
@@ -655,7 +669,10 @@ fn draw_top_files(f: &mut Frame, app: &App) {
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(
-                    truncate(&file.path.display().to_string(), area.width.saturating_sub(34) as usize),
+                    truncate(
+                        &file.path.display().to_string(),
+                        area.width.saturating_sub(34) as usize,
+                    ),
                     Style::default().fg(Color::White),
                 ),
             ];
@@ -691,13 +708,20 @@ fn draw_top_files(f: &mut Frame, app: &App) {
         )
         .highlight_symbol("▶ ");
     let mut state = ListState::default();
-    state.select(Some(app.top_files_selected.min(scan.largest_files.len().saturating_sub(1))));
+    state.select(Some(
+        app.top_files_selected
+            .min(scan.largest_files.len().saturating_sub(1)),
+    ));
     f.render_stateful_widget(list, area, &mut state);
 
     let total = if scan.size.allocated == scan.size.logical {
         human(scan.size.allocated)
     } else {
-        format!("{} / {}", human(scan.size.allocated), human(scan.size.logical))
+        format!(
+            "{} / {}",
+            human(scan.size.allocated),
+            human(scan.size.logical)
+        )
     };
     let mut footer = vec![Line::from(Span::styled(
         format!("total: {total}"),
@@ -751,7 +775,12 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
     lines.push(Line::from(vec![
         Span::styled("mount ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{}  ({}, {})", report.mount.display(), report.fs_type, report.device),
+            format!(
+                "{}  ({}, {})",
+                report.mount.display(),
+                report.fs_type,
+                report.device
+            ),
             Style::default().fg(Color::White),
         ),
     ]));
@@ -766,7 +795,14 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("free ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}  (available: {})", human(report.free), human(report.available)), Style::default().fg(Color::Green)),
+        Span::styled(
+            format!(
+                "{}  (available: {})",
+                human(report.free),
+                human(report.available)
+            ),
+            Style::default().fg(Color::Green),
+        ),
     ]));
     if gap > 0 {
         lines.push(Line::from(vec![
@@ -779,7 +815,11 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
         lines.push(Line::from(vec![
             Span::styled("apfs container ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} free of {}", human(container.free), human(container.size)),
+                format!(
+                    "{} free of {}",
+                    human(container.free),
+                    human(container.size)
+                ),
                 Style::default().fg(Color::Green),
             ),
         ]));
@@ -920,7 +960,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
 
                 let title = Line::from(vec![
                     Span::styled(
-                        format!("{} ", spinner_char()),
+                        format!("{} ", big_spinner_char()),
                         Style::default().fg(Color::Cyan),
                     ),
                     Span::styled("scanning package data…", Style::default().fg(Color::White)),
@@ -1531,6 +1571,15 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                     .map(size_detail)
                     .unwrap_or_else(|| String::from("—"));
                 spans.push(Span::styled(size, Style::default().fg(Color::Green)));
+                if entry.inaccessible > 0 {
+                    spans.push(Span::styled(
+                        format!(
+                            " · {} unreadable dirs; size is a lower bound",
+                            entry.inaccessible
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
                 spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
                 spans.push(Span::styled(
                     format_modified_time(entry.modified),
@@ -1768,6 +1817,14 @@ fn size_detail(size: SizeInfo) -> String {
     )
 }
 
+fn size_with_access_marker(bytes: u64, inaccessible: u32) -> String {
+    if inaccessible > 0 {
+        format!("≥{}", human(bytes))
+    } else {
+        human(bytes)
+    }
+}
+
 fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize, usize) {
     const ICON_WIDTH: usize = 2;
     const GAP_WIDTH: usize = 2;
@@ -1785,9 +1842,7 @@ fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize, 
     let content_width = inner_width.saturating_sub(ICON_WIDTH);
     let show_bar = inner_width >= BAR_THRESHOLD_WIDTH;
     let preferred_bar_width = if show_bar {
-        PREFERRED_BAR_WIDTH
-            .min(MAX_BAR_WIDTH)
-            .max(MIN_BAR_WIDTH)
+        PREFERRED_BAR_WIDTH.clamp(MIN_BAR_WIDTH, MAX_BAR_WIDTH)
     } else {
         0
     };
@@ -1800,20 +1855,19 @@ fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize, 
         }
 
         if preferred_bar_width > 0 {
-            let minimum_width = MIN_NAME_WIDTH + GAP_WIDTH + MIN_SIZE_WIDTH + GAP_WIDTH + MIN_BAR_WIDTH;
+            let minimum_width =
+                MIN_NAME_WIDTH + GAP_WIDTH + MIN_SIZE_WIDTH + GAP_WIDTH + MIN_BAR_WIDTH;
             if room_for_size >= minimum_width.saturating_sub(MIN_NAME_WIDTH) {
                 let mut size_width = PREFERRED_SIZE_WIDTH.min(room_for_size);
                 let mut bar_width = preferred_bar_width;
-                let mut required =
-                    MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + bar_width;
+                let mut required = MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + bar_width;
                 if required > content_width {
                     let mut overflow = required - content_width;
                     let shrink_bar = (bar_width.saturating_sub(MIN_BAR_WIDTH)).min(overflow);
                     bar_width -= shrink_bar;
                     overflow -= shrink_bar;
                     size_width = size_width.saturating_sub(overflow).max(MIN_SIZE_WIDTH);
-                    required =
-                        MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + bar_width;
+                    required = MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + bar_width;
                 }
                 if required <= content_width {
                     let name_width = content_width
@@ -1825,9 +1879,7 @@ fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize, 
         }
 
         let size_width = room_for_size.min(PREFERRED_SIZE_WIDTH);
-        let name_width = content_width
-            .saturating_sub(GAP_WIDTH + size_width)
-            .max(1);
+        let name_width = content_width.saturating_sub(GAP_WIDTH + size_width).max(1);
         return (name_width, size_width, 0, 0);
     }
 
@@ -1837,20 +1889,19 @@ fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize, 
         return (content_width.max(1), 0, 0, 0);
     }
 
-    let min_for_size_and_modified = MIN_NAME_WIDTH
-        + GAP_WIDTH
-        + MIN_SIZE_WIDTH
-        + GAP_WIDTH
-        + MIN_MODIFIED_WIDTH;
-    let mut size_width = 0;
-    let mut modified_width = 0;
+    let min_for_size_and_modified =
+        MIN_NAME_WIDTH + GAP_WIDTH + MIN_SIZE_WIDTH + GAP_WIDTH + MIN_MODIFIED_WIDTH;
+    let mut size_width;
+    let mut modified_width;
     if room_for_name_and_meta >= min_for_size_and_modified && inner_width >= 50 {
         size_width = PREFERRED_SIZE_WIDTH;
         modified_width = PREFERRED_MODIFIED_WIDTH;
         let mut required = MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + modified_width;
         if required > room_for_name_and_meta {
             let mut overflow = required - room_for_name_and_meta;
-            let shrink_modified = modified_width.saturating_sub(MIN_MODIFIED_WIDTH).min(overflow);
+            let shrink_modified = modified_width
+                .saturating_sub(MIN_MODIFIED_WIDTH)
+                .min(overflow);
             modified_width -= shrink_modified;
             overflow -= shrink_modified;
             size_width = size_width.saturating_sub(overflow).max(MIN_SIZE_WIDTH);
@@ -1865,14 +1916,20 @@ fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize, 
             }
 
             let mut bar_width = preferred_bar_width;
-            let mut required =
-                MIN_NAME_WIDTH + GAP_WIDTH + size_width + GAP_WIDTH + modified_width + GAP_WIDTH + bar_width;
+            let mut required = MIN_NAME_WIDTH
+                + GAP_WIDTH
+                + size_width
+                + GAP_WIDTH
+                + modified_width
+                + GAP_WIDTH
+                + bar_width;
             if required > room_for_name_and_meta {
                 let mut overflow = required - room_for_name_and_meta;
                 let shrink_bar = (bar_width.saturating_sub(MIN_BAR_WIDTH)).min(overflow);
                 bar_width -= shrink_bar;
                 overflow -= shrink_bar;
-                let shrink_modified = (modified_width.saturating_sub(MIN_MODIFIED_WIDTH)).min(overflow);
+                let shrink_modified =
+                    (modified_width.saturating_sub(MIN_MODIFIED_WIDTH)).min(overflow);
                 modified_width -= shrink_modified;
                 overflow -= shrink_modified;
                 size_width = size_width.saturating_sub(overflow).max(MIN_SIZE_WIDTH);
@@ -1898,8 +1955,7 @@ fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize, 
 
     let modified_width = room_for_name_and_meta
         .saturating_sub(MIN_NAME_WIDTH + GAP_WIDTH)
-        .min(PREFERRED_MODIFIED_WIDTH)
-        .max(MIN_MODIFIED_WIDTH);
+        .clamp(MIN_MODIFIED_WIDTH, PREFERRED_MODIFIED_WIDTH);
     let name_width = content_width
         .saturating_sub(GAP_WIDTH + modified_width)
         .max(1);
@@ -1954,7 +2010,11 @@ fn file_size_bar(
 
     let Some(size) = size else {
         let blank = format!("{: <bar_width$}", " ");
-        return (blank, String::from(" --%"), Style::default().fg(Color::DarkGray));
+        return (
+            blank,
+            String::from(" --%"),
+            Style::default().fg(Color::DarkGray),
+        );
     };
 
     if max_visible_size == 0 {
@@ -2128,7 +2188,17 @@ fn spinner_char() -> char {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let index = ((ms / 80) % spinners.len() as u128) as usize;
+    let index = ((ms / 60) % spinners.len() as u128) as usize;
+    spinners[index]
+}
+
+fn big_spinner_char() -> char {
+    let spinners = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let index = ((ms / 120) % spinners.len() as u128) as usize;
     spinners[index]
 }
 

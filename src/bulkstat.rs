@@ -68,6 +68,9 @@ pub struct LargeFile {
 pub struct DirScan {
     pub size: SizeInfo,
     pub largest_files: Vec<LargeFile>,
+    /// Directories that could not be opened due to permissions (EACCES/EPERM).
+    /// When non-zero the reported size is a lower bound.
+    pub inaccessible: u32,
 }
 
 #[repr(C)]
@@ -82,7 +85,7 @@ struct Attrlist {
 }
 
 /// Recursive size and optional largest-file report for `root`.
-/// Symlinks are skipped. Permission errors yield zero contribution, not panic.
+/// Symlinks are skipped. Permission errors yield zero contribution and are counted.
 pub fn scan_dir(root: &Path, top_file_limit: usize) -> DirScan {
     let Ok(meta) = std::fs::symlink_metadata(root) else {
         return DirScan::default();
@@ -107,11 +110,13 @@ pub fn scan_dir(root: &Path, top_file_limit: usize) -> DirScan {
 struct ScanAggregate {
     size: SizeInfo,
     largest_files: BinaryHeap<Reverse<FileCandidate>>,
+    inaccessible: u32,
 }
 
 impl ScanAggregate {
     fn merge(&mut self, partial: DirectoryScan, top_file_limit: usize) {
         self.size.add_file(partial.size);
+        self.inaccessible = self.inaccessible.saturating_add(partial.inaccessible);
         if top_file_limit == 0 {
             return;
         }
@@ -124,6 +129,7 @@ impl ScanAggregate {
         DirScan {
             size: self.size,
             largest_files: sorted_largest_files(self.largest_files),
+            inaccessible: self.inaccessible,
         }
     }
 }
@@ -133,6 +139,7 @@ struct DirectoryScan {
     size: SizeInfo,
     largest_files: BinaryHeap<Reverse<FileCandidate>>,
     subdirs: Vec<PathBuf>,
+    inaccessible: u32,
 }
 
 fn spawn_scan<'scope>(
@@ -147,6 +154,7 @@ fn spawn_scan<'scope>(
             size,
             largest_files,
             subdirs,
+            inaccessible,
         } = partial;
 
         for subdir in subdirs {
@@ -158,6 +166,7 @@ fn spawn_scan<'scope>(
                 size,
                 largest_files,
                 subdirs: Vec::new(),
+                inaccessible,
             },
             top_file_limit,
         );
@@ -176,7 +185,14 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
         )
     };
     if fd < 0 {
-        return DirectoryScan::default();
+        // EACCES/EPERM means real data was skipped (no Full Disk Access, ACLs);
+        // ENOENT is just a deletion race during the walk and stays silent.
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        let inaccessible = u32::from(matches!(errno, Some(libc::EACCES) | Some(libc::EPERM)));
+        return DirectoryScan {
+            inaccessible,
+            ..DirectoryScan::default()
+        };
     }
 
     let mut attrlist = Attrlist {
@@ -502,6 +518,31 @@ mod tests {
         assert_eq!(scan.largest_files[0].size.logical, 4096 * 8);
         assert_eq!(scan.largest_files[1].path, root.join("a/b/medium.bin"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_subdir_is_counted_and_rest_still_sums() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePerms(PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+                let _ = fs::remove_dir_all(self.0.parent().unwrap());
+            }
+        }
+
+        let root = test_root("bulkstat_perm");
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(root.join("readable.txt"), b"0123456789").unwrap(); // 10
+        fs::write(locked.join("hidden.bin"), vec![0u8; 4096]).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = RestorePerms(locked.clone());
+
+        let scan = scan_dir(&root, 0);
+        assert_eq!(scan.inaccessible, 1, "locked dir should be counted");
+        assert_eq!(scan.size.logical, 10, "readable part should still sum");
     }
 
     #[test]

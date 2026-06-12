@@ -71,7 +71,7 @@ diskr --thin-snapshots 10G --yes ~ # execute it
 | Space | Quick Look selected item |
 | f | Reveal selected item in Finder |
 | O | Open selected item with the default app |
-| r | Refresh the current view and rescan a nearby batch of directory sizes |
+| r | Refresh the current view and rescan all visible directory sizes |
 | o | Cycle sort mode |
 | . | Toggle hidden files |
 | d | Move selected item to Trash |

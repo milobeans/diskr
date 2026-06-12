@@ -10,9 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bulkstat::{self, DirScan, SizeInfo};
-use crate::{history, reclaim, space};
 use crate::packages::{self, DepGraph, ManagerReport, ProjectDeps};
 use crate::scanner::{ScanId, ScanMsg, Scanner};
+use crate::{history, reclaim, space};
 
 const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
 const AUTO_SCAN_LIMIT: usize = 4;
@@ -36,8 +36,6 @@ pub enum SortMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     None,
-    Search,
-    PkgSearch,
     Rename,
     Mkdir,
 }
@@ -46,7 +44,7 @@ impl SortMode {
     pub fn label(self) -> &'static str {
         match self {
             SortMode::Name => "name",
-            SortMode::SizeDesc => "size↓",
+            SortMode::SizeDesc => "size ↓",
             SortMode::Modified => "mtime",
         }
     }
@@ -66,7 +64,8 @@ pub struct Entry {
     pub is_dir: bool,
     pub is_symlink: bool,
     pub size: Option<SizeInfo>,
-    pub modified: Option<std::time::SystemTime>,
+    pub inaccessible: u32,
+    pub modified: Option<SystemTime>,
     pub scanning: bool,
 }
 
@@ -103,7 +102,6 @@ struct TopFilesMsg {
 
 struct DiskInfoMsg {
     scan_id: ScanId,
-    path: PathBuf,
     result: Result<space::SpaceReport, String>,
 }
 
@@ -157,6 +155,7 @@ pub struct App {
     pending_delete: Option<DeleteTarget>,
     marked: HashSet<PathBuf>,
     size_cache: HashMap<PathBuf, SizeInfo>,
+    inaccessible_cache: HashMap<PathBuf, u32>,
     entry_index: HashMap<PathBuf, usize>,
     cached_flat_packages: Vec<(packages::Package, packages::Manager)>,
     last_sort: Instant,
@@ -278,6 +277,7 @@ impl App {
             pending_delete: None,
             marked: HashSet::new(),
             size_cache: HashMap::new(),
+            inaccessible_cache: HashMap::new(),
             entry_index: HashMap::new(),
             cached_flat_packages: Vec::new(),
             last_sort: Instant::now(),
@@ -327,10 +327,7 @@ impl App {
     }
 
     pub fn refresh_history_state(&mut self) {
-        self.history_baseline = match history::load_record_for_path(&self.cwd) {
-            Ok(record) => record,
-            Err(_) => None,
-        };
+        self.history_baseline = history::load_record_for_path(&self.cwd).unwrap_or(None);
         self.history_diff = if self.history_baseline.is_some() {
             history::diff(&self.cwd).ok()
         } else {
@@ -352,9 +349,7 @@ impl App {
     pub fn history_delta_status(&self) -> Option<String> {
         let diff = self.history_diff.as_ref()?;
         let delta = diff.total_delta_allocated();
-        let bytes = delta
-            .unsigned_abs()
-            .min(u128::from(u64::MAX)) as u64;
+        let bytes = delta.unsigned_abs().min(u128::from(u64::MAX)) as u64;
         let delta_label = if delta > 0 {
             format!("+{}", human(bytes))
         } else if delta < 0 {
@@ -427,6 +422,7 @@ impl App {
                 })
             };
             let modified = meta.as_ref().and_then(|m| m.modified().ok());
+            let inaccessible = self.inaccessible_cache.get(&path).copied().unwrap_or(0);
             let name_lower = name.to_lowercase();
             let idx = self.entries.len();
             self.entry_index.insert(path.clone(), idx);
@@ -437,6 +433,7 @@ impl App {
                 is_dir,
                 is_symlink,
                 size,
+                inaccessible,
                 modified,
                 scanning: false,
             });
@@ -470,7 +467,9 @@ impl App {
     }
 
     fn apply_sort_preserving_selection(&mut self) {
-        let selected_path = self.visible_entry(self.selected).map(|entry| entry.path.clone());
+        let selected_path = self
+            .visible_entry(self.selected)
+            .map(|entry| entry.path.clone());
         let fallback_selected = self.selected.min(self.entries.len().saturating_sub(1));
         self.apply_sort();
         if let Some(path) = selected_path {
@@ -734,11 +733,18 @@ impl App {
                     scan_id,
                     path,
                     size,
+                    inaccessible,
                 } if scan_id == self.active_scan_id => {
                     self.size_cache.insert(path.clone(), size);
+                    if inaccessible > 0 {
+                        self.inaccessible_cache.insert(path.clone(), inaccessible);
+                    } else {
+                        self.inaccessible_cache.remove(&path);
+                    }
                     if let Some(&idx) = self.entry_index.get(&path) {
                         if let Some(e) = self.entries.get_mut(idx) {
                             e.size = Some(size);
+                            e.inaccessible = inaccessible;
                             e.scanning = false;
                             changed = true;
                         }
@@ -841,9 +847,9 @@ impl App {
                 self.reclaim_paths_open = false;
                 self.reclaim_paths_selected = 0;
                 self.reclaim_path_list_offset = 0;
-                self.selected_reclaim =
-                    self.selected_reclaim
-                        .min(self.reclaim_item_count().saturating_sub(1));
+                self.selected_reclaim = self
+                    .selected_reclaim
+                    .min(self.reclaim_item_count().saturating_sub(1));
                 self.status = String::from("reclaim scan complete");
                 true
             }
@@ -1041,7 +1047,9 @@ impl App {
         self.reclaim_paths_open = true;
         self.reclaim_paths_selected = 0;
         self.reclaim_path_list_offset = 0;
-        self.reclaim_paths_finding = self.selected_reclaim.min(self.reclaim_item_count().saturating_sub(1));
+        self.reclaim_paths_finding = self
+            .selected_reclaim
+            .min(self.reclaim_item_count().saturating_sub(1));
         let label = self
             .reclaim_report
             .as_ref()
@@ -1176,14 +1184,9 @@ impl App {
 
         thread::spawn(move || {
             let result = space::report_for_path(&path).map_err(|e| e.to_string());
-            let _ = tx.send(DiskInfoMsg {
-                scan_id,
-                path,
-                result,
-            });
+            let _ = tx.send(DiskInfoMsg { scan_id, result });
         });
     }
-
 
     pub fn has_pending_scan_work(&self) -> bool {
         self.sort_dirty
@@ -1198,6 +1201,10 @@ impl App {
 
     pub fn request_delete(&mut self) {
         if self.confirming_delete {
+            return;
+        }
+        if self.focus == Focus::Files && !self.marked.is_empty() {
+            self.request_batch_delete();
             return;
         }
         match self.focus {
@@ -1293,16 +1300,17 @@ impl App {
                         Err(e) => self.status = format!("delete failed: {e}"),
                     }
                 }
-                DeleteTarget::TopFile { name, path } => match crate::fs_ops::delete_to_trash(&path) {
-                        Ok(()) => {
-                            self.status = format!("moved to trash: {name}");
-                            self.invalidate_cache_for(&path);
-                            self.refresh_disks();
-                            if let Some(path) = top_files_path {
-                                self.open_top_files_for_path(path);
-                            }
-                            self.refresh_history_state();
+                DeleteTarget::TopFile { name, path } => match crate::fs_ops::delete_to_trash(&path)
+                {
+                    Ok(()) => {
+                        self.status = format!("moved to trash: {name}");
+                        self.invalidate_cache_for(&path);
+                        self.refresh_disks();
+                        if let Some(path) = top_files_path {
+                            self.open_top_files_for_path(path);
                         }
+                        self.refresh_history_state();
+                    }
                     Err(e) => self.status = format!("delete failed: {e}"),
                 },
                 DeleteTarget::ReclaimPath {
@@ -1310,14 +1318,15 @@ impl App {
                     name,
                     path,
                 } => match crate::fs_ops::delete_to_trash(&path) {
-                        Ok(()) => {
-                            self.status = format!("moved to trash: {name}");
-                            self.invalidate_cache_for(&path);
-                            self.refresh_disks();
-                            self.rescan_reclaim_finding(finding_index);
-                            self.selected_reclaim = finding_index.min(self.reclaim_item_count().saturating_sub(1));
-                            self.refresh_history_state();
-                        }
+                    Ok(()) => {
+                        self.status = format!("moved to trash: {name}");
+                        self.invalidate_cache_for(&path);
+                        self.refresh_disks();
+                        self.rescan_reclaim_finding(finding_index);
+                        self.selected_reclaim =
+                            finding_index.min(self.reclaim_item_count().saturating_sub(1));
+                        self.refresh_history_state();
+                    }
                     Err(e) => {
                         self.status = format!("delete failed: {e}");
                     }
@@ -1327,17 +1336,17 @@ impl App {
                     path,
                     is_project_dep,
                 } => match crate::fs_ops::delete_to_trash(&path) {
-                        Ok(()) => {
-                            self.status = format!("moved to trash: {name}");
-                            self.invalidate_cache_for(&path);
-                            self.refresh_disks();
-                            if is_project_dep {
-                                self.reload_project_deps();
-                            } else {
-                                self.refresh_packages();
-                            }
-                            self.refresh_history_state();
+                    Ok(()) => {
+                        self.status = format!("moved to trash: {name}");
+                        self.invalidate_cache_for(&path);
+                        self.refresh_disks();
+                        if is_project_dep {
+                            self.reload_project_deps();
+                        } else {
+                            self.refresh_packages();
                         }
+                        self.refresh_history_state();
+                    }
                     Err(e) => self.status = format!("delete failed: {e}"),
                 },
                 DeleteTarget::Batch => {
@@ -1357,7 +1366,12 @@ impl App {
                     if failures.is_empty() {
                         self.status = String::from("moved marked items to trash");
                     } else {
-                        let names: Vec<String> = failures.iter().filter_map(|(p, _)| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
+                        let names: Vec<String> = failures
+                            .iter()
+                            .filter_map(|(p, _)| {
+                                p.file_name().map(|n| n.to_string_lossy().into_owned())
+                            })
+                            .collect();
                         self.status = format!("some items failed: {}", names.join(", "));
                     }
                 }
@@ -1381,9 +1395,11 @@ impl App {
     /// ancestor's cached size are now stale.
     fn invalidate_cache_for(&mut self, path: &Path) {
         self.size_cache.remove(path);
+        self.inaccessible_cache.remove(path);
         let mut p = path.parent();
         while let Some(parent) = p {
             self.size_cache.remove(parent);
+            self.inaccessible_cache.remove(parent);
             p = parent.parent();
         }
     }
@@ -1507,7 +1523,7 @@ impl App {
                 None => return false,
             };
 
-            match recv {
+            return match recv {
                 Ok(msg) => {
                     if msg.scan_id != self.active_pkg_scan_id {
                         continue;
@@ -1539,16 +1555,16 @@ impl App {
                             self.project_deps.len()
                         );
                     }
-                    return true;
+                    true
                 }
-                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Empty) => false,
                 Err(TryRecvError::Disconnected) => {
                     self.packages_loading = false;
                     self.pkg_scan_rx = None;
                     self.status = String::from("package scan failed");
-                    return true;
+                    true
                 }
-            }
+            };
         }
     }
 
@@ -1933,7 +1949,13 @@ impl App {
         self.file_list_offset = 0;
     }
 
-    fn enter_input_mode(&mut self, mode: InputMode, prompt: &str, initial: &str, action: InputAction) {
+    fn enter_input_mode(
+        &mut self,
+        mode: InputMode,
+        prompt: &str,
+        initial: &str,
+        action: InputAction,
+    ) {
         self.input_mode = mode;
         self.input_prompt = prompt.to_string();
         self.input_buffer = initial.to_string();
@@ -1981,7 +2003,11 @@ impl App {
                     }
                     match std::fs::rename(&old_path, &new_path) {
                         Ok(()) => {
-                            self.status = format!("renamed: {} → {}", old_path.file_name().unwrap().to_string_lossy(), new_name);
+                            self.status = format!(
+                                "renamed: {} → {}",
+                                old_path.file_name().unwrap().to_string_lossy(),
+                                new_name
+                            );
                             self.invalidate_cache_for(&old_path);
                             self.invalidate_cache_for(&new_path);
                             self.reload()?;
@@ -2014,7 +2040,8 @@ impl App {
                         Ok(()) => {
                             self.status = format!("created directory: {}", new_name);
                             self.reload()?;
-                            if let Some(idx) = self.entries.iter().position(|e| e.path == new_path) {
+                            if let Some(idx) = self.entries.iter().position(|e| e.path == new_path)
+                            {
                                 self.selected = idx;
                             }
                             self.refresh_history_state();
@@ -2038,7 +2065,12 @@ impl App {
             if let Some(entry) = self.entries.get(entry_idx).cloned() {
                 let name = entry.name.clone();
                 let path = entry.path.clone();
-                self.enter_input_mode(InputMode::Rename, "Rename:", &name, InputAction::Rename(path));
+                self.enter_input_mode(
+                    InputMode::Rename,
+                    "Rename:",
+                    &name,
+                    InputAction::Rename(path),
+                );
             }
         }
     }
@@ -2047,7 +2079,12 @@ impl App {
         if self.confirming_delete {
             return;
         }
-        self.enter_input_mode(InputMode::Mkdir, "New directory:", "", InputAction::Mkdir(self.cwd.clone()));
+        self.enter_input_mode(
+            InputMode::Mkdir,
+            "New directory:",
+            "",
+            InputAction::Mkdir(self.cwd.clone()),
+        );
     }
 
     pub fn toggle_mark(&mut self) {
@@ -2081,12 +2118,6 @@ impl App {
         self.status = format!("marked all {} visible entries", count);
     }
 
-    pub fn clear_marks(&mut self) {
-        let count = self.marked.len();
-        self.marked.clear();
-        self.status = format!("cleared {} marks", count);
-    }
-
     pub fn request_batch_delete(&mut self) {
         if self.confirming_delete {
             return;
@@ -2095,7 +2126,12 @@ impl App {
             self.status = String::from("nothing marked for deletion");
             return;
         }
-        let total_size: u64 = self.marked.iter().filter_map(|p| self.size_cache.get(p)).map(|s| s.allocated).sum();
+        let total_size: u64 = self
+            .marked
+            .iter()
+            .filter_map(|p| self.size_cache.get(p))
+            .map(|s| s.allocated)
+            .sum();
         let size_str = if total_size > 0 {
             format!(" ({})", human(total_size))
         } else {
@@ -2219,10 +2255,7 @@ fn format_localtime(modified: SystemTime) -> Option<String> {
     const DAY: u64 = 24 * HOUR;
     const RELATIVE_THRESHOLD: u64 = 30 * DAY;
 
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs();
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     let target_secs = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
     if now_secs >= target_secs {
         let age = now_secs.saturating_sub(target_secs);
@@ -2274,7 +2307,7 @@ fn disk_info() -> Vec<DiskInfo> {
     }
 
     let mut stats = Vec::<libc::statfs>::with_capacity(count as usize);
-    let bytes = (stats.capacity() * std::mem::size_of::<libc::statfs>()) as libc::c_int;
+    let bytes = (stats.capacity() * size_of::<libc::statfs>()) as libc::c_int;
     let actual = unsafe { libc::getfsstat(stats.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
     if actual <= 0 {
         return Vec::new();
@@ -2524,7 +2557,7 @@ mod tests {
                 packages::Manager::BrewCask,
             ),
         ];
-        app.dep_graph = Some(packages::DepGraph::from_entries(vec![
+        app.dep_graph = Some(DepGraph::from_entries(vec![
             (
                 packages::Manager::Brew,
                 "leaf",
@@ -2636,7 +2669,11 @@ mod tests {
         assert!(app.entries.iter().any(|entry| entry.name == "b.txt"));
         assert_eq!(app.entries[app.selected].path, selected_before);
 
-        let scanning_dirs_count = app.entries.iter().filter(|entry| entry.is_dir && entry.scanning).count();
+        let scanning_dirs_count = app
+            .entries
+            .iter()
+            .filter(|entry| entry.is_dir && entry.scanning)
+            .count();
         assert_eq!(scanning_dirs_count, 6);
 
         fs::remove_dir_all(root).unwrap();
@@ -2876,8 +2913,8 @@ mod tests {
     }
 
     fn test_root(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("diskr_app_{name}_{}_{}", std::process::id(), nanos))

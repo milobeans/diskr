@@ -717,10 +717,10 @@ fn scan_cargo() -> Vec<Package> {
     let mut current_bins: Vec<String> = Vec::new();
 
     let flush = |name: &str,
-                     version: &str,
-                     bins: &mut Vec<String>,
-                     packages: &mut Vec<Package>,
-                     cargo_bin: &Option<PathBuf>| {
+                 version: &str,
+                 bins: &mut Vec<String>,
+                 packages: &mut Vec<Package>,
+                 cargo_bin: &Option<PathBuf>| {
         if name.is_empty() {
             return;
         }
@@ -738,7 +738,7 @@ fn scan_cargo() -> Vec<Package> {
                 if path.is_none() {
                     path = Some(bin_path.clone());
                 }
-                if let Some(meta) = std::fs::symlink_metadata(&bin_path).ok() {
+                if let Ok(meta) = std::fs::symlink_metadata(&bin_path) {
                     size.logical = size.logical.saturating_add(meta.len());
                     size.allocated = size
                         .allocated
@@ -1160,7 +1160,10 @@ fn pip_command() -> Option<PipCommand> {
     None
 }
 
-fn find_pip_package_size_and_path(site_packages: &Path, package: &str) -> (Option<SizeInfo>, Option<PathBuf>) {
+fn find_pip_package_size_and_path(
+    site_packages: &Path,
+    package: &str,
+) -> (Option<SizeInfo>, Option<PathBuf>) {
     let Some(dist_info_path) = find_pip_dist_info(site_packages, package) else {
         return (None, infer_pip_package_dir(site_packages, package));
     };
@@ -1199,9 +1202,7 @@ fn find_pip_dist_info(site_packages: &Path, package: &str) -> Option<PathBuf> {
         let prefix = &name[..name.len() - ".dist-info".len()];
         let normalized = normalize_dist_name(prefix);
         let exact = normalized == needle;
-        let versioned = normalized
-            .strip_prefix(&(needle.clone() + "-"))
-            .is_some();
+        let versioned = normalized.strip_prefix(&(needle.clone() + "-")).is_some();
         if exact || versioned {
             return Some(entry.path());
         }
@@ -1408,7 +1409,10 @@ mod tests {
     fn normalizes_pip_distribution_names() {
         assert_eq!(normalize_dist_name("PyYAML"), "pyyaml");
         assert_eq!(normalize_dist_name("ruff"), "ruff");
-        assert_eq!(normalize_dist_name("typing_extensions"), "typing-extensions");
+        assert_eq!(
+            normalize_dist_name("typing_extensions"),
+            "typing-extensions"
+        );
     }
 
     #[test]
@@ -1444,7 +1448,11 @@ mod tests {
         let dist_info = root.join("requests-2.32.0.dist-info");
         std::fs::create_dir_all(&dist_info).unwrap();
         std::fs::create_dir_all(root.join("requests")).unwrap();
-        std::fs::write(root.join("requests").join("__init__.py"), b"print('requests')").unwrap();
+        std::fs::write(
+            root.join("requests").join("__init__.py"),
+            b"print('requests')",
+        )
+        .unwrap();
         std::fs::write(
             dist_info.join("RECORD"),
             "requests/__init__.py,sha256=abc,13\n\
@@ -1556,7 +1564,10 @@ mod tests {
 
         let pdf = packages.iter().find(|p| p.name == "pdfextractor").unwrap();
         assert_eq!(pdf.version, "1.5");
-        assert_eq!(pdf.path.as_ref().unwrap(), &temp_caskroom.join("pdfextractor"));
+        assert_eq!(
+            pdf.path.as_ref().unwrap(),
+            &temp_caskroom.join("pdfextractor")
+        );
 
         let pkgs = packages.iter().find(|p| p.name == "packages").unwrap();
         assert_eq!(pkgs.version, "1.2.10 (installer-based)");

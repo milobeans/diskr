@@ -200,6 +200,8 @@ pub struct Finding {
     pub class: Reclaimability,
     pub note: String,
     pub size: SizeInfo,
+    /// Permission-denied directories encountered while sizing this finding.
+    pub inaccessible: u32,
     /// Number of directories rolled into this finding (1 for fixed locations).
     pub count: usize,
     pub paths: Vec<PathBuf>,
@@ -210,6 +212,7 @@ pub struct ReclaimReport {
     pub root: PathBuf,
     pub findings: Vec<Finding>,
     pub total: SizeInfo,
+    pub inaccessible: u32,
 }
 
 /// Scan for reclaimable space under `root`, resolving fixed caches against `$HOME`.
@@ -238,15 +241,18 @@ pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
     });
 
     let mut total = SizeInfo::default();
+    let mut inaccessible = 0u32;
     for finding in &findings {
         total.logical = total.logical.saturating_add(finding.size.logical);
         total.allocated = total.allocated.saturating_add(finding.size.allocated);
+        inaccessible = inaccessible.saturating_add(finding.inaccessible);
     }
 
     ReclaimReport {
         root,
         findings,
         total,
+        inaccessible,
     }
 }
 
@@ -255,15 +261,17 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<Finding> {
         .iter()
         .filter_map(|category| {
             let mut size = SizeInfo::default();
+            let mut inaccessible = 0u32;
             let mut paths = Vec::new();
             for rel in category.paths {
                 let candidate = home.join(rel);
                 if !candidate.starts_with(root) || !candidate.is_dir() {
                     continue;
                 }
-                let scanned = bulkstat::scan_dir(&candidate, 0).size;
-                size.logical = size.logical.saturating_add(scanned.logical);
-                size.allocated = size.allocated.saturating_add(scanned.allocated);
+                let scanned = bulkstat::scan_dir(&candidate, 0);
+                size.logical = size.logical.saturating_add(scanned.size.logical);
+                size.allocated = size.allocated.saturating_add(scanned.size.allocated);
+                inaccessible = inaccessible.saturating_add(scanned.inaccessible);
                 paths.push(candidate);
             }
             if paths.is_empty() {
@@ -274,6 +282,7 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<Finding> {
                 class: category.class,
                 note: category.note.to_string(),
                 size,
+                inaccessible,
                 count: paths.len(),
                 paths,
             })
@@ -288,11 +297,13 @@ fn artifact_findings(root: &Path) -> Vec<Finding> {
         .iter()
         .filter_map(|(name, class, note)| {
             let mut size = SizeInfo::default();
+            let mut inaccessible = 0u32;
             let mut paths = Vec::new();
             for path in hits.iter().filter(|(hit_name, _)| hit_name == name) {
-                let scanned = bulkstat::scan_dir(&path.1, 0).size;
-                size.logical = size.logical.saturating_add(scanned.logical);
-                size.allocated = size.allocated.saturating_add(scanned.allocated);
+                let scanned = bulkstat::scan_dir(&path.1, 0);
+                size.logical = size.logical.saturating_add(scanned.size.logical);
+                size.allocated = size.allocated.saturating_add(scanned.size.allocated);
+                inaccessible = inaccessible.saturating_add(scanned.inaccessible);
                 paths.push(path.1.clone());
             }
             if paths.is_empty() {
@@ -303,6 +314,7 @@ fn artifact_findings(root: &Path) -> Vec<Finding> {
                 class: *class,
                 note: (*note).to_string(),
                 size,
+                inaccessible,
                 count: paths.len(),
                 paths,
             })

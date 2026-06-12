@@ -14,6 +14,8 @@ pub enum ScanMsg {
         scan_id: ScanId,
         path: PathBuf,
         size: SizeInfo,
+        /// Permission-denied directories under `path`; size is a lower bound when > 0.
+        inaccessible: u32,
     },
     AllDone {
         scan_id: ScanId,
@@ -50,11 +52,12 @@ impl Scanner {
                             let Some(dir) = dirs.get(index).cloned() else {
                                 break;
                             };
-                            let size = bulkstat::scan_dir(&dir, 0).size;
+                            let scan = bulkstat::scan_dir(&dir, 0);
                             let _ = tx.send(ScanMsg::DirSize {
                                 scan_id,
                                 path: dir,
-                                size,
+                                size: scan.size,
+                                inaccessible: scan.inaccessible,
                             });
                         });
                     }
