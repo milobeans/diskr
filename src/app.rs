@@ -3658,11 +3658,29 @@ mod tests {
         assert_eq!(app.pkg_visible_indices(), &[0, 1]);
 
         app.toggle_unused_filter();
-        assert_eq!(app.pkg_visible_indices(), &[0]);
+        let visible_names: Vec<&str> = app
+            .pkg_visible_indices()
+            .iter()
+            .filter_map(|&idx| {
+                app.flat_packages()
+                    .get(idx)
+                    .map(|(pkg, _)| pkg.name.as_str())
+            })
+            .collect();
+        assert_eq!(visible_names, vec!["alpha"]);
 
         app.enter_pkg_search();
         app.pkg_search_push('a');
-        assert_eq!(app.pkg_visible_indices(), &[0]);
+        let searched_names: Vec<&str> = app
+            .pkg_visible_indices()
+            .iter()
+            .filter_map(|&idx| {
+                app.flat_packages()
+                    .get(idx)
+                    .map(|(pkg, _)| pkg.name.as_str())
+            })
+            .collect();
+        assert_eq!(searched_names, vec!["alpha"]);
 
         app.exit_pkg_search();
         app.project_deps = vec![
