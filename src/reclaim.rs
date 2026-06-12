@@ -207,6 +207,10 @@ pub struct Finding {
     /// Number of directories rolled into this finding (1 for fixed locations).
     pub count: usize,
     pub paths: Vec<PathBuf>,
+    /// True when this finding's paths are ancestors of one or more other findings'
+    /// paths, meaning its bytes are already counted inside those child findings.
+    /// Roll-up findings are shown for context but excluded from `report.total`.
+    pub rollup: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -244,10 +248,20 @@ pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
             .then(a.label.cmp(&b.label))
     });
 
+    // Mark a finding as a roll-up when at least one of its paths is a strict
+    // prefix of a path in another finding.  This detects parent/child overlaps
+    // (e.g. "User caches" ⊇ "Homebrew cache") regardless of which categories
+    // are active — no hardcoding required.
+    mark_rollups(&mut findings);
+
     let mut total = SizeInfo::default();
     let mut inaccessible = 0u32;
     let mut skipped_mounts = 0u32;
     for finding in &findings {
+        if finding.rollup {
+            // Bytes already counted inside child findings; exclude from total.
+            continue;
+        }
         total.logical = total.logical.saturating_add(finding.size.logical);
         total.allocated = total.allocated.saturating_add(finding.size.allocated);
         inaccessible = inaccessible.saturating_add(finding.inaccessible);
@@ -261,6 +275,44 @@ pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
         inaccessible,
         skipped_mounts,
     }
+}
+
+/// For every finding whose paths are a strict prefix of another finding's
+/// paths, set `rollup = true`.  A roll-up's bytes are already counted inside
+/// its child findings, so the total must exclude it to avoid double-counting.
+///
+/// Detection is purely structural: path A is a parent of path B when B starts
+/// with A as a complete component prefix (i.e. `B.starts_with(A)` and `A != B`
+/// in canonical `Path` terms).  No category names are hardcoded.
+fn mark_rollups(findings: &mut [Finding]) {
+    // Collect a flat list of all child paths for the containment check.
+    // Using indices avoids borrow conflicts when we mutate `findings`.
+    let path_sets: Vec<Vec<PathBuf>> = findings.iter().map(|f| f.paths.clone()).collect();
+
+    for i in 0..findings.len() {
+        // A finding is a roll-up when at least one of its paths is a strict
+        // ancestor of at least one path in a *different* finding.
+        let is_rollup = path_sets[i].iter().any(|parent_path| {
+            path_sets.iter().enumerate().any(|(j, other_paths)| {
+                j != i
+                    && other_paths
+                        .iter()
+                        .any(|child_path| is_strict_prefix(parent_path, child_path))
+            })
+        });
+        if is_rollup {
+            findings[i].rollup = true;
+        }
+    }
+}
+
+/// Returns true when `ancestor` is a strict path prefix of `descendant`
+/// (i.e. `descendant` is inside `ancestor`, not the same path).
+fn is_strict_prefix(ancestor: &Path, descendant: &Path) -> bool {
+    if ancestor == descendant {
+        return false;
+    }
+    descendant.starts_with(ancestor)
 }
 
 fn fixed_findings(root: &Path, home: &Path) -> Vec<Finding> {
@@ -295,6 +347,7 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<Finding> {
                 skipped_mounts,
                 count: paths.len(),
                 paths,
+                rollup: false,
             })
         })
         .collect()
@@ -330,6 +383,7 @@ fn artifact_findings(root: &Path) -> Vec<Finding> {
                 skipped_mounts,
                 count: paths.len(),
                 paths,
+                rollup: false,
             })
         })
         .collect()
@@ -499,6 +553,102 @@ mod tests {
         );
         assert_eq!(report.root, home.canonicalize().unwrap());
         fs::remove_dir_all(home).unwrap();
+    }
+
+    // --- issue #46: rollup / double-counting tests ---
+
+    /// Parent + child both present: the parent is marked rollup, and the
+    /// total equals only the child's bytes, not parent + child.
+    #[test]
+    fn parent_child_overlap_counts_bytes_once() {
+        let root = test_root("reclaim_overlap");
+        let _ = fs::remove_dir_all(&root);
+
+        // A file that lives under Library/Caches/Homebrew — counted by
+        // both "User caches" (parent) and "Homebrew cache" (child).
+        fs::create_dir_all(root.join("Library/Caches/Homebrew")).unwrap();
+        fs::write(
+            root.join("Library/Caches/Homebrew/bottle.bin"),
+            vec![0u8; 8192],
+        )
+        .unwrap();
+
+        let report = report_with_home(&root, Some(&root));
+
+        let user_caches = report
+            .findings
+            .iter()
+            .find(|f| f.label == "User caches")
+            .expect("User caches finding should be present");
+        let homebrew = report
+            .findings
+            .iter()
+            .find(|f| f.label == "Homebrew cache")
+            .expect("Homebrew cache finding should be present");
+
+        assert!(user_caches.rollup, "User caches should be marked rollup");
+        assert!(!homebrew.rollup, "Homebrew cache should NOT be rollup");
+
+        // The total must not exceed the child's size (it shouldn't count the
+        // parent's overlapping bytes on top).
+        assert!(
+            report.total.logical <= homebrew.size.logical,
+            "total ({}) must not exceed the disjoint child size ({})",
+            report.total.logical,
+            homebrew.size.logical,
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Only a non-overlapping cache is present; total equals its size and it
+    /// is NOT marked as a rollup.
+    #[test]
+    fn non_overlapping_finding_not_marked_rollup() {
+        let root = test_root("reclaim_no_overlap");
+        let _ = fs::remove_dir_all(&root);
+
+        // A file under Library/Caches/some-app — only "User caches" covers it.
+        fs::create_dir_all(root.join("Library/Caches/my-app")).unwrap();
+        fs::write(root.join("Library/Caches/my-app/data.bin"), vec![0u8; 4096]).unwrap();
+
+        let report = report_with_home(&root, Some(&root));
+
+        let user_caches = report
+            .findings
+            .iter()
+            .find(|f| f.label == "User caches")
+            .expect("User caches finding should be present");
+
+        // No child category matches, so it must not be a rollup.
+        assert!(
+            !user_caches.rollup,
+            "User caches with no child overlap should NOT be rollup"
+        );
+        assert!(
+            report.total.logical >= 4096,
+            "total should include the non-overlapping cache bytes"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// is_strict_prefix: sanity checks for the helper.
+    #[test]
+    fn is_strict_prefix_basic() {
+        use std::path::PathBuf;
+        let parent = PathBuf::from("/a/b");
+        let child = PathBuf::from("/a/b/c");
+        let sibling = PathBuf::from("/a/d");
+        let same = PathBuf::from("/a/b");
+
+        assert!(is_strict_prefix(&parent, &child));
+        assert!(!is_strict_prefix(&parent, &sibling));
+        assert!(!is_strict_prefix(&parent, &same), "same path is not strict");
+        assert!(
+            !is_strict_prefix(&child, &parent),
+            "child not prefix of parent"
+        );
     }
 
     fn test_root(name: &str) -> PathBuf {

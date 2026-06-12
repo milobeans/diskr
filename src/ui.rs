@@ -495,10 +495,16 @@ fn draw_reclaim_panel(f: &mut Frame, app: &App) {
                 class_style,
             ));
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                truncate(&finding.label, area.width.saturating_sub(52) as usize),
-                Style::default().fg(Color::White),
-            ));
+            // Roll-up rows are shown for context; their bytes are already
+            // counted inside child findings and excluded from the total.
+            let label_text = if finding.rollup {
+                let available = area.width.saturating_sub(52) as usize;
+                let base = truncate(&finding.label, available.saturating_sub(10));
+                format!("{base} [subtotal]")
+            } else {
+                truncate(&finding.label, area.width.saturating_sub(52) as usize)
+            };
+            spans.push(Span::styled(label_text, Style::default().fg(Color::White)));
             ListItem::new(Line::from(spans))
         })
         .collect();

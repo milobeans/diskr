@@ -444,6 +444,7 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
                     "allocated": finding.size.allocated,
                     "inaccessible": finding.inaccessible,
                     "skipped_mounts": finding.skipped_mounts,
+                    "rollup": finding.rollup,
                     "note": finding.note,
                     "paths": finding
                         .paths
@@ -493,12 +494,17 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
         } else {
             String::new()
         };
+        // Roll-up rows are shown for context but their bytes are already
+        // counted inside the child findings; mark them so readers are not
+        // misled into thinking they add to the total.
+        let rollup_suffix = if finding.rollup { " [subtotal]" } else { "" };
         println!(
-            "{:>22}  [{:^11}]  {}{}",
+            "{:>22}  [{:^11}]  {}{}{}",
             reclaim_size_label(finding),
             finding.class.label(),
             finding.label,
-            count
+            count,
+            rollup_suffix
         );
         println!("                          {}", finding.note);
     }
