@@ -2794,6 +2794,7 @@ impl App {
                     }
                     match std::fs::rename(&old_path, &new_path) {
                         Ok(()) => {
+                            let previous_index = self.selected;
                             self.status = format!(
                                 "renamed: {} → {}",
                                 old_path.file_name().unwrap().to_string_lossy(),
@@ -2801,7 +2802,7 @@ impl App {
                             );
                             self.invalidate_cache_for(&old_path);
                             self.invalidate_cache_for(&new_path);
-                            self.reload()?;
+                            self.reload_with_selection(Some(new_path), previous_index)?;
                             self.refresh_history_state();
                         }
                         Err(e) => {
@@ -4132,6 +4133,33 @@ mod tests {
 
         assert_eq!(app.cwd, root);
         assert_eq!(app.entries[app.selected].path, child);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_reload_selects_new_path_after_sorting() {
+        let root = test_root("rename_reselect");
+        let alpha = root.join("alpha");
+        let zeta = root.join("zeta");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&zeta).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == zeta)
+            .unwrap();
+
+        app.request_rename();
+        app.input_buffer = String::from("aardvark");
+        app.input_commit().unwrap();
+
+        assert_eq!(app.entries[app.selected].path, root.join("aardvark"));
+        assert_eq!(app.entries[app.selected].name, "aardvark");
 
         fs::remove_dir_all(root).unwrap();
     }

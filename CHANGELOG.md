@@ -9,6 +9,14 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+## [0.1.49] - 2026-06-12
+
+### Fixed
+
+- Rename keeps the cursor on the renamed entry after reloads in sorted views,
+  instead of falling back to the old row index; restored the missing
+  regression test. (#55)
+
 ## [0.1.48] - 2026-06-12
 
 ### Changed
