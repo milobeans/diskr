@@ -10,7 +10,10 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::bulkstat::{self, SizeInfo};
+use crate::{
+    bulkstat::{self, SizeInfo},
+    state,
+};
 
 /// One immediate child of a scanned directory, with its recursive size.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,15 +212,8 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn state_dir() -> PathBuf {
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("Library/Application Support/diskr")
-}
-
 fn history_file() -> PathBuf {
-    state_dir().join("history.json")
+    state::state_dir().join("history.json")
 }
 
 fn load_history() -> Result<serde_json::Map<String, serde_json::Value>> {
@@ -252,7 +248,7 @@ pub fn load_record_for_path(path: &Path) -> Result<Option<ScanRecord>> {
 }
 
 fn store_record(record: &ScanRecord) -> Result<()> {
-    let dir = state_dir();
+    let dir = state::state_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let mut history = load_history()?;
     history.insert(

@@ -56,6 +56,13 @@ impl Manager {
         Manager::Bun,
     ];
 
+    pub fn is_global_leaf_manager(self) -> bool {
+        matches!(
+            self,
+            Manager::BrewCask | Manager::Npm | Manager::Cargo | Manager::Bun
+        )
+    }
+
     pub fn uninstall_args(self, name: &str) -> (&'static str, Vec<String>) {
         match self {
             Manager::Brew => ("brew", vec!["uninstall".into(), name.into()]),
@@ -242,12 +249,7 @@ pub fn scan_dep_graph(reports: &[ManagerReport]) -> DepGraph {
             continue;
         }
         for pkg in &report.packages {
-            let info = match report.manager {
-                Manager::Brew => brew_deps.get(&pkg.name).cloned().unwrap_or_default(),
-                Manager::BrewCask => DepInfo::default(),
-                Manager::Pip => pip_deps.get(&pkg.name).cloned().unwrap_or_default(),
-                _ => DepInfo::default(),
-            };
+            let info = package_dep_info(report.manager, &pkg.name, &brew_deps, &pip_deps);
             graph
                 .entries
                 .insert((report.manager, pkg.name.clone()), info);
@@ -255,6 +257,21 @@ pub fn scan_dep_graph(reports: &[ManagerReport]) -> DepGraph {
     }
 
     graph
+}
+
+fn package_dep_info(
+    manager: Manager,
+    name: &str,
+    brew_deps: &HashMap<String, DepInfo>,
+    pip_deps: &HashMap<String, DepInfo>,
+) -> DepInfo {
+    match manager {
+        Manager::Brew => brew_deps.get(name).cloned().unwrap_or_default(),
+        Manager::Pip => pip_deps.get(name).cloned().unwrap_or_default(),
+        Manager::BrewCask | Manager::Npm | Manager::Cargo | Manager::Bun => {
+            DepInfo::tracked(Vec::new(), Vec::new())
+        }
+    }
 }
 
 fn scan_brew_dep_graph() -> HashMap<String, DepInfo> {
@@ -1502,6 +1519,25 @@ mod tests {
         assert_eq!(graph["requests"].dependents, vec!["my-tool"]);
         assert_eq!(graph["urllib3"].dependencies, Vec::<String>::new());
         assert_eq!(graph["urllib3"].dependents, vec!["requests"]);
+    }
+
+    #[test]
+    fn global_cli_managers_are_dependency_leaves() {
+        let brew_deps = HashMap::new();
+        let pip_deps = HashMap::new();
+
+        for manager in [
+            Manager::BrewCask,
+            Manager::Npm,
+            Manager::Cargo,
+            Manager::Bun,
+        ] {
+            let info = package_dep_info(manager, "tool", &brew_deps, &pip_deps);
+            assert_eq!(info.evidence, DepEvidence::ManagerGraph);
+            assert!(info.dependencies.is_empty());
+            assert!(info.dependents.is_empty());
+            assert!(manager.is_global_leaf_manager());
+        }
     }
 
     #[test]

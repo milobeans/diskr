@@ -223,10 +223,11 @@ pub fn report(root: &Path) -> ReclaimReport {
 
 /// Same as [`report`], but with an explicit home directory (used in tests).
 pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
-    let root = root.to_path_buf();
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let home = home.map(|home| home.canonicalize().unwrap_or_else(|_| home.to_path_buf()));
     let mut findings = Vec::new();
 
-    if let Some(home) = home {
+    if let Some(home) = home.as_deref() {
         findings.extend(fixed_findings(&root, home));
     }
     findings.extend(artifact_findings(&root));

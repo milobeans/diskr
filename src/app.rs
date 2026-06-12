@@ -12,11 +12,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::bulkstat::{self, DirScan, SizeInfo};
 use crate::packages::{self, DepGraph, ManagerReport, ProjectDeps};
 use crate::scanner::{ScanId, ScanMsg, Scanner};
-use crate::{history, reclaim, space};
+use crate::{history, reclaim, space, state};
 
 const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
+const SIZE_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 const AUTO_SCAN_LIMIT: usize = 4;
 const TOP_FILES_LIMIT: usize = 50;
+const TOP_FILES_PAGE_ROWS: i32 = 10;
+const RECLAIM_PATHS_PAGE_ROWS: i32 = 10;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -64,6 +67,8 @@ pub struct Entry {
     pub is_dir: bool,
     pub is_symlink: bool,
     pub size: Option<SizeInfo>,
+    pub size_stale: bool,
+    pub cached_at: Option<u64>,
     pub inaccessible: u32,
     pub modified: Option<SystemTime>,
     pub scanning: bool,
@@ -91,6 +96,7 @@ pub enum DeleteTarget {
 
 struct ReclaimMsg {
     scan_id: ScanId,
+    root: PathBuf,
     report: reclaim::ReclaimReport,
 }
 
@@ -156,6 +162,10 @@ pub struct App {
     marked: HashSet<PathBuf>,
     size_cache: HashMap<PathBuf, SizeInfo>,
     inaccessible_cache: HashMap<PathBuf, u32>,
+    cache_age: HashMap<PathBuf, u64>,
+    stale_size_cache: HashSet<PathBuf>,
+    size_cache_dirty: bool,
+    last_size_cache_save: Instant,
     entry_index: HashMap<PathBuf, usize>,
     cached_flat_packages: Vec<(packages::Package, packages::Manager)>,
     last_sort: Instant,
@@ -165,6 +175,7 @@ pub struct App {
     active_reclaim_scan_id: ScanId,
     reclaim_scan_rx: Option<Receiver<ReclaimMsg>>,
     pub reclaim_report: Option<reclaim::ReclaimReport>,
+    reclaim_cwd: Option<PathBuf>,
     pub reclaim_loading: bool,
     pub selected_reclaim: usize,
 
@@ -215,6 +226,7 @@ pub enum PkgView {
 
 struct PkgScanMsg {
     scan_id: ScanId,
+    cwd: PathBuf,
     reports: Vec<ManagerReport>,
     project_deps: Vec<ProjectDeps>,
     include_managers: bool,
@@ -241,6 +253,36 @@ impl PkgView {
 
 impl App {
     pub fn new(cwd: PathBuf) -> Result<Self> {
+        let (mut size_cache, mut inaccessible_cache, mut cache_age, mut stale_size_cache) = (
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashSet::new(),
+        );
+        let mut size_cache_dirty = false;
+        let cache_warning = match state::load_size_cache() {
+            Ok(mut entries) => {
+                if entries.len() > state::SIZE_CACHE_MAX_ENTRIES {
+                    entries.sort_by(|a, b| {
+                        b.scanned_at
+                            .cmp(&a.scanned_at)
+                            .then_with(|| a.path.cmp(&b.path))
+                    });
+                    entries.truncate(state::SIZE_CACHE_MAX_ENTRIES);
+                    size_cache_dirty = true;
+                }
+                for entry in entries {
+                    if entry.inaccessible > 0 {
+                        inaccessible_cache.insert(entry.path.clone(), entry.inaccessible);
+                    }
+                    cache_age.insert(entry.path.clone(), entry.scanned_at);
+                    stale_size_cache.insert(entry.path.clone());
+                    size_cache.insert(entry.path, entry.size);
+                }
+                None
+            }
+            Err(err) => Some(format!("size cache ignored: {err}")),
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App {
             cwd,
@@ -276,8 +318,12 @@ impl App {
             file_list_offset: 0,
             pending_delete: None,
             marked: HashSet::new(),
-            size_cache: HashMap::new(),
-            inaccessible_cache: HashMap::new(),
+            size_cache,
+            inaccessible_cache,
+            cache_age,
+            stale_size_cache,
+            size_cache_dirty,
+            last_size_cache_save: Instant::now(),
             entry_index: HashMap::new(),
             cached_flat_packages: Vec::new(),
             last_sort: Instant::now(),
@@ -286,6 +332,7 @@ impl App {
             active_reclaim_scan_id: 0,
             reclaim_scan_rx: None,
             reclaim_report: None,
+            reclaim_cwd: None,
             reclaim_loading: false,
             selected_reclaim: 0,
             reclaim_paths_open: false,
@@ -323,6 +370,9 @@ impl App {
         app.refresh_disks();
         app.reload()?;
         app.refresh_history_state();
+        if let Some(warning) = cache_warning {
+            app.status = warning;
+        }
         Ok(app)
     }
 
@@ -343,7 +393,7 @@ impl App {
             .map(|now| now.as_secs())
             .unwrap_or(0);
         let age = now_secs.saturating_sub(record.timestamp);
-        Some(format!("baseline saved {} ago", format_elapsed(age)))
+        Some(format!("baseline saved {}", format_elapsed(age)))
     }
 
     pub fn history_delta_status(&self) -> Option<String> {
@@ -423,6 +473,12 @@ impl App {
             };
             let modified = meta.as_ref().and_then(|m| m.modified().ok());
             let inaccessible = self.inaccessible_cache.get(&path).copied().unwrap_or(0);
+            let size_stale = is_dir && self.stale_size_cache.contains(&path);
+            let cached_at = if is_dir {
+                self.cache_age.get(&path).copied()
+            } else {
+                None
+            };
             let name_lower = name.to_lowercase();
             let idx = self.entries.len();
             self.entry_index.insert(path.clone(), idx);
@@ -433,6 +489,8 @@ impl App {
                 is_dir,
                 is_symlink,
                 size,
+                size_stale,
+                cached_at,
                 inaccessible,
                 modified,
                 scanning: false,
@@ -622,13 +680,13 @@ impl App {
         match self.focus {
             Focus::Files => {
                 if let Some(entry_idx) = self.visible_entry_index(self.selected) {
-                        if let Some(entry) = self.entries.get(entry_idx).cloned() {
-                            if entry.is_dir {
-                                self.exit_search();
-                                self.cwd = entry.path;
-                                self.selected = 0;
-                                self.reload()?;
-                                self.refresh_history_state();
+                    if let Some(entry) = self.entries.get(entry_idx).cloned() {
+                        if entry.is_dir {
+                            self.exit_search();
+                            self.cwd = entry.path;
+                            self.selected = 0;
+                            self.reload()?;
+                            self.refresh_history_state();
                         }
                     }
                 }
@@ -699,8 +757,14 @@ impl App {
             .get(self.selected)
             .map(|entry| entry.path.clone());
         let previous_index = self.selected;
-        for e in self.entries.iter().filter(|e| e.is_dir) {
-            self.size_cache.remove(&e.path);
+        let cached_dirs: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_dir)
+            .map(|e| e.path.clone())
+            .collect();
+        for path in cached_dirs {
+            self.remove_cached_size(&path);
         }
         self.refresh_disks();
         if self.rebuild_entries().is_err() {
@@ -709,6 +773,8 @@ impl App {
         self.restore_selection(previous_selected, previous_index);
         for e in self.entries.iter_mut().filter(|entry| entry.is_dir) {
             e.size = None;
+            e.size_stale = false;
+            e.cached_at = None;
         }
         let missing: Vec<PathBuf> = self
             .entries
@@ -764,15 +830,13 @@ impl App {
                     size,
                     inaccessible,
                 } if scan_id == self.active_scan_id => {
-                    self.size_cache.insert(path.clone(), size);
-                    if inaccessible > 0 {
-                        self.inaccessible_cache.insert(path.clone(), inaccessible);
-                    } else {
-                        self.inaccessible_cache.remove(&path);
-                    }
+                    let scanned_at = now_secs();
+                    self.record_cached_size(path.clone(), size, inaccessible, scanned_at, false);
                     if let Some(&idx) = self.entry_index.get(&path) {
                         if let Some(e) = self.entries.get_mut(idx) {
                             e.size = Some(size);
+                            e.size_stale = false;
+                            e.cached_at = Some(scanned_at);
                             e.inaccessible = inaccessible;
                             e.scanning = false;
                             changed = true;
@@ -807,6 +871,16 @@ impl App {
         if self.sort_dirty && self.last_sort.elapsed() >= SORT_DEBOUNCE {
             self.apply_sort_preserving_selection();
             changed = true;
+        }
+        if self.size_cache_dirty && self.last_size_cache_save.elapsed() >= SIZE_CACHE_SAVE_INTERVAL
+        {
+            match self.save_size_cache() {
+                Ok(()) => changed = true,
+                Err(err) => {
+                    self.status = format!("size cache save failed: {err}");
+                    changed = true;
+                }
+            }
         }
         changed |= self.drain_package_results();
         changed |= self.drain_dep_results();
@@ -872,9 +946,14 @@ impl App {
 
         match recv {
             Ok(msg) if msg.scan_id == self.active_reclaim_scan_id => {
-                self.reclaim_report = Some(msg.report);
                 self.reclaim_loading = false;
                 self.reclaim_scan_rx = None;
+                if msg.root != self.cwd {
+                    self.status = String::from("ignored stale reclaim scan");
+                    return true;
+                }
+                self.reclaim_report = Some(msg.report);
+                self.reclaim_cwd = Some(msg.root);
                 self.reclaim_paths_open = false;
                 self.reclaim_paths_selected = 0;
                 self.reclaim_path_list_offset = 0;
@@ -998,6 +1077,21 @@ impl App {
         self.reclaim_paths_selected = s.rem_euclid(n) as usize;
     }
 
+    pub fn page_reclaim_paths(&mut self, pages: i32) {
+        self.move_reclaim_paths(pages.saturating_mul(RECLAIM_PATHS_PAGE_ROWS));
+    }
+
+    pub fn reclaim_paths_window_bounds(&mut self, max_rows: usize) -> (usize, usize) {
+        let (offset, end) = modal_window_bounds(
+            self.reclaim_paths_selected,
+            self.reclaim_paths_count(),
+            self.reclaim_path_list_offset,
+            max_rows,
+        );
+        self.reclaim_path_list_offset = offset;
+        (offset, end)
+    }
+
     pub fn top_files_count(&self) -> usize {
         self.top_files_scan
             .as_ref()
@@ -1012,6 +1106,25 @@ impl App {
         }
         let s = self.top_files_selected as i32 + delta;
         self.top_files_selected = s.rem_euclid(n) as usize;
+    }
+
+    pub fn page_top_files(&mut self, pages: i32) {
+        self.move_top_files(pages.saturating_mul(TOP_FILES_PAGE_ROWS));
+    }
+
+    pub fn top_files_selected(&self) -> usize {
+        self.top_files_selected
+    }
+
+    pub fn top_files_window_bounds(&mut self, max_rows: usize) -> (usize, usize) {
+        let (offset, end) = modal_window_bounds(
+            self.top_files_selected,
+            self.top_files_count(),
+            self.top_files_offset,
+            max_rows,
+        );
+        self.top_files_offset = offset;
+        (offset, end)
     }
 
     pub fn selected_top_file_path(&self) -> Option<PathBuf> {
@@ -1040,7 +1153,11 @@ impl App {
     }
 
     pub fn open_reclaim_for_focus(&mut self) {
-        if self.reclaim_loading || self.reclaim_report.is_some() {
+        if self.reclaim_loading {
+            return;
+        }
+        if self.reclaim_report.is_some() && self.reclaim_cwd.as_deref() == Some(self.cwd.as_path())
+        {
             return;
         }
         self.request_reclaim_scan();
@@ -1061,12 +1178,22 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
 
         self.reclaim_loading = true;
+        self.reclaim_report = None;
+        self.reclaim_cwd = Some(cwd.clone());
+        self.selected_reclaim = 0;
+        self.reclaim_paths_open = false;
+        self.reclaim_paths_selected = 0;
+        self.reclaim_path_list_offset = 0;
         self.reclaim_scan_rx = Some(rx);
         self.status = String::from("scanning reclaim recommendations…");
 
         thread::spawn(move || {
             let report = reclaim::report(&cwd);
-            let _ = tx.send(ReclaimMsg { scan_id, report });
+            let _ = tx.send(ReclaimMsg {
+                scan_id,
+                root: cwd,
+                report,
+            });
         });
     }
 
@@ -1422,15 +1549,90 @@ impl App {
         }
     }
 
+    pub fn save_size_cache(&mut self) -> Result<()> {
+        if !self.size_cache_dirty {
+            return Ok(());
+        }
+        let entries = self.size_cache_entries_for_store(now_secs());
+        state::store_size_cache(&entries)?;
+        self.size_cache_dirty = false;
+        self.last_size_cache_save = Instant::now();
+        Ok(())
+    }
+
+    fn size_cache_entries_for_store(&mut self, fallback_scanned_at: u64) -> Vec<state::CachedSize> {
+        let mut entries: Vec<state::CachedSize> = self
+            .size_cache
+            .iter()
+            .map(|(path, size)| state::CachedSize {
+                path: path.clone(),
+                size: *size,
+                inaccessible: self.inaccessible_cache.get(path).copied().unwrap_or(0),
+                scanned_at: self
+                    .cache_age
+                    .get(path)
+                    .copied()
+                    .unwrap_or(fallback_scanned_at),
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            b.scanned_at
+                .cmp(&a.scanned_at)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        if entries.len() > state::SIZE_CACHE_MAX_ENTRIES {
+            entries.truncate(state::SIZE_CACHE_MAX_ENTRIES);
+            let retained: HashSet<PathBuf> =
+                entries.iter().map(|entry| entry.path.clone()).collect();
+            self.size_cache.retain(|path, _| retained.contains(path));
+            self.inaccessible_cache
+                .retain(|path, _| retained.contains(path));
+            self.cache_age.retain(|path, _| retained.contains(path));
+            self.stale_size_cache.retain(|path| retained.contains(path));
+        }
+        entries
+    }
+
+    fn record_cached_size(
+        &mut self,
+        path: PathBuf,
+        size: SizeInfo,
+        inaccessible: u32,
+        scanned_at: u64,
+        stale: bool,
+    ) {
+        self.size_cache.insert(path.clone(), size);
+        if inaccessible > 0 {
+            self.inaccessible_cache.insert(path.clone(), inaccessible);
+        } else {
+            self.inaccessible_cache.remove(&path);
+        }
+        self.cache_age.insert(path.clone(), scanned_at);
+        if stale {
+            self.stale_size_cache.insert(path);
+        } else {
+            self.stale_size_cache.remove(&path);
+        }
+        self.size_cache_dirty = true;
+    }
+
+    fn remove_cached_size(&mut self, path: &Path) {
+        let mut removed = self.size_cache.remove(path).is_some();
+        removed |= self.inaccessible_cache.remove(path).is_some();
+        removed |= self.cache_age.remove(path).is_some();
+        removed |= self.stale_size_cache.remove(path);
+        if removed {
+            self.size_cache_dirty = true;
+        }
+    }
+
     /// When a path changes (deletion, write), its own cache entry and every
     /// ancestor's cached size are now stale.
     fn invalidate_cache_for(&mut self, path: &Path) {
-        self.size_cache.remove(path);
-        self.inaccessible_cache.remove(path);
+        self.remove_cached_size(path);
         let mut p = path.parent();
         while let Some(parent) = p {
-            self.size_cache.remove(parent);
-            self.inaccessible_cache.remove(parent);
+            self.remove_cached_size(parent);
             p = parent.parent();
         }
     }
@@ -1535,6 +1737,7 @@ impl App {
             let project_deps = packages::find_project_deps(&cwd, 5);
             let _ = tx.send(PkgScanMsg {
                 scan_id,
+                cwd,
                 reports,
                 project_deps,
                 include_managers,
@@ -1559,12 +1762,18 @@ impl App {
                     if msg.scan_id != self.active_pkg_scan_id {
                         continue;
                     }
+                    if msg.cwd != self.cwd {
+                        self.packages_loading = false;
+                        self.pkg_scan_rx = None;
+                        self.status = String::from("discarded stale package scan");
+                        return true;
+                    }
                     if msg.include_managers {
                         self.pkg_reports = msg.reports;
                         self.packages_loaded = true;
                     }
                     self.project_deps = msg.project_deps;
-                    self.project_deps_cwd = Some(self.cwd.clone());
+                    self.project_deps_cwd = Some(msg.cwd);
                     self.rebuild_flat_packages();
                     self.selected_pkg = self
                         .selected_pkg
@@ -2070,6 +2279,7 @@ impl App {
                     match std::fs::create_dir(&new_path) {
                         Ok(()) => {
                             self.status = format!("created directory: {}", new_name);
+                            self.invalidate_cache_for(&new_path);
                             self.reload()?;
                             if let Some(idx) = self.entries.iter().position(|e| e.path == new_path)
                             {
@@ -2232,6 +2442,26 @@ impl App {
     }
 }
 
+fn modal_window_bounds(
+    selected: usize,
+    count: usize,
+    mut offset: usize,
+    max_rows: usize,
+) -> (usize, usize) {
+    let max_rows = max_rows.max(1);
+    if count == 0 {
+        return (0, 0);
+    }
+    if selected < offset {
+        offset = selected;
+    } else if selected >= offset.saturating_add(max_rows) {
+        offset = selected + 1 - max_rows;
+    }
+    offset = offset.min(count.saturating_sub(1));
+    let end = offset.saturating_add(max_rows).min(count);
+    (offset, end)
+}
+
 fn limited_scan_status(action: &str, scanning: usize, total: usize) -> String {
     if scanning >= total {
         format!("{action}: {total} directories")
@@ -2256,6 +2486,13 @@ fn scan_path_label(path: &Path) -> String {
         .skip(char_count.saturating_sub(MAX_CHARS - 1))
         .collect();
     format!("…{tail}")
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn human(bytes: u64) -> String {
@@ -2581,7 +2818,7 @@ mod tests {
     }
 
     #[test]
-    fn dependency_leaf_filter_excludes_untracked_packages() {
+    fn dependency_leaf_filter_includes_global_leaf_managers() {
         let root = test_root("pkg_unused_filter");
         fs::create_dir_all(&root).unwrap();
 
@@ -2642,16 +2879,17 @@ mod tests {
                 packages::DepInfo {
                     dependencies: Vec::new(),
                     dependents: Vec::new(),
-                    evidence: packages::DepEvidence::Untracked,
+                    evidence: packages::DepEvidence::ManagerGraph,
                 },
             ),
         ]));
 
         app.toggle_unused_filter();
 
-        assert_eq!(app.pkg_item_count(), 1);
+        assert_eq!(app.pkg_item_count(), 2);
         assert_eq!(app.pkg_visible_index(0), Some(0));
-        assert_eq!(app.pkg_visible_index(1), None);
+        assert_eq!(app.pkg_visible_index(1), Some(2));
+        assert_eq!(app.pkg_visible_index(2), None);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2829,6 +3067,61 @@ mod tests {
 
         assert_eq!(scanning_count, AUTO_SCAN_LIMIT);
         assert!(app.status.contains("4/8 directories"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_size_cache_marks_directory_stale_until_fresh_scan() {
+        let root = test_root("stale_cache");
+        let cached = root.join("cached");
+        fs::create_dir_all(&cached).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.record_cached_size(cached.clone(), SizeInfo::new(10, 20), 1, 123, true);
+        app.rebuild_entries().unwrap();
+
+        let entry = app
+            .entries
+            .iter()
+            .find(|entry| entry.path == cached)
+            .unwrap();
+        assert_eq!(entry.size, Some(SizeInfo::new(10, 20)));
+        assert!(entry.size_stale);
+        assert_eq!(entry.cached_at, Some(123));
+        assert_eq!(entry.inaccessible, 1);
+
+        app.record_cached_size(cached.clone(), SizeInfo::new(30, 40), 0, 456, false);
+        app.rebuild_entries().unwrap();
+
+        let entry = app
+            .entries
+            .iter()
+            .find(|entry| entry.path == cached)
+            .unwrap();
+        assert_eq!(entry.size, Some(SizeInfo::new(30, 40)));
+        assert!(!entry.size_stale);
+        assert_eq!(entry.cached_at, Some(456));
+        assert_eq!(entry.inaccessible, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_invalidation_removes_persistent_metadata_for_ancestors() {
+        let root = test_root("cache_invalidation");
+        let cached = root.join("cached");
+        fs::create_dir_all(&cached).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.record_cached_size(cached.clone(), SizeInfo::new(10, 20), 2, 123, true);
+        app.invalidate_cache_for(&cached.join("child.txt"));
+
+        assert!(!app.size_cache.contains_key(&cached));
+        assert!(!app.inaccessible_cache.contains_key(&cached));
+        assert!(!app.cache_age.contains_key(&cached));
+        assert!(!app.stale_size_cache.contains(&cached));
+        assert!(app.size_cache_dirty);
+
         fs::remove_dir_all(root).unwrap();
     }
 

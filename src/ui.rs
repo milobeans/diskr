@@ -12,9 +12,11 @@ use ratatui_widgets::{
     list::{List, ListItem, ListState},
     paragraph::{Paragraph, Wrap},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{
-    format_modified_time, human, size_sort_key, App, Focus, InputMode, PkgView, SortMode,
+    format_elapsed, format_modified_time, human, size_sort_key, App, Focus, InputMode, PkgView,
+    SortMode,
 };
 use crate::bulkstat::SizeInfo;
 use crate::packages::{DepEvidence, PackageUseStatus};
@@ -117,7 +119,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         ),
     ];
     if let Some(baseline) = app.history_baseline_status() {
-        spans.push(Span::styled(baseline, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            format!(" · {baseline}"),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     if let Some(delta) = app.history_delta_status() {
         spans.push(Span::styled(
@@ -176,16 +181,32 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = visible_entries
         .into_iter()
         .map(|e| {
-            let size_str = match (e.is_dir, e.size, e.scanning) {
-                (true, _, true) => format!("{} scanning…", spinner_char()),
-                (true, Some(size), _) => {
-                    size_with_access_marker(size_sort_key(size), e.inaccessible)
+            let (size_str, size_style) = match (e.is_dir, e.size, e.scanning) {
+                (true, _, true) => (
+                    format!("{} scanning…", spinner_char()),
+                    Style::default().fg(Color::Cyan),
+                ),
+                (true, Some(size), _) => (
+                    size_with_markers(size_sort_key(size), e.inaccessible, e.size_stale),
+                    if e.size_stale {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default().fg(Color::Green)
+                    },
+                ),
+                (true, None, _) => (String::from("—"), Style::default().fg(Color::DarkGray)),
+                (false, Some(size), _) if e.is_symlink => (
+                    human(size_sort_key(size)),
+                    Style::default().fg(Color::Green),
+                ),
+                (false, None, _) if e.is_symlink => {
+                    (String::from("link"), Style::default().fg(Color::DarkGray))
                 }
-                (true, None, _) => String::from("—"),
-                (false, Some(size), _) if e.is_symlink => human(size_sort_key(size)),
-                (false, None, _) if e.is_symlink => String::from("link"),
-                (false, Some(size), _) => human(size_sort_key(size)),
-                (false, None, _) => String::from("?"),
+                (false, Some(size), _) => (
+                    human(size_sort_key(size)),
+                    Style::default().fg(Color::Green),
+                ),
+                (false, None, _) => (String::from("?"), Style::default().fg(Color::DarkGray)),
             };
             let icon = if e.is_dir {
                 "▸ "
@@ -220,10 +241,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
             );
             if size_width > 0 {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    format!("{size_str:>size_width$}"),
-                    Style::default().fg(Color::Green),
-                ));
+                spans.push(Span::styled(format!("{size_str:>size_width$}"), size_style));
             }
             if bar_width > 0 && !e.scanning {
                 spans.push(Span::raw("  "));
@@ -537,45 +555,11 @@ fn finding_count_label(count: usize) -> String {
     }
 }
 
-fn draw_reclaim_paths(f: &mut Frame, app: &App) {
+fn draw_reclaim_paths(f: &mut Frame, app: &mut App) {
     let area = centered_rect(68, 68, 72, 20, f.area());
     f.render_widget(Clear, area);
 
-    let finding = match app.selected_reclaim_finding() {
-        Some(finding) => finding,
-        None => return,
-    };
     let item_count = app.reclaim_paths_count();
-    let items: Vec<ListItem> = finding
-        .paths
-        .iter()
-        .enumerate()
-        .map(|(idx, path)| {
-            let prefix = if item_count == 0 {
-                String::new()
-            } else {
-                format!("{:>2}. ", idx + 1)
-            };
-            let mut spans = vec![
-                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    truncate(
-                        &path.display().to_string(),
-                        area.width.saturating_sub(8) as usize,
-                    ),
-                    Style::default().fg(Color::White),
-                ),
-            ];
-            if idx == app.reclaim_paths_selected() {
-                spans.push(Span::styled(
-                    "  (current)",
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-
     if item_count == 0 {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -586,6 +570,48 @@ fn draw_reclaim_paths(f: &mut Frame, app: &App) {
         f.render_widget(body, area);
         return;
     }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(2)])
+        .split(area);
+    let max_rows = chunks[0].height.saturating_sub(2).max(1) as usize;
+    let (offset, end) = app.reclaim_paths_window_bounds(max_rows);
+    let selected = app.reclaim_paths_selected();
+
+    let finding = match app.selected_reclaim_finding() {
+        Some(finding) => finding,
+        None => return,
+    };
+    let items: Vec<ListItem> = finding
+        .paths
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(end.saturating_sub(offset))
+        .map(|(idx, path)| {
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:>2}. ", idx + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    truncate(
+                        &path.display().to_string(),
+                        chunks[0].width.saturating_sub(8) as usize,
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+            ];
+            if idx == selected {
+                spans.push(Span::styled(
+                    "  (current)",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(format!(
@@ -601,14 +627,17 @@ fn draw_reclaim_paths(f: &mut Frame, app: &App) {
         )
         .highlight_symbol("▶ ");
     let mut state = ListState::default();
-    state.select(Some(
-        app.reclaim_paths_selected()
-            .min(item_count.saturating_sub(1)),
-    ));
-    f.render_stateful_widget(list, area, &mut state);
+    state.select(Some(selected.saturating_sub(offset)));
+    f.render_stateful_widget(list, chunks[0], &mut state);
+
+    let footer = Paragraph::new(vec![
+        Line::from(format!("{}-{} of {} paths", offset + 1, end, item_count)),
+        Line::from("f/enter: reveal  ·  d: trash  ·  esc: close"),
+    ]);
+    f.render_widget(footer, chunks[1]);
 }
 
-fn draw_top_files(f: &mut Frame, app: &App) {
+fn draw_top_files(f: &mut Frame, app: &mut App) {
     let area = centered_rect(70, 70, 74, 20, f.area());
     f.render_widget(Clear, area);
 
@@ -633,35 +662,45 @@ fn draw_top_files(f: &mut Frame, app: &App) {
         f.render_widget(body, area);
         return;
     }
-    let scan = match app.top_files_scan() {
-        Some(scan) => scan,
-        None => {
-            let block = Block::default().borders(Borders::ALL).title(" top files ");
-            let body = Paragraph::new("no scan in progress")
-                .block(block)
-                .alignment(Alignment::Center);
-            f.render_widget(body, area);
-            return;
-        }
-    };
-    if scan.largest_files.is_empty() {
+
+    let file_count = app.top_files_count();
+    if file_count == 0 {
+        let message = if app.top_files_scan().is_some() {
+            "no regular files found"
+        } else {
+            "no scan in progress"
+        };
         let block = Block::default().borders(Borders::ALL).title(" top files ");
-        let body = Paragraph::new("no regular files found")
+        let body = Paragraph::new(message)
             .block(block)
             .alignment(Alignment::Center);
         f.render_widget(body, area);
         return;
     }
 
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(2)])
+        .split(area);
+    let max_rows = chunks[0].height.saturating_sub(2).max(1) as usize;
+    let (offset, end) = app.top_files_window_bounds(max_rows);
+    let selected = app.top_files_selected();
+
     let title = app
         .top_files_path()
         .map(|path| format!(" top files · {} ", path.display()))
         .unwrap_or_else(|| String::from(" top files "));
 
+    let scan = match app.top_files_scan() {
+        Some(scan) => scan,
+        None => return,
+    };
     let items: Vec<ListItem> = scan
         .largest_files
         .iter()
         .enumerate()
+        .skip(offset)
+        .take(end.saturating_sub(offset))
         .map(|(idx, file)| {
             let mut spans = vec![
                 Span::styled(
@@ -671,7 +710,7 @@ fn draw_top_files(f: &mut Frame, app: &App) {
                 Span::styled(
                     truncate(
                         &file.path.display().to_string(),
-                        area.width.saturating_sub(34) as usize,
+                        chunks[0].width.saturating_sub(34) as usize,
                     ),
                     Style::default().fg(Color::White),
                 ),
@@ -708,11 +747,8 @@ fn draw_top_files(f: &mut Frame, app: &App) {
         )
         .highlight_symbol("▶ ");
     let mut state = ListState::default();
-    state.select(Some(
-        app.top_files_selected
-            .min(scan.largest_files.len().saturating_sub(1)),
-    ));
-    f.render_stateful_widget(list, area, &mut state);
+    state.select(Some(selected.saturating_sub(offset)));
+    f.render_stateful_widget(list, chunks[0], &mut state);
 
     let total = if scan.size.allocated == scan.size.logical {
         human(scan.size.allocated)
@@ -723,18 +759,17 @@ fn draw_top_files(f: &mut Frame, app: &App) {
             human(scan.size.logical)
         )
     };
-    let mut footer = vec![Line::from(Span::styled(
-        format!("total: {total}"),
-        Style::default().fg(Color::Green),
-    ))];
-    footer.push(Line::from("f/enter: reveal  ·  d: trash  ·  esc: close"));
-    let footer_area = Rect {
-        x: area.x + 1,
-        y: area.y + area.height.saturating_sub(2),
-        width: area.width.saturating_sub(2),
-        height: 1,
-    };
-    f.render_widget(Paragraph::new(footer), footer_area);
+    let footer = vec![
+        Line::from(vec![
+            Span::styled(format!("total: {total}"), Style::default().fg(Color::Green)),
+            Span::styled(
+                format!(" · {}-{} of {}", offset + 1, end, file_count),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from("f/enter: reveal  ·  d: trash  ·  esc: close"),
+    ];
+    f.render_widget(Paragraph::new(footer), chunks[1]);
 }
 
 fn draw_disk_info_modal(f: &mut Frame, app: &App) {
@@ -1394,40 +1429,54 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
 
     match dep_info {
         Some(info) if info.evidence == DepEvidence::ManagerGraph => {
-            let dep_text = if info.dependencies.is_empty() {
-                String::from("none")
+            if manager.is_global_leaf_manager()
+                && info.dependencies.is_empty()
+                && info.dependents.is_empty()
+            {
+                lines.push(Line::from(Span::styled(
+                    "  Usage: global install - no package-manager dependents",
+                    Style::default().fg(Color::Green),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  Treat as a leaf unless you use it manually or from scripts.",
+                    Style::default().fg(Color::Gray),
+                )));
             } else {
-                let max_len = area.width.saturating_sub(18) as usize;
-                let joined = info.dependencies.join(", ");
-                truncate(&joined, max_len)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  Dependencies ({}): ", info.dependencies.len()),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(dep_text, Style::default().fg(Color::White)),
-            ]));
+                let dep_text = if info.dependencies.is_empty() {
+                    String::from("none")
+                } else {
+                    let max_len = area.width.saturating_sub(18) as usize;
+                    let joined = info.dependencies.join(", ");
+                    truncate(&joined, max_len)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  Dependencies ({}): ", info.dependencies.len()),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(dep_text, Style::default().fg(Color::White)),
+                ]));
 
-            let rev_text = if info.dependents.is_empty() {
-                String::from("none in manager graph")
-            } else {
-                let max_len = area.width.saturating_sub(14) as usize;
-                let joined = info.dependents.join(", ");
-                truncate(&joined, max_len)
-            };
-            let rev_style = if info.dependents.is_empty() {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::Yellow)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  Used by ({}): ", info.dependents.len()),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(rev_text, rev_style),
-            ]));
+                let rev_text = if info.dependents.is_empty() {
+                    String::from("none in manager graph")
+                } else {
+                    let max_len = area.width.saturating_sub(14) as usize;
+                    let joined = info.dependents.join(", ");
+                    truncate(&joined, max_len)
+                };
+                let rev_style = if info.dependents.is_empty() {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  Used by ({}): ", info.dependents.len()),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(rev_text, rev_style),
+                ]));
+            }
         }
         Some(_) => {
             lines.push(Line::from(Span::styled(
@@ -1543,7 +1592,7 @@ fn truncate_start(s: &str, max: usize) -> String {
 fn selection_status(app: &App) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     match app.focus {
-        Focus::Files => match app.entries.get(app.selected) {
+        Focus::Files => match app.visible_entry(app.selected) {
             Some(entry) if entry.is_dir && entry.scanning => {
                 spans.push(Span::styled(
                     format!("{} ", spinner_char()),
@@ -1577,9 +1626,20 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                 spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
                 let size = entry
                     .size
-                    .map(size_detail)
+                    .map(|size| size_detail_with_cache_marker(size, entry.size_stale))
                     .unwrap_or_else(|| String::from("—"));
-                spans.push(Span::styled(size, Style::default().fg(Color::Green)));
+                let size_style = if entry.size_stale {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                spans.push(Span::styled(size, size_style));
+                if let Some(status) = stale_cache_status(entry) {
+                    spans.push(Span::styled(
+                        format!(" · {status}"),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
                 if entry.inaccessible > 0 {
                     spans.push(Span::styled(
                         format!(
@@ -1826,12 +1886,38 @@ fn size_detail(size: SizeInfo) -> String {
     )
 }
 
-fn size_with_access_marker(bytes: u64, inaccessible: u32) -> String {
-    if inaccessible > 0 {
-        format!("≥{}", human(bytes))
+fn size_detail_with_cache_marker(size: SizeInfo, stale: bool) -> String {
+    let detail = size_detail(size);
+    if stale {
+        format!("~{detail}")
     } else {
-        human(bytes)
+        detail
     }
+}
+
+fn size_with_markers(bytes: u64, inaccessible: u32, stale: bool) -> String {
+    let mut label = String::new();
+    if stale {
+        label.push('~');
+    }
+    if inaccessible > 0 {
+        label.push('≥');
+    }
+    label.push_str(&human(bytes));
+    label
+}
+
+fn stale_cache_status(entry: &crate::app::Entry) -> Option<String> {
+    if !entry.size_stale {
+        return None;
+    }
+    let scanned_at = entry.cached_at?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let age = now.saturating_sub(scanned_at);
+    Some(format!(
+        "cached {}; press r to refresh",
+        format_elapsed(age)
+    ))
 }
 
 fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize, usize) {

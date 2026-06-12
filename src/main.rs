@@ -6,6 +6,7 @@ mod packages;
 mod reclaim;
 mod scanner;
 mod space;
+mod state;
 mod terminal_backend;
 mod ui;
 
@@ -53,12 +54,7 @@ fn main() -> Result<()> {
 }
 
 fn run_app(start: PathBuf) -> Result<()> {
-    if !start.exists() {
-        bail!("path does not exist: {}", start.display());
-    }
-    if !start.is_dir() {
-        bail!("path is not a directory: {}", start.display());
-    }
+    let start = canonical_dir(start)?;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("diskr requires an interactive terminal");
     }
@@ -70,11 +66,24 @@ fn run_app(start: PathBuf) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let res = run(&mut terminal, &mut app);
+    let cache_res = app.save_size_cache();
     let cursor_res = terminal.show_cursor();
 
     res?;
+    cache_res?;
     cursor_res?;
     Ok(())
+}
+
+fn canonical_dir(path: PathBuf) -> Result<PathBuf> {
+    if !path.exists() {
+        bail!("path does not exist: {}", path.display());
+    }
+    if !path.is_dir() {
+        bail!("path is not a directory: {}", path.display());
+    }
+    path.canonicalize()
+        .with_context(|| format!("resolve {}", path.display()))
 }
 
 enum CliAction {
@@ -321,12 +330,7 @@ Keys:
 }
 
 fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
-    if !path.exists() {
-        bail!("path does not exist: {}", path.display());
-    }
-    if !path.is_dir() {
-        bail!("path is not a directory: {}", path.display());
-    }
+    let path = canonical_dir(path)?;
 
     let scan = bulkstat::scan_dir(&path, limit);
     if json {
@@ -406,12 +410,7 @@ fn reclaim_size_label(finding: &reclaim::Finding) -> String {
 }
 
 fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
-    if !path.exists() {
-        bail!("path does not exist: {}", path.display());
-    }
-    if !path.is_dir() {
-        bail!("path is not a directory: {}", path.display());
-    }
+    let path = canonical_dir(path)?;
 
     let report = reclaim::report(&path);
     if json {
@@ -482,6 +481,7 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
 }
 
 fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
+    let path = canonical_dir(path)?;
     let record = history::save(&path)?;
     let total = record.total();
     if json {
@@ -523,6 +523,7 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
 }
 
 fn print_diff(path: PathBuf, json: bool) -> Result<()> {
+    let path = canonical_dir(path)?;
     let report = history::diff(&path)?;
     if json {
         let changes: Vec<_> = report
@@ -603,6 +604,7 @@ fn format_signed_bytes(delta: i128) -> String {
 }
 
 fn print_space(path: PathBuf, json: bool) -> Result<()> {
+    let path = canonical_dir(path)?;
     let report = space::report_for_path(&path)?;
     if json {
         let snapshots: Vec<_> = report
@@ -681,6 +683,7 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
 }
 
 fn print_packages(path: PathBuf, json: bool) -> Result<()> {
+    let path = canonical_dir(path)?;
     let reports = packages::scan_managers();
     let project_deps = packages::find_project_deps(&path, 5);
 
@@ -1055,11 +1058,11 @@ where
                                 true
                             }
                             KeyCode::PageDown => {
-                                app.move_top_files(1);
+                                app.page_top_files(1);
                                 true
                             }
                             KeyCode::PageUp => {
-                                app.move_top_files(-1);
+                                app.page_top_files(-1);
                                 true
                             }
                             KeyCode::Home => {
@@ -1116,11 +1119,11 @@ where
                                 true
                             }
                             KeyCode::PageDown => {
-                                app.move_reclaim_paths(1);
+                                app.page_reclaim_paths(1);
                                 true
                             }
                             KeyCode::PageUp => {
-                                app.move_reclaim_paths(-1);
+                                app.page_reclaim_paths(-1);
                                 true
                             }
                             KeyCode::Home => {
@@ -1550,7 +1553,7 @@ fn focus_next(app: &mut App) {
 
 fn focus_previous(app: &mut App) {
     let previous = match app.focus {
-        Focus::Files => Focus::Packages,
+        Focus::Files => Focus::Reclaim,
         Focus::Disks => Focus::Files,
         Focus::Packages => Focus::Disks,
         Focus::Reclaim => Focus::Packages,
