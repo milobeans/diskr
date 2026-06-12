@@ -299,6 +299,7 @@ Keys:
   f               Reveal selected item in Finder
   O               Open selected item with default app
   r               Refresh view and scan all visible directory sizes
+  S               Scan every missing visible directory size
   o               Cycle sort mode
   p               Open packages pane / switch package view
   .               Toggle hidden files
@@ -1377,6 +1378,10 @@ where
                             } else {
                                 app.force_rescan();
                             }
+                            true
+                        }
+                        KeyCode::Char('S') => {
+                            app.scan_all_missing_visible();
                             true
                         }
                         KeyCode::Char('d') => {

@@ -725,10 +725,39 @@ impl App {
         self.start_scan(dirs, status);
     }
 
+    /// Invoked by the `S` key. Scans every visible directory whose size is not known yet.
+    pub fn scan_all_missing_visible(&mut self) {
+        if self.confirming_delete {
+            return;
+        }
+        let missing: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_dir && e.size.is_none())
+            .map(|e| e.path.clone())
+            .collect();
+        if missing.is_empty() {
+            self.status = String::from("full scan complete · all visible sizes known");
+            return;
+        }
+        let dirs = self.scan_candidates(missing.len(), &missing);
+        let status = limited_scan_status("full scan", dirs.len(), missing.len());
+        self.start_scan(dirs, status);
+    }
+
     pub fn drain_scan_results(&mut self) -> bool {
         let mut changed = false;
         while let Ok(msg) = self.scan_rx.try_recv() {
             match msg {
+                ScanMsg::DirStarted { scan_id, path } if scan_id == self.active_scan_id => {
+                    self.status = format!(
+                        "scanning {}: {}/{}",
+                        scan_path_label(&path),
+                        self.scan_completed,
+                        self.scan_total
+                    );
+                    changed = true;
+                }
                 ScanMsg::DirSize {
                     scan_id,
                     path,
@@ -752,8 +781,10 @@ impl App {
                     self.scan_completed += 1;
                     if self.scan_completed < self.scan_total {
                         self.status = format!(
-                            "scanning directories: {}/{}",
-                            self.scan_completed, self.scan_total
+                            "scanned {}: {}/{}",
+                            scan_path_label(&path),
+                            self.scan_completed,
+                            self.scan_total
                         );
                     }
                     if self.sort == SortMode::SizeDesc {
@@ -2198,6 +2229,24 @@ fn limited_scan_status(action: &str, scanning: usize, total: usize) -> String {
     }
 }
 
+fn scan_path_label(path: &Path) -> String {
+    const MAX_CHARS: usize = 36;
+    let label = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    let char_count = label.chars().count();
+    if char_count <= MAX_CHARS {
+        return label.into_owned();
+    }
+    let tail: String = label
+        .chars()
+        .skip(char_count.saturating_sub(MAX_CHARS - 1))
+        .collect();
+    format!("…{tail}")
+}
+
 pub fn human(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut value = bytes as f64;
@@ -2675,6 +2724,55 @@ mod tests {
             .filter(|entry| entry.is_dir && entry.scanning)
             .count();
         assert_eq!(scanning_dirs_count, 6);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_scan_scans_all_missing_visible_dirs_without_invalidating_cache() {
+        let root = test_root("full_scan");
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..6 {
+            fs::create_dir_all(root.join(format!("dir-{i}"))).unwrap();
+        }
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        let known_dir = root.join("dir-0");
+        let known_size = SizeInfo::new(123, 64);
+        app.size_cache.insert(known_dir.clone(), known_size);
+        for entry in &mut app.entries {
+            entry.scanning = false;
+            if entry.path == known_dir {
+                entry.size = Some(known_size);
+            } else if entry.is_dir {
+                entry.size = None;
+            }
+        }
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == root.join("dir-4"))
+            .unwrap();
+
+        app.scan_all_missing_visible();
+
+        let scanning_dirs_count = app
+            .entries
+            .iter()
+            .filter(|entry| entry.is_dir && entry.scanning)
+            .count();
+        assert_eq!(scanning_dirs_count, 5);
+        assert_eq!(app.size_cache.get(&known_dir), Some(&known_size));
+        assert_eq!(
+            app.entries
+                .iter()
+                .find(|entry| entry.path == known_dir)
+                .and_then(|entry| entry.size),
+            Some(known_size)
+        );
+        assert!(app.status.contains("full scan: 5 directories"));
 
         fs::remove_dir_all(root).unwrap();
     }

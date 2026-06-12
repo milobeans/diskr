@@ -9,6 +9,10 @@ pub type ScanId = u64;
 
 /// Messages from the scanner thread back to the UI.
 pub enum ScanMsg {
+    DirStarted {
+        scan_id: ScanId,
+        path: PathBuf,
+    },
     DirSize {
         scan_id: ScanId,
         path: PathBuf,
@@ -38,6 +42,10 @@ impl Scanner {
             .name(String::from("diskr-scan"))
             .spawn(move || {
                 dirs.into_par_iter().for_each(|dir| {
+                    let _ = tx.send(ScanMsg::DirStarted {
+                        scan_id,
+                        path: dir.clone(),
+                    });
                     let scan = bulkstat::scan_dir(&dir, 0);
                     let _ = tx.send(ScanMsg::DirSize {
                         scan_id,
@@ -77,8 +85,14 @@ mod tests {
             .unwrap();
 
         let mut seen = HashSet::new();
+        let mut started = HashSet::new();
         loop {
             match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                ScanMsg::DirStarted { scan_id, path } => {
+                    assert_eq!(scan_id, 42);
+                    assert!(path == first || path == second);
+                    started.insert(path);
+                }
                 ScanMsg::DirSize {
                     scan_id,
                     path,
@@ -99,8 +113,11 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 2);
+        assert_eq!(started.len(), 2);
         assert!(seen.contains(&first));
         assert!(seen.contains(&second));
+        assert!(started.contains(&first));
+        assert!(started.contains(&second));
         fs::remove_dir_all(root).unwrap();
     }
 
