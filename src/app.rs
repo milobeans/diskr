@@ -622,14 +622,13 @@ impl App {
         match self.focus {
             Focus::Files => {
                 if let Some(entry_idx) = self.visible_entry_index(self.selected) {
-                    if let Some(entry) = self.entries.get(entry_idx).cloned() {
-                        if entry.is_dir {
-                            self.exit_search();
-                            self.cwd = entry.path;
-                            self.reset_cwd_scoped_state();
-                            self.selected = 0;
-                            self.reload()?;
-                            self.refresh_history_state();
+                        if let Some(entry) = self.entries.get(entry_idx).cloned() {
+                            if entry.is_dir {
+                                self.exit_search();
+                                self.cwd = entry.path;
+                                self.selected = 0;
+                                self.reload()?;
+                                self.refresh_history_state();
                         }
                     }
                 }
@@ -637,7 +636,6 @@ impl App {
             Focus::Disks => {
                 if let Some(disk) = self.disks.get(self.selected_disk) {
                     self.cwd = disk.mount.clone();
-                    self.reset_cwd_scoped_state();
                     self.focus = Focus::Files;
                     self.selected = 0;
                     self.reload()?;
@@ -659,7 +657,6 @@ impl App {
         let previous_cwd = self.cwd.clone();
         if let Some(parent) = self.cwd.parent().map(|p| p.to_path_buf()) {
             self.cwd = parent;
-            self.reset_cwd_scoped_state();
             self.reload_with_selection(Some(previous_cwd), self.selected)?;
             self.refresh_history_state();
         }
@@ -671,7 +668,6 @@ impl App {
             return Ok(());
         }
         self.show_hidden = !self.show_hidden;
-        self.marked.clear();
         self.reload()
     }
 
