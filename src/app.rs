@@ -2465,6 +2465,11 @@ impl App {
         packages::Manager,
         Option<&packages::DepInfo>,
     )> {
+        // Only valid in the SystemManagers view; in ProjectDeps the visible index
+        // addresses project_deps, not cached_flat_packages.
+        if self.pkg_view != PkgView::SystemManagers {
+            return None;
+        }
         let real_idx = self.pkg_visible_index(self.selected_pkg)?;
         let (pkg, manager) = self.cached_flat_packages.get(real_idx)?;
         let dep_info = self
@@ -2472,6 +2477,14 @@ impl App {
             .as_ref()
             .and_then(|g| g.get(*manager, &pkg.name));
         Some((pkg, *manager, dep_info))
+    }
+
+    pub fn selected_project_dep_detail(&self) -> Option<&packages::ProjectDeps> {
+        if self.pkg_view != PkgView::ProjectDeps {
+            return None;
+        }
+        let real_idx = self.pkg_visible_index(self.selected_pkg)?;
+        self.project_deps.get(real_idx)
     }
 
     pub fn toggle_pkg_view(&mut self) {
@@ -4574,6 +4587,147 @@ mod tests {
         let entry = app.entries.iter().find(|entry| entry.path == dir).unwrap();
         assert_eq!(entry.size, None);
         assert!(!entry.scanning);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- issue #60: package detail modal must resolve against the active view ---
+
+    fn make_flat_package(name: &str) -> (packages::Package, packages::Manager) {
+        (
+            packages::Package {
+                name: name.into(),
+                version: "1.0".into(),
+                size: None,
+                path: None,
+                metadata_path: None,
+            },
+            packages::Manager::Brew,
+        )
+    }
+
+    #[test]
+    fn pkg_detail_in_system_view_returns_system_package() {
+        let root = test_root("pkg_detail_system");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Packages;
+        app.pkg_view = PkgView::SystemManagers;
+        app.cached_flat_packages = vec![make_flat_package("alpha"), make_flat_package("beta")];
+        app.project_deps = vec![packages::ProjectDeps {
+            path: root.join("Cargo.toml"),
+            manager_label: "cargo",
+            manifest: "Cargo.toml",
+            dep_count: 3,
+            deps_size: None,
+            deps_dir: None,
+        }];
+        app.rebuild_pkg_visible_indices();
+        app.selected_pkg = 1;
+
+        let detail = app.selected_pkg_detail();
+        assert!(detail.is_some(), "system view should return pkg detail");
+        let (pkg, _, _) = detail.unwrap();
+        assert_eq!(pkg.name, "beta");
+
+        assert!(
+            app.selected_project_dep_detail().is_none(),
+            "selected_project_dep_detail must be None in SystemManagers view"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pkg_detail_in_project_deps_view_returns_project_dep_not_flat_package() {
+        let root = test_root("pkg_detail_projects");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Packages;
+        app.pkg_view = PkgView::ProjectDeps;
+        // Three system packages — if the bug were present, row 1 would resolve to "beta".
+        app.cached_flat_packages = vec![
+            make_flat_package("alpha"),
+            make_flat_package("beta"),
+            make_flat_package("gamma"),
+        ];
+        app.project_deps = vec![
+            packages::ProjectDeps {
+                path: root.join("Cargo.toml"),
+                manager_label: "cargo",
+                manifest: "Cargo.toml",
+                dep_count: 3,
+                deps_size: None,
+                deps_dir: Some(root.join("target")),
+            },
+            packages::ProjectDeps {
+                path: root.join("package.json"),
+                manager_label: "npm/bun/yarn",
+                manifest: "package.json",
+                dep_count: 10,
+                deps_size: None,
+                deps_dir: Some(root.join("node_modules")),
+            },
+        ];
+        app.rebuild_project_dep_search_text();
+        app.rebuild_pkg_visible_indices();
+        app.selected_pkg = 1;
+
+        // selected_pkg_detail must return None — it must not alias row 1 from flat packages.
+        assert!(
+            app.selected_pkg_detail().is_none(),
+            "selected_pkg_detail must return None in ProjectDeps view (was showing wrong system package)"
+        );
+
+        // selected_project_dep_detail must return the correct project dep row.
+        let dep = app
+            .selected_project_dep_detail()
+            .expect("project dep detail must be Some for row 1 in ProjectDeps view");
+        assert_eq!(dep.manifest, "package.json");
+        assert_eq!(dep.manager_label, "npm/bun/yarn");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn open_pkg_detail_sets_flag_in_both_views() {
+        let root = test_root("pkg_detail_open");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Packages;
+
+        // SystemManagers view
+        app.pkg_view = PkgView::SystemManagers;
+        app.cached_flat_packages = vec![make_flat_package("alpha")];
+        app.rebuild_pkg_visible_indices();
+        app.open_pkg_detail();
+        assert!(
+            app.pkg_detail,
+            "pkg_detail should be set in SystemManagers view"
+        );
+        app.close_pkg_detail();
+
+        // ProjectDeps view
+        app.pkg_view = PkgView::ProjectDeps;
+        app.project_deps = vec![packages::ProjectDeps {
+            path: root.join("Cargo.toml"),
+            manager_label: "cargo",
+            manifest: "Cargo.toml",
+            dep_count: 2,
+            deps_size: None,
+            deps_dir: None,
+        }];
+        app.rebuild_project_dep_search_text();
+        app.rebuild_pkg_visible_indices();
+        app.open_pkg_detail();
+        assert!(
+            app.pkg_detail,
+            "pkg_detail should be set in ProjectDeps view"
+        );
+        app.close_pkg_detail();
 
         fs::remove_dir_all(root).unwrap();
     }

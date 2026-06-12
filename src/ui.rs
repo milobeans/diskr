@@ -82,7 +82,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_empty_trash_confirm(f, app);
     }
     if app.pkg_detail {
-        draw_pkg_detail(f, app);
+        match app.pkg_view {
+            PkgView::SystemManagers => draw_pkg_detail(f, app),
+            PkgView::ProjectDeps => draw_project_dep_detail(f, app),
+        }
     }
     if app.file_info_open {
         draw_file_info(f, app);
@@ -1846,6 +1849,84 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" package info ")
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_project_dep_detail(f: &mut Frame, app: &App) {
+    let Some(dep) = app.selected_project_dep_detail() else {
+        return;
+    };
+
+    let area = centered_rect(75, 60, 50, 12, f.area());
+    f.render_widget(Clear, area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{} ", dep.manager_label),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            dep.path.display().to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("  Manifest: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(dep.manifest, Style::default().fg(Color::Gray)),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("  Dependencies: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(dep.dep_count.to_string(), Style::default().fg(Color::White)),
+    ]));
+
+    if let Some(size) = dep.deps_size {
+        lines.push(Line::from(vec![
+            Span::styled("  Deps size: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(size_detail(size), Style::default().fg(Color::Green)),
+        ]));
+    }
+
+    if let Some(deps_dir) = &dep.deps_dir {
+        let max_path_len = area.width.saturating_sub(14) as usize;
+        lines.push(Line::from(vec![
+            Span::styled("  Deps dir: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate(&deps_dir.display().to_string(), max_path_len),
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  d",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" trash deps dir", Style::default().fg(Color::Gray)),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" close", Style::default().fg(Color::Gray)),
+    ]));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" project deps ")
         .border_style(Style::default().fg(Color::Cyan));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
