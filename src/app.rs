@@ -423,9 +423,7 @@ pub struct App {
     disk_info_id: ScanId,
     disk_info_scan_rx: Option<Receiver<DiskInfoMsg>>,
     pub disk_info_report: Option<space::SpaceReport>,
-    #[allow(dead_code)]
     pub file_info: Option<FileInfo>,
-    #[allow(dead_code)]
     pub file_info_open: bool,
 
     pub history_baseline: Option<history::ScanRecord>,

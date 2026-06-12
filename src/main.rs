@@ -1543,10 +1543,6 @@ where
                             app.open_pkg_detail();
                             true
                         }
-                        KeyCode::Char('i') if app.focus == Focus::Files => {
-                            app.open_file_info();
-                            true
-                        }
                         KeyCode::Char('i') if app.focus == Focus::Disks => {
                             app.request_disk_info_for_selected_disk();
                             true
