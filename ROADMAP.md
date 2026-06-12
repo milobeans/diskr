@@ -4,6 +4,11 @@
 The strongest direction is to explain why space disappeared, what changed over
 time, and what is actually reclaimable.
 
+This file tracks product direction at the feature level. Bugs and small
+improvements live in [docs/ISSUES.md](docs/ISSUES.md); shipped work is
+recorded in [CHANGELOG.md](CHANGELOG.md). See [AGENTS.md](AGENTS.md) for when
+to update which file.
+
 ## Highest-Leverage Features
 
 - APFS phantom-space view: show local Time Machine snapshots, purgeable space,
@@ -66,6 +71,39 @@ time, and what is actually reclaimable.
 - Saved roots and profiles: let users pin common scan targets and switch between
   named views such as `dev`, `media`, `downloads`, and external volumes.
 
+## TUI Density and Declutter (2026-06 UI/UX review)
+
+Direction from the 2026-06-12 UI/UX review: the screen budget is
+misallocated. Always-on chrome (a fixed 38% side column that is usually idle,
+a static 22-binding help strip, header text restating default settings)
+makes the TUI feel cluttered, while the differentiated intelligence (reclaim
+classification, diff deltas, top files) hides behind stacked modals. The fix
+is not more panels — it is moving the intelligence into the file list itself
+and making every other element earn its pixels. Tracked as issues #71-#77 in
+[docs/ISSUES.md](docs/ISSUES.md):
+
+- Fix the share-bar/percentage denominators, which today are computed over
+  the scroll window instead of the directory (#71 — bug, do first).
+- Context-sensitive help strip plus a `?` keymap overlay, driven by one
+  shared keymap table (#72, with #56/#40/#69).
+- Files-pane density: column header with sort indicator, always-on modified
+  column, magnitude-coded size colors, summary title with cwd total and scan
+  coverage, visible mark totals (#73).
+- Inline reclaim classification chips in the browser — the product-defining
+  move; the same thesis as audit finding 15 applied to the main surface
+  instead of a modal (#74).
+- Declutter the header and status line (show deviations, not defaults; stop
+  duplicating the selected row); collapsible side column with one-line disk
+  rows (#75, #76).
+- Two overlay patterns — full-screen selectable list views and a single
+  detail drawer — replacing six modal types; top-files becomes a flat-view
+  toggle of the files pane (#77).
+
+Sequencing: #71 and #72 are quick wins; #73/#74 are the value core and ship
+sub-item by sub-item; #75-#77 follow. The correctness/safety burn-down (build
+order step 9) still takes precedence for destructive-action and
+state-integrity issues.
+
 ## Scriptability and Reports
 
 - Non-interactive top-N mode: support commands such as `diskr --top 20 --json
@@ -90,6 +128,9 @@ time, and what is actually reclaimable.
   Quick Look, Finder, and clone files are where `diskr` can beat generic tools.
 - Keep automation useful. Every major insight in the TUI should eventually have
   a scriptable equivalent.
+- Chrome must earn its pixels. Prefer densifying the files pane over adding
+  panes or modals, show deviations rather than defaults, and do not repeat
+  information that is already visible in another region of the screen.
 
 ## Suggested Build Order
 
@@ -101,5 +142,16 @@ time, and what is actually reclaimable.
 6. Done: add developer-cache detection and reclaimability scoring (`--reclaim`).
 7. Done: add JSON/reporting commands for `--top`, `--reclaim`, `--save`,
    `--diff`, and `--space`.
-8. Next: stale-file finder (size combined with last-used metadata).
-9. Next: duplicate finder with APFS clone-based dedupe (`clonefile(2)`).
+8. Done: bring the intelligence into the TUI — reclaim pane, top-files modal,
+   disk details, history diff header, file operations, size-share bars,
+   persistent size cache (audit findings #15-#20).
+9. Next: burn down the open correctness/safety issues in
+   [docs/ISSUES.md](docs/ISSUES.md) (state integrity, destructive-action
+   guardrails, accuracy) before adding new surfaces.
+10. Next: TUI density and declutter pass (issues #71-#77; see the section
+    above) — denominator fix and context-sensitive help first, then
+    files-pane density and inline reclaim classification, then side-column
+    collapse and overlay unification.
+11. Next: stale-file finder (size combined with last-used metadata); pairs
+    with #73's age-dimming and #74's row chips.
+12. Next: duplicate finder with APFS clone-based dedupe (`clonefile(2)`).
