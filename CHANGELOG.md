@@ -9,12 +9,18 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+## [0.1.56] - 2026-06-12
+
 ### Fixed
 
 - Project dependency reports now merge multiple manifests that point at the
   same dependency directory, so Python projects with both `requirements.txt`
   and `pyproject.toml` count one `.venv` once while preserving both manifest
   labels. (#34)
+- Size bars and the `%` column in the files pane now show each entry's share
+  of the full directory rather than the scroll window, so percentages no longer
+  change as you scroll and the largest item in view is no longer always
+  full-width. (#71)
 
 ## [0.1.54] - 2026-06-12
 

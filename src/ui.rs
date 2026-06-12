@@ -183,18 +183,18 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     let (offset, end) =
         file_window_bounds(app.selected, visible_count, app.file_list_offset, max_rows);
     app.file_list_offset = offset;
-    let visible_entries: Vec<&crate::app::Entry> = (offset..end)
-        .filter_map(|visible_index| app.visible_entry(visible_index))
-        .collect();
-    let max_visible_size = visible_entries
-        .iter()
+    let max_visible_size = (0..visible_count)
+        .filter_map(|i| app.visible_entry(i))
         .filter_map(|entry| entry.size.map(size_sort_key))
         .max()
         .unwrap_or(0);
-    let total_visible_size: u64 = visible_entries
-        .iter()
+    let total_visible_size: u64 = (0..visible_count)
+        .filter_map(|i| app.visible_entry(i))
         .filter_map(|entry| entry.size.map(size_sort_key))
         .sum();
+    let visible_entries: Vec<&crate::app::Entry> = (offset..end)
+        .filter_map(|visible_index| app.visible_entry(visible_index))
+        .collect();
 
     let items: Vec<ListItem> = visible_entries
         .into_iter()
