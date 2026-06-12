@@ -18,9 +18,6 @@ const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
 const SIZE_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 const AUTO_SCAN_LIMIT: usize = 4;
 const TOP_FILES_LIMIT: usize = 50;
-const TOP_FILES_PAGE_ROWS: i32 = 10;
-const RECLAIM_PATHS_PAGE_ROWS: i32 = 10;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Files,
@@ -186,6 +183,7 @@ pub struct App {
     reclaim_paths_selected: usize,
     reclaim_paths_finding: usize,
     reclaim_path_list_offset: usize,
+    reclaim_paths_page_rows: usize,
 
     top_files_open: bool,
     top_files_loading: bool,
@@ -195,6 +193,7 @@ pub struct App {
     top_files_path: Option<PathBuf>,
     pub top_files_selected: usize,
     top_files_offset: usize,
+    top_files_page_rows: usize,
 
     disk_info_open: bool,
     disk_info_loading: bool,
@@ -345,6 +344,7 @@ impl App {
             reclaim_paths_selected: 0,
             reclaim_paths_finding: 0,
             reclaim_path_list_offset: 0,
+            reclaim_paths_page_rows: 1,
             top_files_open: false,
             top_files_loading: false,
             top_files_scan_id: 0,
@@ -353,6 +353,7 @@ impl App {
             top_files_path: None,
             top_files_selected: 0,
             top_files_offset: 0,
+            top_files_page_rows: 1,
             disk_info_open: false,
             disk_info_loading: false,
             disk_info_id: 0,
@@ -1094,10 +1095,16 @@ impl App {
     }
 
     pub fn page_reclaim_paths(&mut self, pages: i32) {
-        self.move_reclaim_paths(pages.saturating_mul(RECLAIM_PATHS_PAGE_ROWS));
+        self.reclaim_paths_selected = modal_page_selection(
+            self.reclaim_paths_selected,
+            self.reclaim_paths_count(),
+            self.reclaim_paths_page_rows,
+            pages,
+        );
     }
 
     pub fn reclaim_paths_window_bounds(&mut self, max_rows: usize) -> (usize, usize) {
+        self.reclaim_paths_page_rows = max_rows.max(1);
         let (offset, end) = modal_window_bounds(
             self.reclaim_paths_selected,
             self.reclaim_paths_count(),
@@ -1125,7 +1132,12 @@ impl App {
     }
 
     pub fn page_top_files(&mut self, pages: i32) {
-        self.move_top_files(pages.saturating_mul(TOP_FILES_PAGE_ROWS));
+        self.top_files_selected = modal_page_selection(
+            self.top_files_selected,
+            self.top_files_count(),
+            self.top_files_page_rows,
+            pages,
+        );
     }
 
     pub fn top_files_selected(&self) -> usize {
@@ -1133,6 +1145,7 @@ impl App {
     }
 
     pub fn top_files_window_bounds(&mut self, max_rows: usize) -> (usize, usize) {
+        self.top_files_page_rows = max_rows.max(1);
         let (offset, end) = modal_window_bounds(
             self.top_files_selected,
             self.top_files_count(),
@@ -2541,14 +2554,30 @@ fn modal_window_bounds(
     if count == 0 {
         return (0, 0);
     }
+    let selected = selected.min(count.saturating_sub(1));
+    let max_offset = count.saturating_sub(max_rows);
+    offset = offset.min(max_offset);
     if selected < offset {
         offset = selected;
     } else if selected >= offset.saturating_add(max_rows) {
         offset = selected + 1 - max_rows;
     }
-    offset = offset.min(count.saturating_sub(1));
     let end = offset.saturating_add(max_rows).min(count);
     (offset, end)
+}
+
+fn modal_page_selection(selected: usize, count: usize, max_rows: usize, pages: i32) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let step = max_rows
+        .max(1)
+        .saturating_mul(pages.unsigned_abs() as usize);
+    if pages >= 0 {
+        selected.saturating_add(step).min(count.saturating_sub(1))
+    } else {
+        selected.saturating_sub(step)
+    }
 }
 
 /// True when a TCC-protected directory exists but cannot be listed — the
@@ -3251,6 +3280,16 @@ mod tests {
         assert_eq!(modal_window_bounds(0, 50, 0, 10), (0, 10));
         assert_eq!(modal_window_bounds(12, 50, 0, 10), (3, 13));
         assert_eq!(modal_window_bounds(49, 50, 3, 10), (40, 50));
+        assert_eq!(modal_window_bounds(49, 50, 49, 10), (40, 50));
+    }
+
+    #[test]
+    fn modal_page_selection_uses_visible_page_height() {
+        assert_eq!(modal_page_selection(0, 50, 7, 1), 7);
+        assert_eq!(modal_page_selection(7, 50, 7, 1), 14);
+        assert_eq!(modal_page_selection(14, 50, 7, -1), 7);
+        assert_eq!(modal_page_selection(48, 50, 7, 1), 49);
+        assert_eq!(modal_page_selection(1, 50, 7, -1), 0);
     }
 
     #[test]

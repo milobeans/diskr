@@ -582,11 +582,21 @@ fn draw_reclaim_paths(f: &mut Frame, app: &mut App) {
         return;
     }
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" reclaim paths ")
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(2)])
-        .split(area);
-    let max_rows = chunks[0].height.saturating_sub(2).max(1) as usize;
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner);
+    let max_rows = chunks[0].height.max(1) as usize;
     let (offset, end) = app.reclaim_paths_window_bounds(max_rows);
     let selected = app.reclaim_paths_selected();
 
@@ -625,12 +635,6 @@ fn draw_reclaim_paths(f: &mut Frame, app: &mut App) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " {} ({}) · {} ",
-            finding.label,
-            finding.class.label(),
-            finding.count
-        )))
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -642,8 +646,22 @@ fn draw_reclaim_paths(f: &mut Frame, app: &mut App) {
     f.render_stateful_widget(list, chunks[0], &mut state);
 
     let footer = Paragraph::new(vec![
-        Line::from(format!("{}-{} of {} paths", offset + 1, end, item_count)),
-        Line::from("f/enter: reveal  ·  d: trash  ·  esc: close"),
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "{} ({}) · {}",
+                    finding.label,
+                    finding.class.label(),
+                    finding.count
+                ),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                format!("  ·  {}-{} of {}", offset + 1, end, item_count),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from("f/enter: reveal  ·  O: open  ·  d: trash  ·  esc: close"),
     ]);
     f.render_widget(footer, chunks[1]);
 }
@@ -689,18 +707,27 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(2)])
-        .split(area);
-    let max_rows = chunks[0].height.saturating_sub(2).max(1) as usize;
-    let (offset, end) = app.top_files_window_bounds(max_rows);
-    let selected = app.top_files_selected();
-
     let title = app
         .top_files_path()
         .map(|path| format!(" top files · {} ", path.display()))
         .unwrap_or_else(|| String::from(" top files "));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner);
+    let max_rows = chunks[0].height.max(1) as usize;
+    let (offset, end) = app.top_files_window_bounds(max_rows);
+    let selected = app.top_files_selected();
 
     let scan = match app.top_files_scan() {
         Some(scan) => scan,
@@ -745,12 +772,6 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
         .collect();
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .title_style(Style::default().fg(Color::DarkGray)),
-        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -778,7 +799,7 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
-        Line::from("f/enter: reveal  ·  d: trash  ·  esc: close"),
+        Line::from("f/enter: reveal  ·  O: open  ·  d: trash  ·  esc: close"),
     ];
     f.render_widget(Paragraph::new(footer), chunks[1]);
 }
