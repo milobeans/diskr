@@ -2028,16 +2028,10 @@ fn file_size_bar(
 
     let percent_of_max = if size >= max_visible_size {
         100
-    } else if max_visible_size == 0 {
-        0
     } else {
-        ((size.saturating_mul(100) + max_visible_size / 2) / max_visible_size).min(100)
+        rounded_percent(size, max_visible_size)
     };
-    let percent_of_sum = if total_visible_size == 0 {
-        0
-    } else {
-        ((size.saturating_mul(100) + total_visible_size / 2) / total_visible_size).min(100)
-    };
+    let percent_of_sum = rounded_percent(size, total_visible_size);
     let filled = if size == 0 {
         0
     } else {
@@ -2180,6 +2174,15 @@ mod tests {
         assert_eq!(file_window_bounds(10, 100, 0, 10), (1, 11));
         assert_eq!(file_window_bounds(50, 100, 40, 10), (41, 51));
     }
+}
+
+fn rounded_percent(value: u64, total: u64) -> u64 {
+    value
+        .saturating_mul(100)
+        .saturating_add(total / 2)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(100)
 }
 
 fn spinner_char() -> char {
