@@ -61,6 +61,17 @@ fn run_app(start: PathBuf) -> Result<()> {
 
     let mut app = App::new(start)?;
 
+    // Install the panic hook before entering the TUI. The hook restores the
+    // terminal first so the panic message lands on a sane screen, then
+    // invokes the previous hook (which prints the message). Panic hooks run
+    // before abort, so this also covers `panic = "abort"` in release builds
+    // where Drop never executes.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        prev_hook(info);
+    }));
+
     let _terminal_guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -944,6 +955,13 @@ fn spawn_detached(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// Restore the terminal to its normal state. Safe to call more than once:
+/// both operations are idempotent and errors are intentionally ignored.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+}
+
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -960,8 +978,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        restore_terminal();
     }
 }
 
