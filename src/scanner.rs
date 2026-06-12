@@ -1,10 +1,9 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 
 use crate::bulkstat;
 use crate::bulkstat::SizeInfo;
+use rayon::prelude::*;
 
 pub type ScanId = u64;
 
@@ -38,29 +37,14 @@ impl Scanner {
         std::thread::Builder::new()
             .name(String::from("diskr-scan"))
             .spawn(move || {
-                let worker_count = worker_count(dirs.len());
-                let dirs = Arc::new(dirs);
-                let next_index = AtomicUsize::new(0);
-
-                std::thread::scope(|scope| {
-                    for _ in 0..worker_count {
-                        let tx = tx.clone();
-                        let dirs = Arc::clone(&dirs);
-                        let next_index = &next_index;
-                        scope.spawn(move || loop {
-                            let index = next_index.fetch_add(1, Ordering::Relaxed);
-                            let Some(dir) = dirs.get(index).cloned() else {
-                                break;
-                            };
-                            let scan = bulkstat::scan_dir(&dir, 0);
-                            let _ = tx.send(ScanMsg::DirSize {
-                                scan_id,
-                                path: dir,
-                                size: scan.size,
-                                inaccessible: scan.inaccessible,
-                            });
-                        });
-                    }
+                dirs.into_par_iter().for_each(|dir| {
+                    let scan = bulkstat::scan_dir(&dir, 0);
+                    let _ = tx.send(ScanMsg::DirSize {
+                        scan_id,
+                        path: dir,
+                        size: scan.size,
+                        inaccessible: scan.inaccessible,
+                    });
                 });
 
                 let _ = tx.send(ScanMsg::AllDone { scan_id });
@@ -69,27 +53,66 @@ impl Scanner {
     }
 }
 
-fn worker_count(dir_count: usize) -> usize {
-    if dir_count <= 1 {
-        return dir_count;
-    }
-
-    let available = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1);
-    dir_count.min(available.clamp(1, 8))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::worker_count;
+    use super::{ScanMsg, Scanner};
+    use std::collections::HashSet;
+    use std::fs;
+    use std::sync::mpsc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn worker_count_respects_bounds() {
-        assert_eq!(worker_count(0), 0);
-        assert_eq!(worker_count(1), 1);
+    fn scan_all_streams_each_dir_and_completion() {
+        let root = test_root("scan_all_streams");
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("a.txt"), b"a").unwrap();
+        fs::write(second.join("b.txt"), b"bb").unwrap();
 
-        let workers = worker_count(64);
-        assert!((1..=8).contains(&workers));
+        let (tx, rx) = mpsc::channel();
+        Scanner::new(tx)
+            .scan_all(42, vec![first.clone(), second.clone()])
+            .unwrap();
+
+        let mut seen = HashSet::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                ScanMsg::DirSize {
+                    scan_id,
+                    path,
+                    size,
+                    inaccessible,
+                } => {
+                    assert_eq!(scan_id, 42);
+                    assert_eq!(inaccessible, 0);
+                    assert!(size.logical > 0);
+                    assert!(path == first || path == second);
+                    seen.insert(path);
+                }
+                ScanMsg::AllDone { scan_id } => {
+                    assert_eq!(scan_id, 42);
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains(&first));
+        assert!(seen.contains(&second));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_root(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "diskr_scanner_{name}_{}_{}",
+            std::process::id(),
+            nanos
+        ))
     }
 }
