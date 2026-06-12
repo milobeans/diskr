@@ -11,31 +11,44 @@
 //!   [ 4..24] returned_attrs  5*u32 — bitmap of which attrs the kernel filled in
 //!   [24..28] per-entry error u32   — present when returned_attrs says so
 //!   [28..36] name ref        i32+u32 — offset+length pointing to name bytes below
-//!   [36..40] objtype         u32   — VREG=1, VDIR=2, VLNK=5, …
-//!   [40..48] totalsize       u64   — present for regular files
-//!   [48..56] allocsize       u64   — present for regular files
+//!   [36..40] devid           i32   — device number
+//!   [40..44] objtype         u32   — VREG=1, VDIR=2, VLNK=5, …
+//!   [44..52] fileid          u64   — inode-equivalent id
+//!   [52..56] linkcount       u32   — present for regular files
+//!   [56..64] totalsize       u64   — present for regular files
+//!   [64..72] allocsize       u64   — present for regular files
 //!   [..    ] name bytes + padding
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 use rayon::Scope;
 
 // sys/attr.h constants (stable macOS ABI)
 const ATTR_BIT_MAP_COUNT: u16 = 5;
 const ATTR_CMN_NAME: u32 = 0x00000001;
+const ATTR_CMN_DEVID: u32 = 0x00000002;
 const ATTR_CMN_OBJTYPE: u32 = 0x00000008;
+const ATTR_CMN_FILEID: u32 = 0x02000000;
 const ATTR_CMN_ERROR: u32 = 0x20000000;
 const ATTR_CMN_RETURNED_ATTRS: u32 = 0x80000000;
+const ATTR_FILE_LINKCOUNT: u32 = 0x00000001;
 const ATTR_FILE_TOTALSIZE: u32 = 0x00000002;
 const ATTR_FILE_ALLOCSIZE: u32 = 0x00000004;
 const FSOPT_PACK_INVAL_ATTRS: u64 = 0x00000008;
+const FSOPT_RETURN_REALDEV: u64 = 0x00000200;
 const ATTRIBUTE_SET_LEN: usize = 20;
 const ATTR_REFERENCE_LEN: usize = 8;
+const DATA_VOLUME_ROOT: &str = "/System/Volumes/Data";
+const VOLUMES_ROOT: &str = "/Volumes";
 
 // vnode types (sys/vnode.h)
 const VREG: u32 = 1;
@@ -71,6 +84,31 @@ pub struct DirScan {
     /// Directories that could not be opened due to permissions (EACCES/EPERM).
     /// When non-zero the reported size is a lower bound.
     pub inaccessible: u32,
+    /// Mounted volumes skipped below /Volumes to avoid crossing filesystem boundaries.
+    pub skipped_mounts: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScanCancellation {
+    generation: Arc<AtomicU64>,
+    expected: u64,
+}
+
+impl ScanCancellation {
+    pub fn new(generation: Arc<AtomicU64>, expected: u64) -> Self {
+        Self {
+            generation,
+            expected,
+        }
+    }
+
+    pub fn never() -> Self {
+        Self::new(Arc::new(AtomicU64::new(0)), 0)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.generation.load(Ordering::Relaxed) != self.expected
+    }
 }
 
 #[repr(C)]
@@ -87,23 +125,52 @@ struct Attrlist {
 /// Recursive size and optional largest-file report for `root`.
 /// Symlinks are skipped. Permission errors yield zero contribution and are counted.
 pub fn scan_dir(root: &Path, top_file_limit: usize) -> DirScan {
+    scan_dir_with_cancellation(root, top_file_limit, &ScanCancellation::never()).unwrap_or_default()
+}
+
+pub fn scan_dir_with_cancellation(
+    root: &Path,
+    top_file_limit: usize,
+    cancellation: &ScanCancellation,
+) -> Option<DirScan> {
+    if cancellation.is_cancelled() {
+        return None;
+    }
     let Ok(meta) = std::fs::symlink_metadata(root) else {
-        return DirScan::default();
+        return Some(DirScan::default());
     };
     if !meta.file_type().is_dir() {
-        return DirScan::default();
+        return Some(DirScan::default());
     }
 
+    let policy_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let context = ScanContext {
+        policy: ScanPolicy::new(&policy_root, meta.dev()),
+        seen_hard_links: Mutex::new(HashSet::new()),
+    };
     let aggregate = Mutex::new(ScanAggregate::default());
 
     rayon::scope(|scope| {
-        spawn_scan(scope, root.to_path_buf(), top_file_limit, &aggregate);
+        spawn_scan(
+            scope,
+            root.to_path_buf(),
+            top_file_limit,
+            &aggregate,
+            &context,
+            cancellation,
+        );
     });
 
-    aggregate
-        .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .finish()
+    if cancellation.is_cancelled() {
+        return None;
+    }
+
+    Some(
+        aggregate
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .finish(),
+    )
 }
 
 #[derive(Default)]
@@ -111,12 +178,14 @@ struct ScanAggregate {
     size: SizeInfo,
     largest_files: BinaryHeap<Reverse<FileCandidate>>,
     inaccessible: u32,
+    skipped_mounts: u32,
 }
 
 impl ScanAggregate {
     fn merge(&mut self, partial: DirectoryScan, top_file_limit: usize) {
         self.size.add_file(partial.size);
         self.inaccessible = self.inaccessible.saturating_add(partial.inaccessible);
+        self.skipped_mounts = self.skipped_mounts.saturating_add(partial.skipped_mounts);
         if top_file_limit == 0 {
             return;
         }
@@ -130,6 +199,7 @@ impl ScanAggregate {
             size: self.size,
             largest_files: sorted_largest_files(self.largest_files),
             inaccessible: self.inaccessible,
+            skipped_mounts: self.skipped_mounts,
         }
     }
 }
@@ -140,6 +210,30 @@ struct DirectoryScan {
     largest_files: BinaryHeap<Reverse<FileCandidate>>,
     subdirs: Vec<PathBuf>,
     inaccessible: u32,
+    skipped_mounts: u32,
+}
+
+struct ScanContext {
+    policy: ScanPolicy,
+    seen_hard_links: Mutex<HashSet<FileIdentity>>,
+}
+
+type FileIdentity = (u64, u64);
+
+#[derive(Clone, Copy)]
+struct ScanPolicy {
+    root_dev: u64,
+    skip_data_volume: bool,
+}
+
+impl ScanPolicy {
+    fn new(root: &Path, root_dev: u64) -> Self {
+        let data_root = Path::new(DATA_VOLUME_ROOT);
+        Self {
+            root_dev,
+            skip_data_volume: data_root.starts_with(root) && root != data_root,
+        }
+    }
 }
 
 fn spawn_scan<'scope>(
@@ -147,18 +241,40 @@ fn spawn_scan<'scope>(
     dir: PathBuf,
     top_file_limit: usize,
     aggregate: &'scope Mutex<ScanAggregate>,
+    context: &'scope ScanContext,
+    cancellation: &'scope ScanCancellation,
 ) {
     scope.spawn(move |scope| {
-        let partial = scan_one_dir(&dir, top_file_limit);
+        if cancellation.is_cancelled() {
+            return;
+        }
+        let partial = scan_one_dir(&dir, top_file_limit, context, cancellation);
+        if cancellation.is_cancelled() {
+            return;
+        }
         let DirectoryScan {
             size,
             largest_files,
             subdirs,
             inaccessible,
+            skipped_mounts,
         } = partial;
 
         for subdir in subdirs {
-            spawn_scan(scope, subdir, top_file_limit, aggregate);
+            if cancellation.is_cancelled() {
+                return;
+            }
+            spawn_scan(
+                scope,
+                subdir,
+                top_file_limit,
+                aggregate,
+                context,
+                cancellation,
+            );
+        }
+        if cancellation.is_cancelled() {
+            return;
         }
         let mut shared = aggregate.lock().unwrap();
         shared.merge(
@@ -167,13 +283,22 @@ fn spawn_scan<'scope>(
                 largest_files,
                 subdirs: Vec::new(),
                 inaccessible,
+                skipped_mounts,
             },
             top_file_limit,
         );
     });
 }
 
-fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
+fn scan_one_dir(
+    dir: &Path,
+    top_file_limit: usize,
+    context: &ScanContext,
+    cancellation: &ScanCancellation,
+) -> DirectoryScan {
+    if cancellation.is_cancelled() {
+        return DirectoryScan::default();
+    }
     let c_path = match CString::new(dir.as_os_str().as_bytes()) {
         Ok(p) => p,
         Err(_) => return DirectoryScan::default(),
@@ -198,10 +323,15 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
     let mut attrlist = Attrlist {
         bitmapcount: ATTR_BIT_MAP_COUNT,
         reserved: 0,
-        commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE | ATTR_CMN_ERROR,
+        commonattr: ATTR_CMN_RETURNED_ATTRS
+            | ATTR_CMN_NAME
+            | ATTR_CMN_DEVID
+            | ATTR_CMN_OBJTYPE
+            | ATTR_CMN_FILEID
+            | ATTR_CMN_ERROR,
         volattr: 0,
         dirattr: 0,
-        fileattr: ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE,
+        fileattr: ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE,
         forkattr: 0,
     };
     thread_local! {
@@ -221,7 +351,7 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
                     &mut attrlist as *mut _ as *mut libc::c_void,
                     buf.as_mut_ptr() as *mut libc::c_void,
                     buf.len(),
-                    FSOPT_PACK_INVAL_ATTRS,
+                    FSOPT_PACK_INVAL_ATTRS | FSOPT_RETURN_REALDEV,
                 )
             };
             if n <= 0 {
@@ -274,6 +404,16 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
                     None
                 };
 
+                let devid = if returned_common & ATTR_CMN_DEVID != 0 {
+                    let Some(devid) = read_i32(buf, entry_end, field) else {
+                        break;
+                    };
+                    field += 4;
+                    Some(devid as u32 as u64)
+                } else {
+                    None
+                };
+
                 let objtype = if returned_common & ATTR_CMN_OBJTYPE != 0 {
                     let Some(objtype) = read_u32(buf, entry_end, field) else {
                         break;
@@ -283,7 +423,23 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
                 } else {
                     0
                 };
+                let fileid = if returned_common & ATTR_CMN_FILEID != 0 {
+                    let value = read_u64(buf, entry_end, field);
+                    field += 8;
+                    value
+                } else {
+                    None
+                };
 
+                let linkcount = if returned_file & ATTR_FILE_LINKCOUNT != 0 {
+                    let Some(value) = read_u32(buf, entry_end, field) else {
+                        break;
+                    };
+                    field += 4;
+                    value
+                } else {
+                    1
+                };
                 let totalsize = if returned_file & ATTR_FILE_TOTALSIZE != 0 {
                     let value = read_u64(buf, entry_end, field).unwrap_or(0);
                     field += 8;
@@ -303,6 +459,9 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
                 }
                 match objtype {
                     VREG => {
+                        if !should_count_file(devid, fileid, linkcount, context) {
+                            continue;
+                        }
                         let size = SizeInfo::new(totalsize, allocsize);
                         partial.size.add_file(size);
                         if top_file_limit == 0 {
@@ -338,9 +497,12 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
                         if matches!(name_bytes, b"." | b"..") {
                             continue;
                         }
-                        partial
-                            .subdirs
-                            .push(dir.join(OsStr::from_bytes(name_bytes)));
+                        let subdir = dir.join(OsStr::from_bytes(name_bytes));
+                        if should_skip_subdir(&subdir, devid, &context.policy) {
+                            partial.skipped_mounts = partial.skipped_mounts.saturating_add(1);
+                            continue;
+                        }
+                        partial.subdirs.push(subdir);
                     }
                     _ => {} // VLNK, VSOCK, VBLK, VCHR, VFIFO: ignore
                 }
@@ -350,6 +512,33 @@ fn scan_one_dir(dir: &Path, top_file_limit: usize) -> DirectoryScan {
 
     unsafe { libc::close(fd) };
     partial
+}
+
+fn should_count_file(
+    devid: Option<u64>,
+    fileid: Option<u64>,
+    linkcount: u32,
+    context: &ScanContext,
+) -> bool {
+    if linkcount <= 1 {
+        return true;
+    }
+    let Some(fileid) = fileid else {
+        return true;
+    };
+    let identity = (devid.unwrap_or(context.policy.root_dev), fileid);
+    context
+        .seen_hard_links
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(identity)
+}
+
+fn should_skip_subdir(path: &Path, devid: Option<u64>, policy: &ScanPolicy) -> bool {
+    if policy.skip_data_volume && path == Path::new(DATA_VOLUME_ROOT) {
+        return true;
+    }
+    path.starts_with(VOLUMES_ROOT) && devid.is_some_and(|dev| dev != policy.root_dev)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -514,9 +703,15 @@ mod tests {
         assert_eq!(scan.size.logical, 5 + 4096 * 8 + 4096);
         assert!(scan.size.allocated > 0);
         assert_eq!(scan.largest_files.len(), 2);
-        assert_eq!(scan.largest_files[0].path, root.join("a/large.bin"));
+        assert_eq!(
+            scan.largest_files[0].path.canonicalize().unwrap(),
+            root.join("a/large.bin").canonicalize().unwrap()
+        );
         assert_eq!(scan.largest_files[0].size.logical, 4096 * 8);
-        assert_eq!(scan.largest_files[1].path, root.join("a/b/medium.bin"));
+        assert_eq!(
+            scan.largest_files[1].path.canonicalize().unwrap(),
+            root.join("a/b/medium.bin").canonicalize().unwrap()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -546,6 +741,22 @@ mod tests {
     }
 
     #[test]
+    fn hard_linked_file_counts_once() {
+        let root = test_root("bulkstat_hardlink");
+        let original = root.join("original.bin");
+        let linked = root.join("linked.bin");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&original, vec![1u8; 4096]).unwrap();
+        fs::hard_link(&original, &linked).unwrap();
+
+        let scan = scan_dir(&root, 10);
+
+        assert_eq!(scan.size.logical, 4096, "hard link should not double count");
+        assert_eq!(scan.largest_files.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn missing_directory_counts_as_zero() {
         let root = test_root("missing");
         assert_eq!(scan_dir(&root, 0).size.logical, 0);
@@ -562,6 +773,57 @@ mod tests {
 
         assert_eq!(scan_dir(&link, 0).size.logical, 0);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn skip_policy_skips_data_volume_only_from_ancestor() {
+        let root_policy = ScanPolicy::new(Path::new("/"), 10);
+        assert!(should_skip_subdir(
+            Path::new(DATA_VOLUME_ROOT),
+            Some(10),
+            &root_policy
+        ));
+
+        let data_policy = ScanPolicy::new(Path::new(DATA_VOLUME_ROOT), 10);
+        assert!(!should_skip_subdir(
+            Path::new(DATA_VOLUME_ROOT),
+            Some(10),
+            &data_policy
+        ));
+    }
+
+    #[test]
+    fn skip_policy_skips_different_devices_under_volumes() {
+        let policy = ScanPolicy::new(Path::new("/"), 10);
+
+        assert!(should_skip_subdir(
+            Path::new("/Volumes/External"),
+            Some(20),
+            &policy
+        ));
+        assert!(!should_skip_subdir(
+            Path::new("/Volumes/LocalDirectory"),
+            Some(10),
+            &policy
+        ));
+        assert!(!should_skip_subdir(
+            Path::new("/Users/example"),
+            Some(20),
+            &policy
+        ));
+    }
+
+    #[test]
+    fn cancelled_scan_returns_no_result() {
+        let root = test_root("cancelled");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("data.bin"), vec![1u8; 4096]).unwrap();
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+        let cancellation = ScanCancellation::new(generation, 1);
+
+        assert!(scan_dir_with_cancellation(&root, 0, &cancellation).is_none());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn test_root(name: &str) -> PathBuf {

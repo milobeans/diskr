@@ -15,8 +15,8 @@ use ratatui_widgets::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{
-    format_elapsed, format_modified_time, human, size_sort_key, App, Focus, InputMode, PkgView,
-    SortMode,
+    format_elapsed, format_full_timestamp, format_modified_time, human, size_sort_key, App, Focus,
+    InputMode, PkgView, SortMode,
 };
 use crate::bulkstat::SizeInfo;
 use crate::packages::{DepEvidence, PackageUseStatus};
@@ -72,7 +72,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.disk_info_open() {
         draw_disk_info_modal(f, app);
     }
-
     if app.confirming_delete {
         draw_confirm(f, app);
     }
@@ -84,6 +83,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if app.pkg_detail {
         draw_pkg_detail(f, app);
+    }
+    if app.file_info_open {
+        draw_file_info(f, app);
     }
     if app.input_mode != InputMode::None {
         draw_input_overlay(f, app);
@@ -196,7 +198,12 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                     Style::default().fg(Color::Cyan),
                 ),
                 (true, Some(size), _) => (
-                    size_with_markers(size_sort_key(size), e.inaccessible, e.size_stale),
+                    size_with_markers(
+                        size_sort_key(size),
+                        e.inaccessible,
+                        e.skipped_mounts,
+                        e.size_stale,
+                    ),
                     if e.size_stale {
                         Style::default().fg(Color::DarkGray)
                     } else {
@@ -473,6 +480,11 @@ fn draw_reclaim_panel(f: &mut Frame, app: &App) {
             } else {
                 size
             };
+            let size = if finding.skipped_mounts > 0 {
+                format!("{size}*")
+            } else {
+                size
+            };
             spans.push(Span::styled(
                 format!("{size:>16}"),
                 Style::default().fg(Color::Green),
@@ -543,6 +555,12 @@ fn draw_reclaim_panel(f: &mut Frame, app: &App) {
                     "{} unreadable directories; size is a lower bound",
                     finding.inaccessible
                 ),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        if finding.skipped_mounts > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("{} mounted volumes skipped", finding.skipped_mounts),
                 Style::default().fg(Color::Yellow),
             )));
         }
@@ -928,6 +946,209 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn draw_file_info(f: &mut Frame, app: &App) {
+    let Some(info) = app.file_info.as_ref() else {
+        return;
+    };
+
+    let area = centered_rect(78, 70, 64, 20, f.area());
+    f.render_widget(Clear, area);
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            truncate(&info.name, area.width.saturating_sub(6) as usize),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {}", info.kind),
+            Style::default().fg(Color::Gray),
+        ),
+    ]));
+    lines.push(info_path_line("  Path: ", &info.path, area, 10));
+
+    if let Some(size) = info.size {
+        lines.push(Line::from(vec![
+            Span::styled(
+                if info.kind == "directory" {
+                    "  Recursive size: "
+                } else {
+                    "  Size: "
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                size_detail(size),
+                if info.size_stale {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Green)
+                },
+            ),
+        ]));
+        if size.logical != size.allocated {
+            lines.push(Line::from(Span::styled(
+                if size.allocated < size.logical {
+                    "  Apparent and allocated size differ; APFS clones, sparse files, or compression can make allocated smaller."
+                } else {
+                    "  Apparent and allocated size differ; filesystem block allocation can round allocated size up."
+                },
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    } else if info.kind == "directory" {
+        lines.push(Line::from(vec![
+            Span::styled("  Recursive size: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("not scanned yet", Style::default().fg(Color::Gray)),
+        ]));
+    }
+
+    if let Some(count) = info.direct_items {
+        lines.push(Line::from(vec![
+            Span::styled("  Items: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{count} direct children"),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+    if info.inaccessible > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} unreadable directories were skipped; recursive size is a lower bound.",
+                info.inaccessible
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(file_info_meta_line("  Created: ", info.created));
+    lines.push(file_info_meta_line("  Modified: ", info.modified));
+    lines.push(file_info_meta_line("  Accessed: ", info.accessed));
+    lines.push(Line::from(vec![
+        Span::styled("  Owner: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}:{}", info.owner, info.group),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Permissions: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{} ({})", info.permissions_octal, info.permissions_symbolic),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Hard links: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            info.hard_links.to_string(),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Extended attrs: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            match info.xattr_count {
+                Some(count) if info.has_quarantine_xattr => {
+                    format!("{count} (includes com.apple.quarantine)")
+                }
+                Some(count) => count.to_string(),
+                None => String::from("unavailable"),
+            },
+            if info.has_quarantine_xattr {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        ),
+    ]));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Space",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Quick Look", Style::default().fg(Color::Gray)),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "f",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Finder", Style::default().fg(Color::Gray)),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "O",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" open", Style::default().fg(Color::Gray)),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "d",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" trash", Style::default().fg(Color::Gray)),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" close", Style::default().fg(Color::Gray)),
+    ]));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" file info ")
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn info_path_line(
+    label: &'static str,
+    path: &std::path::Path,
+    area: Rect,
+    reserved: u16,
+) -> Line<'static> {
+    let max_path_len = area.width.saturating_sub(reserved) as usize;
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            truncate_start(&path.display().to_string(), max_path_len),
+            Style::default().fg(Color::Gray),
+        ),
+    ])
+}
+
+fn file_info_meta_line(label: &'static str, value: Option<SystemTime>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format_full_timestamp(value),
+            Style::default().fg(Color::White),
+        ),
+    ])
+}
+
 fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -1073,7 +1294,8 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let item_count = app.pkg_item_count();
+    let visible_indices = app.pkg_visible_indices();
+    let item_count = visible_indices.len();
     let inner_width = area.width.saturating_sub(2);
 
     if item_count == 0 {
@@ -1093,45 +1315,44 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let items: Vec<ListItem> = (0..item_count)
-        .filter_map(|visible_i| {
-            let real_i = app.pkg_visible_index(visible_i)?;
-            match app.pkg_view {
-                PkgView::SystemManagers => {
-                    let (package, manager) = app.flat_packages().get(real_i)?;
-                    let size = package
-                        .size
-                        .map(|s| human(s.allocated))
-                        .unwrap_or_else(|| String::from("?"));
-                    let use_status = app
-                        .dep_graph
-                        .as_ref()
-                        .map(|g| g.use_status(*manager, &package.name))
-                        .unwrap_or(PackageUseStatus::Untracked);
-                    Some(package_line_with_version(
-                        manager.label(),
-                        &package.name,
-                        &package.version,
-                        &size,
-                        use_status,
-                        inner_width,
-                    ))
-                }
-                PkgView::ProjectDeps => {
-                    let dep = app.project_deps.get(real_i)?;
-                    let size = dep
-                        .deps_size
-                        .map(|s| human(s.allocated))
-                        .unwrap_or_else(|| String::from("—"));
-                    let label = format!(
-                        "{} · {} deps · {}",
-                        dep.manager_label,
-                        dep.dep_count,
-                        dep.path.display()
-                    );
-                    let (name_width, size_width) = package_columns(inner_width);
-                    Some(package_line(&label, &size, name_width, size_width))
-                }
+    let items: Vec<ListItem> = visible_indices
+        .iter()
+        .copied()
+        .filter_map(|real_i| match app.pkg_view {
+            PkgView::SystemManagers => {
+                let (package, manager) = app.flat_packages().get(real_i)?;
+                let size = package
+                    .size
+                    .map(|s| human(s.allocated))
+                    .unwrap_or_else(|| String::from("?"));
+                let use_status = app
+                    .dep_graph
+                    .as_ref()
+                    .map(|g| g.use_status(*manager, &package.name))
+                    .unwrap_or(PackageUseStatus::Untracked);
+                Some(package_line_with_version(
+                    manager.label(),
+                    &package.name,
+                    &package.version,
+                    &size,
+                    use_status,
+                    inner_width,
+                ))
+            }
+            PkgView::ProjectDeps => {
+                let dep = app.project_deps.get(real_i)?;
+                let size = dep
+                    .deps_size
+                    .map(|s| human(s.allocated))
+                    .unwrap_or_else(|| String::from("—"));
+                let label = format!(
+                    "{} · {} deps · {}",
+                    dep.manager_label,
+                    dep.dep_count,
+                    dep.path.display()
+                );
+                let (name_width, size_width) = package_columns(inner_width);
+                Some(package_line(&label, &size, name_width, size_width))
             }
         })
         .collect();
@@ -1494,6 +1715,16 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
             ),
         ]));
     }
+    if let Some(path) = &pkg.metadata_path {
+        let max_path_len = area.width.saturating_sub(14) as usize;
+        lines.push(Line::from(vec![
+            Span::styled("  Metadata: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate(&path.display().to_string(), max_path_len),
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+    }
 
     lines.push(Line::from(""));
 
@@ -1716,6 +1947,12 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                             " · {} unreadable dirs; size is a lower bound",
                             entry.inaccessible
                         ),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                if entry.skipped_mounts > 0 {
+                    spans.push(Span::styled(
+                        format!(" · {} mounted volumes skipped", entry.skipped_mounts),
                         Style::default().fg(Color::Yellow),
                     ));
                 }
@@ -1965,7 +2202,7 @@ fn size_detail_with_cache_marker(size: SizeInfo, stale: bool) -> String {
     }
 }
 
-fn size_with_markers(bytes: u64, inaccessible: u32, stale: bool) -> String {
+fn size_with_markers(bytes: u64, inaccessible: u32, skipped_mounts: u32, stale: bool) -> String {
     let mut label = String::new();
     if stale {
         label.push('~');
@@ -1974,6 +2211,9 @@ fn size_with_markers(bytes: u64, inaccessible: u32, stale: bool) -> String {
         label.push('≥');
     }
     label.push_str(&human(bytes));
+    if skipped_mounts > 0 {
+        label.push('*');
+    }
     label
 }
 

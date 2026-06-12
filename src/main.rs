@@ -12,7 +12,7 @@ mod ui;
 
 use anyhow::{bail, Context, Result};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -300,7 +300,7 @@ Keys:
   Enter           Open selected directory or disk/package path
   Backspace       Go to parent directory
   /               Search files or filter packages
-  i               Show package details (packages pane) or disk details (disks pane)
+  i               Show file, package, or disk details in the active pane
   u               Toggle dependency-leaf package filter
   x               Uninstall selected package via its manager
   Left/Right, h/l Switch pane or package view
@@ -351,6 +351,7 @@ fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
             "total_logical": scan.size.logical,
             "total_allocated": scan.size.allocated,
             "inaccessible": scan.inaccessible,
+            "skipped_mounts": scan.skipped_mounts,
             "files": files,
         });
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -371,6 +372,12 @@ fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
         println!(
             "Warning: {} directories were unreadable; totals are lower bounds.",
             scan.inaccessible
+        );
+    }
+    if scan.skipped_mounts > 0 {
+        println!(
+            "Note: skipped {} mounted volumes under /Volumes.",
+            scan.skipped_mounts
         );
     }
     if scan.largest_files.is_empty() {
@@ -425,6 +432,7 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
                     "logical": finding.size.logical,
                     "allocated": finding.size.allocated,
                     "inaccessible": finding.inaccessible,
+                    "skipped_mounts": finding.skipped_mounts,
                     "note": finding.note,
                     "paths": finding
                         .paths
@@ -439,6 +447,7 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
             "total_logical": report.total.logical,
             "total_allocated": report.total.allocated,
             "inaccessible": report.inaccessible,
+            "skipped_mounts": report.skipped_mounts,
             "findings": findings,
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -455,6 +464,12 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
         println!(
             "Warning: {} directories were unreadable; totals are lower bounds.",
             report.inaccessible
+        );
+    }
+    if report.skipped_mounts > 0 {
+        println!(
+            "Note: skipped {} mounted volumes under /Volumes.",
+            report.skipped_mounts
         );
     }
     if report.findings.is_empty() {
@@ -702,6 +717,7 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
                             "logical": p.size.map(|s| s.logical),
                             "allocated": p.size.map(|s| s.allocated),
                             "path": p.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                            "metadata_path": p.metadata_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
                         })
                     })
                     .collect();
@@ -934,7 +950,7 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(err) = execute!(stdout, EnterAlternateScreen) {
             let _ = disable_raw_mode();
             return Err(err.into());
         }
@@ -945,7 +961,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
 }
 
@@ -1188,6 +1204,39 @@ where
                         let handled = match key.code {
                             KeyCode::Esc => {
                                 app.close_disk_info();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
+                    if app.file_info_open {
+                        let handled = match key.code {
+                            KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
+                                app.close_file_info();
+                                true
+                            }
+                            KeyCode::Char(' ') => {
+                                app.close_file_info();
+                                launch_external_action(app, ExternalAction::QuickLook);
+                                true
+                            }
+                            KeyCode::Char('f') => {
+                                app.close_file_info();
+                                launch_external_action(app, ExternalAction::RevealInFinder);
+                                true
+                            }
+                            KeyCode::Char('O') => {
+                                app.close_file_info();
+                                launch_external_action(app, ExternalAction::Open);
+                                true
+                            }
+                            KeyCode::Char('d') => {
+                                app.close_file_info();
+                                app.request_delete();
                                 true
                             }
                             _ => false,
@@ -1484,10 +1533,18 @@ where
                             app.enter_pkg_search();
                             true
                         }
+                        KeyCode::Char('i') if app.focus == Focus::Files => {
+                            app.open_file_info();
+                            true
+                        }
                         KeyCode::Char('i')
                             if app.focus == Focus::Packages && app.packages_loaded =>
                         {
                             app.open_pkg_detail();
+                            true
+                        }
+                        KeyCode::Char('i') if app.focus == Focus::Files => {
+                            app.open_file_info();
                             true
                         }
                         KeyCode::Char('i') if app.focus == Focus::Disks => {
@@ -1495,7 +1552,7 @@ where
                             true
                         }
                         KeyCode::Char('B') => {
-                            app.save_history_baseline()?;
+                            app.save_history_baseline();
                             true
                         }
                         KeyCode::Char('u')
@@ -1810,6 +1867,7 @@ mod tests {
                 version: String::from("0.1.5"),
                 size: None,
                 path: Some(pkg_path.clone()),
+                metadata_path: None,
             }],
             total_size: crate::bulkstat::SizeInfo::default(),
             available: true,

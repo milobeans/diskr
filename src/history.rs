@@ -104,8 +104,14 @@ pub fn diff(path: &Path) -> Result<DiffReport> {
             path.display()
         );
     };
+    diff_from_record(&baseline, path)
+}
+
+/// Compare a fresh scan of `path` against an already-loaded baseline.
+pub fn diff_from_record(baseline: &ScanRecord, path: &Path) -> Result<DiffReport> {
+    validate_dir(path)?;
     let current = scan_record(path)?;
-    Ok(diff_records(&baseline, &current))
+    Ok(diff_records(baseline, &current))
 }
 
 /// Pure diff of two scan records. `before`/`after` need not be sorted.

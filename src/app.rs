@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
+use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -67,6 +69,7 @@ pub struct Entry {
     pub size_stale: bool,
     pub cached_at: Option<u64>,
     pub inaccessible: u32,
+    pub skipped_mounts: u32,
     pub modified: Option<SystemTime>,
     pub scanning: bool,
 }
@@ -108,12 +111,226 @@ struct DiskInfoMsg {
     result: Result<space::SpaceReport, String>,
 }
 
+struct HistoryMsg {
+    request_id: u64,
+    cwd: PathBuf,
+    result: HistoryResult,
+}
+
+enum HistoryResult {
+    Diff(Result<history::DiffReport, String>),
+    Save(Result<history::ScanRecord, String>),
+}
+
 #[derive(Clone)]
 pub struct DiskInfo {
     pub name: String,
     pub mount: PathBuf,
     pub total: u64,
     pub available: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct FileInfo {
+    pub name: String,
+    pub path: PathBuf,
+    pub kind: &'static str,
+    pub direct_items: Option<usize>,
+    pub size: Option<SizeInfo>,
+    pub size_stale: bool,
+    pub inaccessible: u32,
+    pub created: Option<SystemTime>,
+    pub modified: Option<SystemTime>,
+    pub accessed: Option<SystemTime>,
+    pub owner: String,
+    pub group: String,
+    pub permissions_octal: String,
+    pub permissions_symbolic: String,
+    pub hard_links: u64,
+    pub xattr_count: Option<usize>,
+    pub has_quarantine_xattr: bool,
+}
+
+fn collect_file_info(entry: &Entry) -> Result<FileInfo> {
+    let meta = std::fs::symlink_metadata(&entry.path)
+        .with_context(|| format!("stat {}", entry.path.display()))?;
+    let file_type = meta.file_type();
+    let kind = if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_file() {
+        "file"
+    } else {
+        "special"
+    };
+    let direct_items = if file_type.is_dir() {
+        std::fs::read_dir(&entry.path)
+            .ok()
+            .map(|read| read.flatten().count())
+    } else {
+        None
+    };
+    let size = if entry.is_dir {
+        entry.size
+    } else if file_type.is_file() || file_type.is_symlink() {
+        Some(SizeInfo::new(meta.len(), meta.blocks().saturating_mul(512)))
+    } else {
+        None
+    };
+    let (xattr_count, has_quarantine_xattr) = list_xattrs(&entry.path);
+
+    Ok(FileInfo {
+        name: entry.name.clone(),
+        path: entry.path.clone(),
+        kind,
+        direct_items,
+        size,
+        size_stale: entry.size_stale,
+        inaccessible: entry.inaccessible,
+        created: system_time_from_unix(meta.st_birthtime(), meta.st_birthtime_nsec()),
+        modified: system_time_from_unix(meta.mtime(), meta.mtime_nsec()),
+        accessed: system_time_from_unix(meta.atime(), meta.atime_nsec()),
+        owner: lookup_user_name(meta.uid()),
+        group: lookup_group_name(meta.gid()),
+        permissions_octal: format!("{:04o}", meta.mode() & 0o7777),
+        permissions_symbolic: permission_string(meta.mode()),
+        hard_links: meta.nlink(),
+        xattr_count,
+        has_quarantine_xattr,
+    })
+}
+
+fn system_time_from_unix(secs: i64, nanos: i64) -> Option<SystemTime> {
+    if secs < 0 || nanos < 0 {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::from_secs(secs as u64) + Duration::from_nanos(nanos as u64))
+}
+
+fn permission_string(mode: u32) -> String {
+    let mut chars = ['-'; 9];
+    let flags = [
+        0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001,
+    ];
+    let symbols = ['r', 'w', 'x', 'r', 'w', 'x', 'r', 'w', 'x'];
+    for (idx, flag) in flags.iter().enumerate() {
+        if mode & flag != 0 {
+            chars[idx] = symbols[idx];
+        }
+    }
+    chars[2] = match (mode & 0o4000, chars[2]) {
+        (0, existing) => existing,
+        (_, 'x') => 's',
+        _ => 'S',
+    };
+    chars[5] = match (mode & 0o2000, chars[5]) {
+        (0, existing) => existing,
+        (_, 'x') => 's',
+        _ => 'S',
+    };
+    chars[8] = match (mode & 0o1000, chars[8]) {
+        (0, existing) => existing,
+        (_, 'x') => 't',
+        _ => 'T',
+    };
+    chars.into_iter().collect()
+}
+
+struct XattrSummary {
+    count: usize,
+    has_quarantine: bool,
+}
+
+fn parse_xattrs(bytes: &[u8]) -> XattrSummary {
+    let names: Vec<&[u8]> = bytes
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .collect();
+    XattrSummary {
+        count: names.len(),
+        has_quarantine: names.iter().any(|name| *name == b"com.apple.quarantine"),
+    }
+}
+
+fn list_xattrs(path: &Path) -> (Option<usize>, bool) {
+    let path = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(path) => path,
+        Err(_) => return (None, false),
+    };
+    let len =
+        unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, libc::XATTR_NOFOLLOW) };
+    if len < 0 {
+        return (None, false);
+    }
+    if len == 0 {
+        return (Some(0), false);
+    }
+
+    let mut buf = vec![0_u8; len as usize];
+    let filled = unsafe {
+        libc::listxattr(
+            path.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if filled < 0 {
+        return (None, false);
+    }
+
+    let summary = parse_xattrs(&buf[..filled as usize]);
+    (Some(summary.count), summary.has_quarantine)
+}
+
+fn lookup_user_name(uid: u32) -> String {
+    let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    let mut buf = vec![0_u8; 4096];
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            pwd.as_mut_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if status == 0 && !result.is_null() {
+        let pwd = unsafe { pwd.assume_init() };
+        if !pwd.pw_name.is_null() {
+            return unsafe { CStr::from_ptr(pwd.pw_name) }
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    uid.to_string()
+}
+
+fn lookup_group_name(gid: u32) -> String {
+    let mut grp = std::mem::MaybeUninit::<libc::group>::uninit();
+    let mut result = std::ptr::null_mut();
+    let mut buf = vec![0_u8; 4096];
+    let status = unsafe {
+        libc::getgrgid_r(
+            gid,
+            grp.as_mut_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if status == 0 && !result.is_null() {
+        let grp = unsafe { grp.assume_init() };
+        if !grp.gr_name.is_null() {
+            return unsafe { CStr::from_ptr(grp.gr_name) }
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    gid.to_string()
 }
 
 pub struct App {
@@ -148,9 +365,13 @@ pub struct App {
     pub pkg_search_mode: bool,
     pub pkg_search_query: String,
     pub pkg_search_matches: Vec<usize>,
+    cached_pkg_visible_indices: Vec<usize>,
+    cached_pkg_search_text: Vec<String>,
+    cached_project_dep_search_text: Vec<String>,
 
     pub scan_total: usize,
     pub scan_completed: usize,
+    pub scan_skipped_mounts: u32,
 
     pub files_area: ratatui_core::layout::Rect,
     pub file_list_offset: usize,
@@ -171,6 +392,8 @@ pub struct App {
     last_sort: Instant,
     sort_dirty: bool,
     active_scan_id: ScanId,
+    min_valid_scan_id: ScanId,
+    active_scan_paths: HashSet<PathBuf>,
 
     active_reclaim_scan_id: ScanId,
     reclaim_scan_rx: Option<Receiver<ReclaimMsg>>,
@@ -200,9 +423,16 @@ pub struct App {
     disk_info_id: ScanId,
     disk_info_scan_rx: Option<Receiver<DiskInfoMsg>>,
     pub disk_info_report: Option<space::SpaceReport>,
+    #[allow(dead_code)]
+    pub file_info: Option<FileInfo>,
+    #[allow(dead_code)]
+    pub file_info_open: bool,
 
     pub history_baseline: Option<history::ScanRecord>,
     pub history_diff: Option<history::DiffReport>,
+    active_history_request_id: u64,
+    history_loading: bool,
+    history_rx: Option<Receiver<HistoryMsg>>,
 
     scan_rx: Receiver<ScanMsg>,
     scanner: Scanner,
@@ -298,7 +528,7 @@ impl App {
             sort: SortMode::SizeDesc,
             focus: Focus::Files,
             disks: Vec::new(),
-            status: String::from("Space preview · f Finder · O open"),
+            status: String::from("i info · Space preview · f Finder · O open"),
             confirming_delete: false,
             pkg_reports: Vec::new(),
             project_deps: Vec::new(),
@@ -316,8 +546,12 @@ impl App {
             pkg_search_mode: false,
             pkg_search_query: String::new(),
             pkg_search_matches: Vec::new(),
+            cached_pkg_visible_indices: Vec::new(),
+            cached_pkg_search_text: Vec::new(),
+            cached_project_dep_search_text: Vec::new(),
             scan_total: 0,
             scan_completed: 0,
+            scan_skipped_mounts: 0,
             files_area: ratatui_core::layout::Rect::default(),
             file_list_offset: 0,
             pending_delete: None,
@@ -334,6 +568,8 @@ impl App {
             last_sort: Instant::now(),
             sort_dirty: false,
             active_scan_id: 0,
+            min_valid_scan_id: 0,
+            active_scan_paths: HashSet::new(),
             active_reclaim_scan_id: 0,
             reclaim_scan_rx: None,
             reclaim_report: None,
@@ -359,8 +595,13 @@ impl App {
             disk_info_id: 0,
             disk_info_scan_rx: None,
             disk_info_report: None,
+            file_info: None,
+            file_info_open: false,
             history_baseline: None,
             history_diff: None,
+            active_history_request_id: 0,
+            history_loading: false,
+            history_rx: None,
             scanner: Scanner::new(tx.clone()),
             scan_rx: rx,
             active_pkg_scan_id: 0,
@@ -387,12 +628,19 @@ impl App {
     }
 
     pub fn refresh_history_state(&mut self) {
-        self.history_baseline = history::load_record_for_path(&self.cwd).unwrap_or(None);
-        self.history_diff = if self.history_baseline.is_some() {
-            history::diff(&self.cwd).ok()
-        } else {
-            None
+        let baseline = history::load_record_for_path(&self.cwd).unwrap_or(None);
+        self.apply_history_baseline(baseline);
+    }
+
+    fn apply_history_baseline(&mut self, baseline: Option<history::ScanRecord>) {
+        self.history_rx = None;
+        self.history_loading = false;
+        self.history_baseline = baseline;
+        self.history_diff = None;
+        let Some(baseline) = self.history_baseline.clone() else {
+            return;
         };
+        self.start_history_diff_request(self.cwd.clone(), baseline);
     }
 
     pub fn history_baseline_status(&self) -> Option<String> {
@@ -502,6 +750,7 @@ impl App {
                 size_stale,
                 cached_at,
                 inaccessible,
+                skipped_mounts: 0,
                 modified,
                 scanning: false,
             });
@@ -768,6 +1017,7 @@ impl App {
         if self.confirming_delete {
             return;
         }
+        self.invalidate_pending_scan_results();
         let previous_selected = self
             .entries
             .get(self.selected)
@@ -845,7 +1095,10 @@ impl App {
                     path,
                     size,
                     inaccessible,
-                } if scan_id == self.active_scan_id => {
+                    skipped_mounts,
+                } if scan_id >= self.min_valid_scan_id => {
+                    let is_active_scan = scan_id == self.active_scan_id;
+                    let keep_scanning = !is_active_scan && self.active_scan_paths.contains(&path);
                     let scanned_at = now_secs();
                     self.record_cached_size(path.clone(), size, inaccessible, scanned_at, false);
                     if let Some(&idx) = self.entry_index.get(&path) {
@@ -854,31 +1107,47 @@ impl App {
                             e.size_stale = false;
                             e.cached_at = Some(scanned_at);
                             e.inaccessible = inaccessible;
-                            e.scanning = false;
+                            e.skipped_mounts = skipped_mounts;
+                            if !keep_scanning {
+                                e.scanning = false;
+                            }
                             changed = true;
                         }
-                    }
-                    self.scan_completed += 1;
-                    if self.scan_completed < self.scan_total {
-                        self.status = format!(
-                            "scanned {}: {}/{}",
-                            scan_path_label(&path),
-                            self.scan_completed,
-                            self.scan_total
-                        );
                     }
                     if self.sort == SortMode::SizeDesc {
                         self.sort_dirty = true;
                     }
+                    if is_active_scan {
+                        self.active_scan_paths.remove(&path);
+                        self.scan_skipped_mounts =
+                            self.scan_skipped_mounts.saturating_add(skipped_mounts);
+                        self.scan_completed += 1;
+                        if self.scan_completed < self.scan_total {
+                            self.status = format!(
+                                "scanned {}: {}/{}",
+                                scan_path_label(&path),
+                                self.scan_completed,
+                                self.scan_total
+                            );
+                        }
+                    }
                 }
                 ScanMsg::AllDone { scan_id } if scan_id == self.active_scan_id => {
+                    self.active_scan_paths.clear();
                     for entry in &mut self.entries {
                         entry.scanning = false;
                     }
                     if self.sort_dirty {
                         self.apply_sort_preserving_selection();
                     }
-                    self.status = String::from("scan complete");
+                    self.status = if self.scan_skipped_mounts > 0 {
+                        format!(
+                            "scan complete · skipped {} mounted volumes under /Volumes",
+                            self.scan_skipped_mounts
+                        )
+                    } else {
+                        String::from("scan complete")
+                    };
                     changed = true;
                 }
                 _ => {}
@@ -903,16 +1172,15 @@ impl App {
         changed |= self.drain_reclaim_results();
         changed |= self.drain_top_files_results();
         changed |= self.drain_disk_info_results();
+        changed |= self.drain_history_results();
         changed |= self.drain_empty_trash_results();
         changed
     }
 
-    pub fn save_history_baseline(&mut self) -> Result<()> {
-        let record = history::save(&self.cwd)?;
-        self.history_baseline = Some(record);
+    pub fn save_history_baseline(&mut self) {
+        self.start_history_save_request(self.cwd.clone());
         self.history_diff = None;
-        self.status = String::from("baseline saved");
-        Ok(())
+        self.status = String::from("saving baseline...");
     }
 
     pub fn top_files_open(&self) -> bool {
@@ -1068,6 +1336,86 @@ impl App {
     fn next_disk_info_scan_id(&mut self) -> ScanId {
         self.disk_info_id = self.disk_info_id.saturating_add(1);
         self.disk_info_id
+    }
+
+    fn next_history_request_id(&mut self) -> u64 {
+        self.active_history_request_id = self.active_history_request_id.saturating_add(1);
+        self.active_history_request_id
+    }
+
+    fn start_history_diff_request(&mut self, cwd: PathBuf, baseline: history::ScanRecord) {
+        let request_id = self.next_history_request_id();
+        let (tx, rx) = channel();
+        self.history_rx = Some(rx);
+        self.history_loading = true;
+        thread::spawn(move || {
+            let result = history::diff_from_record(&baseline, &cwd).map_err(|err| err.to_string());
+            let _ = tx.send(HistoryMsg {
+                request_id,
+                cwd,
+                result: HistoryResult::Diff(result),
+            });
+        });
+    }
+
+    fn start_history_save_request(&mut self, cwd: PathBuf) {
+        let request_id = self.next_history_request_id();
+        let (tx, rx) = channel();
+        self.history_rx = Some(rx);
+        self.history_loading = true;
+        thread::spawn(move || {
+            let result = history::save(&cwd).map_err(|err| err.to_string());
+            let _ = tx.send(HistoryMsg {
+                request_id,
+                cwd,
+                result: HistoryResult::Save(result),
+            });
+        });
+    }
+
+    fn drain_history_results(&mut self) -> bool {
+        let Some(rx) = self.history_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(msg) => {
+                self.history_loading = false;
+                if msg.request_id != self.active_history_request_id || msg.cwd != self.cwd {
+                    self.status = String::from("discarded stale history result");
+                    return true;
+                }
+                match msg.result {
+                    HistoryResult::Diff(Ok(diff)) => {
+                        self.history_diff = Some(diff);
+                        true
+                    }
+                    HistoryResult::Diff(Err(err)) => {
+                        self.history_diff = None;
+                        self.status = format!("history diff failed: {err}");
+                        true
+                    }
+                    HistoryResult::Save(Ok(record)) => {
+                        self.history_baseline = Some(record);
+                        self.history_diff = None;
+                        self.status = String::from("baseline saved");
+                        true
+                    }
+                    HistoryResult::Save(Err(err)) => {
+                        self.status = format!("baseline save failed: {err}");
+                        true
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                self.history_rx = Some(rx);
+                false
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.history_loading = false;
+                self.status = String::from("history worker failed");
+                true
+            }
+        }
     }
 
     pub fn reclaim_item_count(&self) -> usize {
@@ -1309,6 +1657,26 @@ impl App {
         self.disk_info_scan_rx = None;
     }
 
+    pub fn open_file_info(&mut self) {
+        let Some(entry) = self.visible_entry(self.selected).cloned() else {
+            self.status = String::from("no file selected");
+            return;
+        };
+        match collect_file_info(&entry) {
+            Ok(info) => {
+                self.file_info = Some(info);
+                self.file_info_open = true;
+            }
+            Err(err) => {
+                self.status = format!("file info failed: {err}");
+            }
+        }
+    }
+
+    pub fn close_file_info(&mut self) {
+        self.file_info_open = false;
+    }
+
     /// Explain-first guardrail: emptying the Trash is permanent, so `E` only
     /// arms a confirmation here; the actual work happens in
     /// [`App::confirm_empty_trash`] on a background thread.
@@ -1432,6 +1800,7 @@ impl App {
             || self.top_files_loading
             || self.reclaim_loading
             || self.disk_info_loading
+            || self.history_loading
             || self.packages_loading
             || self.deps_loading
             || self.uninstall_rx.is_some()
@@ -1465,52 +1834,62 @@ impl App {
                     self.status = String::from("press Enter on a reclaim finding to list paths");
                 }
             }
-            Focus::Packages => match self.pkg_view {
-                PkgView::SystemManagers => {
-                    let real_idx = self
-                        .pkg_visible_index(self.selected_pkg)
-                        .unwrap_or(usize::MAX);
-                    let packages = &self.cached_flat_packages;
-                    if let Some((package, manager)) = packages.get(real_idx) {
-                        if *manager == packages::Manager::BrewCask {
-                            self.request_uninstall();
-                        } else if let Some(path) = &package.path {
-                            self.pending_delete = Some(DeleteTarget::Package {
-                                name: format!("{} {}", manager.label(), package.name),
-                                path: path.clone(),
-                                is_project_dep: false,
-                            });
-                            self.confirming_delete = true;
-                        } else {
-                            self.status = format!("no path known for package {}", package.name);
+            Focus::Packages => {
+                if self.cached_pkg_visible_indices.is_empty()
+                    && match self.pkg_view {
+                        PkgView::SystemManagers => !self.cached_flat_packages.is_empty(),
+                        PkgView::ProjectDeps => !self.project_deps.is_empty(),
+                    }
+                {
+                    self.rebuild_pkg_visible_indices();
+                }
+                match self.pkg_view {
+                    PkgView::SystemManagers => {
+                        let real_idx = self
+                            .pkg_visible_index(self.selected_pkg)
+                            .unwrap_or(usize::MAX);
+                        let packages = &self.cached_flat_packages;
+                        if let Some((package, manager)) = packages.get(real_idx) {
+                            if *manager == packages::Manager::BrewCask {
+                                self.request_uninstall();
+                            } else if let Some(path) = &package.path {
+                                self.pending_delete = Some(DeleteTarget::Package {
+                                    name: format!("{} {}", manager.label(), package.name),
+                                    path: path.clone(),
+                                    is_project_dep: false,
+                                });
+                                self.confirming_delete = true;
+                            } else {
+                                self.status = format!("no path known for package {}", package.name);
+                            }
+                        }
+                    }
+                    PkgView::ProjectDeps => {
+                        let real_idx = self
+                            .pkg_visible_index(self.selected_pkg)
+                            .unwrap_or(usize::MAX);
+                        if let Some(dep) = self.project_deps.get(real_idx) {
+                            if let Some(deps_dir) = &dep.deps_dir {
+                                self.pending_delete = Some(DeleteTarget::Package {
+                                    name: format!(
+                                        "{} dependency dir ({})",
+                                        dep.manager_label,
+                                        deps_dir.display()
+                                    ),
+                                    path: deps_dir.clone(),
+                                    is_project_dep: true,
+                                });
+                                self.confirming_delete = true;
+                            } else {
+                                self.status = format!(
+                                    "no local dependency directory to delete for {}",
+                                    dep.manifest
+                                );
+                            }
                         }
                     }
                 }
-                PkgView::ProjectDeps => {
-                    let real_idx = self
-                        .pkg_visible_index(self.selected_pkg)
-                        .unwrap_or(usize::MAX);
-                    if let Some(dep) = self.project_deps.get(real_idx) {
-                        if let Some(deps_dir) = &dep.deps_dir {
-                            self.pending_delete = Some(DeleteTarget::Package {
-                                name: format!(
-                                    "{} dependency dir ({})",
-                                    dep.manager_label,
-                                    deps_dir.display()
-                                ),
-                                path: deps_dir.clone(),
-                                is_project_dep: true,
-                            });
-                            self.confirming_delete = true;
-                        } else {
-                            self.status = format!(
-                                "no local dependency directory to delete for {}",
-                                dep.manifest
-                            );
-                        }
-                    }
-                }
-            },
+            }
         }
     }
 
@@ -1710,12 +2089,27 @@ impl App {
     /// When a path changes (deletion, write), its own cache entry and every
     /// ancestor's cached size are now stale.
     fn invalidate_cache_for(&mut self, path: &Path) {
+        self.invalidate_pending_scan_results();
         self.remove_cached_size(path);
         let mut p = path.parent();
         while let Some(parent) = p {
             self.remove_cached_size(parent);
             p = parent.parent();
         }
+    }
+
+    fn invalidate_pending_scan_results(&mut self) {
+        let next_valid_scan_id = self.active_scan_id.saturating_add(1);
+        self.min_valid_scan_id = self.min_valid_scan_id.max(next_valid_scan_id);
+        self.active_scan_id = next_valid_scan_id;
+        self.active_scan_paths.clear();
+        self.scan_total = 0;
+        self.scan_completed = 0;
+        self.scan_skipped_mounts = 0;
+        for entry in &mut self.entries {
+            entry.scanning = false;
+        }
+        self.scanner.cancel_current();
     }
 
     fn next_scan_id(&mut self) -> ScanId {
@@ -1777,6 +2171,8 @@ impl App {
         let scan_id = self.next_scan_id();
         self.scan_total = dirs.len();
         self.scan_completed = 0;
+        self.scan_skipped_mounts = 0;
+        self.active_scan_paths = dirs.iter().cloned().collect();
         let dir_set: HashSet<&Path> = dirs.iter().map(PathBuf::as_path).collect();
         for entry in &mut self.entries {
             entry.scanning = dir_set.contains(entry.path.as_path());
@@ -1787,6 +2183,7 @@ impl App {
                 for entry in &mut self.entries {
                     entry.scanning = false;
                 }
+                self.active_scan_paths.clear();
                 self.sort_dirty = false;
                 self.status = format!("could not start scanner: {err}");
             }
@@ -1855,6 +2252,7 @@ impl App {
                     }
                     self.project_deps = msg.project_deps;
                     self.project_deps_cwd = Some(msg.cwd);
+                    self.rebuild_project_dep_search_text();
                     self.rebuild_flat_packages();
                     self.selected_pkg = self
                         .selected_pkg
@@ -1932,6 +2330,13 @@ impl App {
             Ok(msg) => {
                 let dependency_leaves = msg.graph.dependency_leaf_count();
                 self.dep_graph = Some(msg.graph);
+                self.rebuild_pkg_visible_indices();
+                if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+                    self.update_pkg_search();
+                }
+                self.selected_pkg = self
+                    .selected_pkg
+                    .min(self.pkg_item_count().saturating_sub(1));
                 self.deps_loading = false;
                 self.dep_scan_rx = None;
                 let total = self.cached_flat_packages.len();
@@ -1980,6 +2385,7 @@ impl App {
 
     pub fn toggle_unused_filter(&mut self) {
         self.pkg_show_unused = !self.pkg_show_unused;
+        self.rebuild_pkg_visible_indices();
         self.selected_pkg = 0;
         self.pkg_search_matches.clear();
         self.pkg_search_query.clear();
@@ -2075,6 +2481,10 @@ impl App {
             PkgView::SystemManagers => PkgView::ProjectDeps,
             PkgView::ProjectDeps => PkgView::SystemManagers,
         };
+        self.rebuild_pkg_visible_indices();
+        if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+            self.update_pkg_search();
+        }
         self.selected_pkg = 0;
     }
 
@@ -2094,28 +2504,49 @@ impl App {
         graph.use_status(*manager, &pkg.name) == packages::PackageUseStatus::DependencyLeaf
     }
 
-    fn base_pkg_indices(&self) -> Vec<usize> {
+    fn rebuild_pkg_visible_indices(&mut self) {
         let total = match self.pkg_view {
             PkgView::SystemManagers => self.cached_flat_packages.len(),
             PkgView::ProjectDeps => self.project_deps.len(),
         };
-        (0..total)
+        self.cached_pkg_visible_indices = (0..total)
             .filter(|&i| self.pkg_passes_unused_filter(i))
-            .collect()
+            .collect();
     }
 
     pub fn pkg_item_count(&self) -> usize {
         if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
             return self.pkg_search_matches.len();
         }
-        self.base_pkg_indices().len()
+        if self.cached_pkg_visible_indices.is_empty() {
+            return match self.pkg_view {
+                PkgView::SystemManagers => self.cached_flat_packages.len(),
+                PkgView::ProjectDeps => self.project_deps.len(),
+            };
+        }
+        self.cached_pkg_visible_indices.len()
     }
 
     pub fn pkg_visible_index(&self, visible_index: usize) -> Option<usize> {
         if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
             return self.pkg_search_matches.get(visible_index).copied();
         }
-        self.base_pkg_indices().get(visible_index).copied()
+        if self.cached_pkg_visible_indices.is_empty() {
+            let total = match self.pkg_view {
+                PkgView::SystemManagers => self.cached_flat_packages.len(),
+                PkgView::ProjectDeps => self.project_deps.len(),
+            };
+            return (visible_index < total).then_some(visible_index);
+        }
+        self.cached_pkg_visible_indices.get(visible_index).copied()
+    }
+
+    pub fn pkg_visible_indices(&self) -> &[usize] {
+        if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+            &self.pkg_search_matches
+        } else {
+            &self.cached_pkg_visible_indices
+        }
     }
 
     pub fn enter_pkg_search(&mut self) {
@@ -2130,8 +2561,11 @@ impl App {
         self.pkg_search_query.clear();
         self.pkg_search_matches.clear();
         if let Some(idx) = real_index {
-            let base = self.base_pkg_indices();
-            self.selected_pkg = base.iter().position(|&i| i == idx).unwrap_or(0);
+            self.selected_pkg = self
+                .cached_pkg_visible_indices
+                .iter()
+                .position(|&i| i == idx)
+                .unwrap_or(0);
         }
     }
 
@@ -2152,25 +2586,25 @@ impl App {
 
     fn update_pkg_search(&mut self) {
         let query = self.pkg_search_query.to_lowercase();
-        let base = self.base_pkg_indices();
         self.pkg_search_matches = match self.pkg_view {
-            PkgView::SystemManagers => base
-                .into_iter()
+            PkgView::SystemManagers => self
+                .cached_pkg_visible_indices
+                .iter()
+                .copied()
                 .filter(|&i| {
-                    let Some((pkg, mgr)) = self.cached_flat_packages.get(i) else {
-                        return false;
-                    };
-                    pkg.name.to_lowercase().contains(&query) || mgr.label().contains(&query)
+                    self.cached_pkg_search_text
+                        .get(i)
+                        .is_some_and(|text| text.contains(&query))
                 })
                 .collect(),
-            PkgView::ProjectDeps => base
-                .into_iter()
+            PkgView::ProjectDeps => self
+                .cached_pkg_visible_indices
+                .iter()
+                .copied()
                 .filter(|&i| {
-                    let Some(dep) = self.project_deps.get(i) else {
-                        return false;
-                    };
-                    dep.path.to_string_lossy().to_lowercase().contains(&query)
-                        || dep.manager_label.contains(&query)
+                    self.cached_project_dep_search_text
+                        .get(i)
+                        .is_some_and(|text| text.contains(&query))
                 })
                 .collect(),
         };
@@ -2212,6 +2646,31 @@ impl App {
             b_size.cmp(&a_size).then(a.name.cmp(&b.name))
         });
         self.cached_flat_packages = pkgs;
+        self.cached_pkg_search_text = self
+            .cached_flat_packages
+            .iter()
+            .map(|(pkg, manager)| format!("{} {}", pkg.name, manager.label()).to_lowercase())
+            .collect();
+        self.rebuild_pkg_visible_indices();
+        if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+            self.update_pkg_search();
+        }
+    }
+
+    fn rebuild_project_dep_search_text(&mut self) {
+        self.cached_project_dep_search_text = self
+            .project_deps
+            .iter()
+            .map(|dep| {
+                format!(
+                    "{} {} {}",
+                    dep.manager_label,
+                    dep.manifest,
+                    dep.path.display().to_string().to_lowercase()
+                )
+                .to_lowercase()
+            })
+            .collect();
     }
 
     pub fn refresh_disks(&mut self) {
@@ -2734,6 +3193,28 @@ fn to_local_tm(secs: u64) -> Option<libc::tm> {
     Some(tm)
 }
 
+pub fn format_full_timestamp(timestamp: Option<SystemTime>) -> String {
+    timestamp
+        .and_then(|time| {
+            let secs = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
+            let tm = to_local_tm(secs)?;
+            Some(format_calendar_timestamp(&tm))
+        })
+        .unwrap_or_else(|| String::from("?"))
+}
+
+fn format_calendar_timestamp(tm: &libc::tm) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
 fn disk_info() -> Vec<DiskInfo> {
     let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
     if count <= 0 {
@@ -3021,6 +3502,8 @@ mod tests {
         }];
         app.focus = Focus::Packages;
         app.pkg_view = PkgView::ProjectDeps;
+        app.rebuild_project_dep_search_text();
+        app.rebuild_pkg_visible_indices();
         app.selected_pkg = 0;
 
         app.request_delete();
@@ -3057,6 +3540,7 @@ mod tests {
                     version: "1.0".into(),
                     size: None,
                     path: None,
+                    metadata_path: None,
                 },
                 packages::Manager::Brew,
             ),
@@ -3066,6 +3550,7 @@ mod tests {
                     version: "2.0".into(),
                     size: None,
                     path: None,
+                    metadata_path: None,
                 },
                 packages::Manager::Brew,
             ),
@@ -3075,6 +3560,7 @@ mod tests {
                     version: "base".into(),
                     size: None,
                     path: None,
+                    metadata_path: None,
                 },
                 packages::Manager::BrewCask,
             ),
@@ -3120,6 +3606,98 @@ mod tests {
     }
 
     #[test]
+    fn package_visibility_cache_tracks_filter_view_and_search_transitions() {
+        let root = test_root("pkg_visibility_cache");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Packages;
+        app.pkg_reports = vec![packages::ManagerReport {
+            manager: packages::Manager::Brew,
+            packages: vec![
+                packages::Package {
+                    name: "alpha".into(),
+                    version: "1.0".into(),
+                    size: Some(SizeInfo::new(20, 20)),
+                    path: None,
+                    metadata_path: None,
+                },
+                packages::Package {
+                    name: "beta".into(),
+                    version: "1.0".into(),
+                    size: Some(SizeInfo::new(10, 10)),
+                    path: None,
+                    metadata_path: None,
+                },
+            ],
+            total_size: SizeInfo::new(30, 30),
+            available: true,
+        }];
+        app.dep_graph = Some(DepGraph::from_entries(vec![
+            (
+                packages::Manager::Brew,
+                "alpha",
+                packages::DepInfo {
+                    dependencies: Vec::new(),
+                    dependents: Vec::new(),
+                    evidence: packages::DepEvidence::ManagerGraph,
+                },
+            ),
+            (
+                packages::Manager::Brew,
+                "beta",
+                packages::DepInfo {
+                    dependencies: Vec::new(),
+                    dependents: vec!["tool".into()],
+                    evidence: packages::DepEvidence::ManagerGraph,
+                },
+            ),
+        ]));
+        app.rebuild_flat_packages();
+
+        assert_eq!(app.pkg_visible_indices(), &[0, 1]);
+
+        app.toggle_unused_filter();
+        assert_eq!(app.pkg_visible_indices(), &[0]);
+
+        app.enter_pkg_search();
+        app.pkg_search_push('a');
+        assert_eq!(app.pkg_visible_indices(), &[0]);
+
+        app.exit_pkg_search();
+        app.project_deps = vec![
+            ProjectDeps {
+                path: root.join("Cargo.toml"),
+                manager_label: "cargo",
+                manifest: "Cargo.toml",
+                dep_count: 4,
+                deps_size: Some(SizeInfo::new(100, 100)),
+                deps_dir: Some(root.join("target")),
+            },
+            ProjectDeps {
+                path: root.join("package.json"),
+                manager_label: "npm/bun/yarn",
+                manifest: "package.json",
+                dep_count: 8,
+                deps_size: Some(SizeInfo::new(200, 200)),
+                deps_dir: Some(root.join("node_modules")),
+            },
+        ];
+        app.rebuild_project_dep_search_text();
+        app.toggle_pkg_view();
+
+        assert_eq!(app.pkg_visible_indices(), &[0, 1]);
+
+        app.enter_pkg_search();
+        for ch in "cargo".chars() {
+            app.pkg_search_push(ch);
+        }
+        assert_eq!(app.pkg_visible_indices(), &[0]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn disk_pane_selection_can_open_mounts() {
         let root = test_root("disk_pane");
         let first = root.join("first");
@@ -3150,6 +3728,42 @@ mod tests {
 
         assert_eq!(app.cwd, second);
         assert!(app.focus == Focus::Files);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn open_file_info_collects_selected_entry_metadata() {
+        let root = test_root("file_info_modal");
+        let subdir = root.join("subdir");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::write(subdir.join("child.txt"), b"child").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        let known_size = SizeInfo::new(42, 64);
+        app.size_cache.insert(subdir.clone(), known_size);
+        for entry in &mut app.entries {
+            if entry.path == subdir {
+                entry.size = Some(known_size);
+            }
+        }
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == subdir)
+            .unwrap();
+
+        app.open_file_info();
+
+        let info = app.file_info.as_ref().expect("file info");
+        assert!(app.file_info_open);
+        assert_eq!(info.kind, "directory");
+        assert_eq!(info.path, subdir);
+        assert_eq!(info.direct_items, Some(1));
+        assert_eq!(info.size, Some(known_size));
+        assert_eq!(info.permissions_symbolic.len(), 9);
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3201,6 +3815,97 @@ mod tests {
     }
 
     #[test]
+    fn permission_string_formats_special_bits() {
+        assert_eq!(permission_string(0o755), "rwxr-xr-x");
+        assert_eq!(permission_string(0o4755), "rwsr-xr-x");
+        assert_eq!(permission_string(0o1777), "rwxrwxrwt");
+    }
+
+    #[test]
+    fn parse_xattrs_detects_quarantine() {
+        let summary = parse_xattrs(b"com.apple.lastuseddate#PS\0com.apple.quarantine\0user.test\0");
+        assert_eq!(summary.count, 3);
+        assert!(summary.has_quarantine);
+    }
+
+    #[test]
+    fn format_calendar_timestamp_uses_fixed_layout() {
+        let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
+        tm.tm_year = 126;
+        tm.tm_mon = 5;
+        tm.tm_mday = 12;
+        tm.tm_hour = 7;
+        tm.tm_min = 8;
+        tm.tm_sec = 9;
+        assert_eq!(format_calendar_timestamp(&tm), "2026-06-12 07:08:09");
+    }
+
+    #[test]
+    fn apply_history_baseline_schedules_background_diff() {
+        let root = test_root("history_async_refresh");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file.txt"), b"hello").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        let baseline = history::ScanRecord {
+            path: root.clone(),
+            timestamp: now_secs().saturating_sub(30),
+            children: Vec::new(),
+        };
+
+        app.apply_history_baseline(Some(baseline.clone()));
+
+        assert_eq!(app.history_baseline.as_ref(), Some(&baseline));
+        assert!(app.history_loading);
+        assert!(app.history_rx.is_some());
+        assert!(app.history_diff.is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_history_result_is_ignored_after_cwd_change() {
+        let root_a = test_root("stale_history_a");
+        let root_b = test_root("stale_history_b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+
+        let mut app = App::new(root_a.clone()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.active_history_request_id = 5;
+        app.history_rx = Some(rx);
+        app.history_loading = true;
+        app.history_baseline = Some(history::ScanRecord {
+            path: root_a.clone(),
+            timestamp: 100,
+            children: Vec::new(),
+        });
+        app.cwd = root_b.clone();
+
+        tx.send(HistoryMsg {
+            request_id: 5,
+            cwd: root_a.clone(),
+            result: HistoryResult::Diff(Ok(history::DiffReport {
+                path: root_a.clone(),
+                baseline_timestamp: 100,
+                current_timestamp: 200,
+                before_total: SizeInfo::default(),
+                after_total: SizeInfo::new(1, 1),
+                changes: Vec::new(),
+            })),
+        })
+        .unwrap();
+
+        assert!(app.drain_history_results());
+        assert!(app.history_diff.is_none());
+        assert!(!app.history_loading);
+        assert!(app.status.contains("stale history"));
+
+        fs::remove_dir_all(root_a).unwrap();
+        fs::remove_dir_all(root_b).unwrap();
+    }
+
+    #[test]
     fn stale_reclaim_scan_result_is_ignored_after_cwd_change() {
         let root_a = test_root("stale_reclaim_a");
         let root_b = test_root("stale_reclaim_b");
@@ -3222,6 +3927,7 @@ mod tests {
                 findings: Vec::new(),
                 total: SizeInfo::default(),
                 inaccessible: 0,
+                skipped_mounts: 0,
             },
         })
         .unwrap();
@@ -3681,6 +4387,7 @@ mod tests {
                 size_stale: false,
                 cached_at: None,
                 inaccessible: 0,
+                skipped_mounts: 0,
                 modified: None,
                 scanning: false,
             },
@@ -3694,6 +4401,7 @@ mod tests {
                 size_stale: false,
                 cached_at: None,
                 inaccessible: 0,
+                skipped_mounts: 0,
                 modified: None,
                 scanning: false,
             },
@@ -3707,6 +4415,7 @@ mod tests {
                 size_stale: false,
                 cached_at: None,
                 inaccessible: 0,
+                skipped_mounts: 0,
                 modified: None,
                 scanning: false,
             },
@@ -3730,6 +4439,7 @@ mod tests {
             path: dir_b.clone(),
             size: SizeInfo::new(508 * 1024 * 1024, 508 * 1024 * 1024),
             inaccessible: 0,
+            skipped_mounts: 0,
         })
         .unwrap();
         app.drain_scan_results();
@@ -3755,6 +4465,100 @@ mod tests {
             Some(SizeInfo::new(508 * 1024 * 1024, 508 * 1024 * 1024)),
             "dir_b scan result must land on dir_b"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn superseded_dir_size_result_is_salvaged_into_cache() {
+        let root = test_root("stale_scan_salvage");
+        let stale_dir = root.join("stale-dir");
+        let active_dir = root.join("active-dir");
+        fs::create_dir_all(&stale_dir).unwrap();
+        fs::create_dir_all(&active_dir).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.scan_rx = rx;
+        app.active_scan_id = 2;
+        app.scan_total = 1;
+        app.scan_completed = 0;
+        app.active_scan_paths = HashSet::from([active_dir.clone()]);
+        app.size_cache.clear();
+        for entry in &mut app.entries {
+            if entry.path == stale_dir {
+                entry.size = None;
+                entry.scanning = true;
+            }
+        }
+
+        tx.send(ScanMsg::DirSize {
+            scan_id: 1,
+            path: stale_dir.clone(),
+            size: SizeInfo::new(12_345, 16_384),
+            inaccessible: 1,
+            skipped_mounts: 2,
+        })
+        .unwrap();
+
+        assert!(app.drain_scan_results());
+        assert_eq!(
+            app.size_cache.get(&stale_dir),
+            Some(&SizeInfo::new(12_345, 16_384))
+        );
+        assert_eq!(app.inaccessible_cache.get(&stale_dir), Some(&1));
+        assert_eq!(
+            app.scan_completed, 0,
+            "stale results must not advance active progress"
+        );
+        let entry = app
+            .entries
+            .iter()
+            .find(|entry| entry.path == stale_dir)
+            .unwrap();
+        assert_eq!(entry.size, Some(SizeInfo::new(12_345, 16_384)));
+        assert_eq!(entry.inaccessible, 1);
+        assert_eq!(entry.skipped_mounts, 2);
+        assert!(!entry.scanning);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_invalidating_changes_reject_older_scan_results() {
+        let root = test_root("stale_scan_reject");
+        let dir = root.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.scan_rx = rx;
+        app.active_scan_id = 7;
+        app.size_cache.clear();
+        for entry in &mut app.entries {
+            if entry.path == dir {
+                entry.size = None;
+                entry.scanning = true;
+            }
+        }
+
+        app.invalidate_cache_for(&dir.join("changed.txt"));
+        assert_eq!(app.min_valid_scan_id, 8);
+
+        tx.send(ScanMsg::DirSize {
+            scan_id: 7,
+            path: dir.clone(),
+            size: SizeInfo::new(99, 128),
+            inaccessible: 0,
+            skipped_mounts: 0,
+        })
+        .unwrap();
+
+        assert!(!app.drain_scan_results());
+        assert!(!app.size_cache.contains_key(&dir));
+        let entry = app.entries.iter().find(|entry| entry.path == dir).unwrap();
+        assert_eq!(entry.size, None);
+        assert!(!entry.scanning);
+
         fs::remove_dir_all(root).unwrap();
     }
 

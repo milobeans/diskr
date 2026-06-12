@@ -13,6 +13,7 @@ pub struct Package {
     pub version: String,
     pub size: Option<SizeInfo>,
     pub path: Option<PathBuf>,
+    pub metadata_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -464,6 +465,18 @@ fn scan_brew_casks() -> Vec<Package> {
 }
 
 fn parse_brew_cask_json(output: &str, caskroom: &Path) -> Vec<Package> {
+    let mut app_roots = vec![PathBuf::from("/Applications")];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        app_roots.push(home.join("Applications"));
+    }
+    parse_brew_cask_json_with_app_roots(output, caskroom, &app_roots)
+}
+
+fn parse_brew_cask_json_with_app_roots(
+    output: &str,
+    caskroom: &Path,
+    app_roots: &[PathBuf],
+) -> Vec<Package> {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(output) else {
         return Vec::new();
     };
@@ -510,32 +523,48 @@ fn parse_brew_cask_json(output: &str, caskroom: &Path) -> Vec<Package> {
             } else {
                 SizeInfo::default()
             };
+            let mut primary_app_path = None;
 
             if !is_installer_based {
-                let home = std::env::var_os("HOME").map(PathBuf::from);
                 for app_name in &app_names {
-                    let mut app_path = PathBuf::from("/Applications").join(app_name);
-                    if !app_path.exists() {
-                        if let Some(ref h) = home {
-                            app_path = h.join("Applications").join(app_name);
-                        }
-                    }
-                    if app_path.exists() {
+                    if let Some(app_path) = find_cask_app_path(app_name, app_roots) {
                         let app_size = bulkstat::scan_dir(&app_path, 0).size;
                         size.logical = size.logical.saturating_add(app_size.logical);
                         size.allocated = size.allocated.saturating_add(app_size.allocated);
+                        if primary_app_path.is_none() && app_path != pkg_path {
+                            primary_app_path = Some(app_path);
+                        }
                     }
                 }
             }
+
+            let action_path = primary_app_path.unwrap_or_else(|| pkg_path.clone());
+            let metadata_path = if action_path != pkg_path {
+                Some(pkg_path)
+            } else {
+                None
+            };
 
             Some(Package {
                 name: token,
                 version: version_display,
                 size: Some(size),
-                path: Some(pkg_path),
+                path: Some(action_path),
+                metadata_path,
             })
         })
         .collect()
+}
+
+fn find_cask_app_path(app_name: &str, app_roots: &[PathBuf]) -> Option<PathBuf> {
+    let app_path = PathBuf::from(app_name);
+    if app_path.is_absolute() && app_path.exists() {
+        return Some(app_path);
+    }
+    app_roots
+        .iter()
+        .map(|root| root.join(app_name))
+        .find(|path| path.exists())
 }
 
 fn scan_brew_dir(install_dir: &Path) -> Vec<Package> {
@@ -565,6 +594,7 @@ fn scan_brew_dir(install_dir: &Path) -> Vec<Package> {
                 version,
                 size,
                 path: Some(pkg_path),
+                metadata_path: None,
             }
         })
         .collect()
@@ -611,67 +641,84 @@ fn scan_npm_global() -> Vec<Package> {
     entries
         .into_par_iter()
         .map(|(name, version)| {
-            let pkg_path = global_root.join(&name);
-            let size = if pkg_path.is_dir() {
-                Some(bulkstat::scan_dir(&pkg_path, 0).size)
-            } else {
-                None
-            };
+            let pkg_path = global_root.as_ref().map(|root| root.join(&name));
+            let size = pkg_path
+                .as_ref()
+                .filter(|path| path.is_dir())
+                .map(|path| bulkstat::scan_dir(path, 0).size);
             Package {
                 name,
                 version,
                 size,
-                path: Some(pkg_path),
+                path: pkg_path.filter(|path| path.is_dir()),
+                metadata_path: None,
             }
         })
         .collect()
 }
 
-fn find_npm_global_root() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if let Some(ref home) = home {
-        if let Some(nvm_dir) = std::env::var_os("NVM_DIR") {
-            let nvm_current = PathBuf::from(nvm_dir).join("versions/node");
-            if let Ok(rd) = std::fs::read_dir(&nvm_current) {
-                if let Some(latest) = rd
-                    .flatten()
-                    .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-                    .max_by_key(|e| e.file_name())
-                {
-                    let root = latest.path().join("lib/node_modules");
-                    if root.is_dir() {
-                        return root;
-                    }
-                }
-            }
-        }
-        let fnm = home.join(".local/share/fnm/node-versions");
-        if fnm.is_dir() {
-            if let Ok(rd) = std::fs::read_dir(&fnm) {
-                if let Some(latest) = rd
-                    .flatten()
-                    .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-                    .max_by_key(|e| e.file_name())
-                {
-                    let root = latest.path().join("installation/lib/node_modules");
-                    if root.is_dir() {
-                        return root;
-                    }
-                }
-            }
-        }
-    }
-    let known = if cfg!(target_arch = "aarch64") {
-        "/opt/homebrew/lib/node_modules"
+fn find_npm_global_root() -> Option<PathBuf> {
+    let known_root = if cfg!(target_arch = "aarch64") {
+        Some(PathBuf::from("/opt/homebrew/lib/node_modules"))
     } else {
-        "/usr/local/lib/node_modules"
+        Some(PathBuf::from("/usr/local/lib/node_modules"))
     };
-    let known_path = PathBuf::from(known);
-    if known_path.is_dir() {
-        return known_path;
+    find_npm_global_root_with(
+        run_command,
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::var_os("NVM_DIR").map(PathBuf::from),
+        known_root,
+    )
+}
+
+fn find_npm_global_root_with<F>(
+    mut run: F,
+    home: Option<PathBuf>,
+    nvm_dir: Option<PathBuf>,
+    known_root: Option<PathBuf>,
+) -> Option<PathBuf>
+where
+    F: FnMut(&str, &[&str]) -> String,
+{
+    let active_root = run("npm", &["root", "-g"]);
+    let active_root = active_root.trim();
+    if !active_root.is_empty() {
+        return Some(PathBuf::from(active_root));
     }
-    let fallback = run_command("npm", &["root", "-g"]).trim().to_string();
-    PathBuf::from(fallback)
+
+    if let Some(root) = nvm_dir
+        .as_ref()
+        .map(|dir| dir.join("versions/node"))
+        .and_then(|dir| single_version_node_modules_root(&dir, Path::new("lib/node_modules")))
+    {
+        return Some(root);
+    }
+
+    if let Some(root) = home
+        .as_ref()
+        .map(|home| home.join(".local/share/fnm/node-versions"))
+        .and_then(|dir| {
+            single_version_node_modules_root(&dir, Path::new("installation/lib/node_modules"))
+        })
+    {
+        return Some(root);
+    }
+
+    known_root.filter(|path| path.is_dir())
+}
+
+fn single_version_node_modules_root(base: &Path, suffix: &Path) -> Option<PathBuf> {
+    let mut roots = std::fs::read_dir(base)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .map(|entry| entry.path().join(suffix))
+        .filter(|path| path.is_dir());
+    let first = roots.next()?;
+    if roots.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 fn scan_pip() -> Vec<Package> {
@@ -714,6 +761,7 @@ fn scan_pip() -> Vec<Package> {
                 version,
                 size,
                 path,
+                metadata_path: None,
             }
         })
         .collect()
@@ -770,6 +818,7 @@ fn scan_cargo() -> Vec<Package> {
             version: version.to_string(),
             size: if has_bin { Some(size) } else { None },
             path,
+            metadata_path: None,
         });
     };
 
@@ -869,6 +918,7 @@ fn scan_bun_global() -> Vec<Package> {
                 version,
                 size,
                 path,
+                metadata_path: None,
             }
         })
         .collect()
@@ -1541,6 +1591,52 @@ mod tests {
     }
 
     #[test]
+    fn npm_global_root_prefers_active_npm_over_version_probes() {
+        let root = test_root("npm_root_prefers_active");
+        let active_root = root.join("active/lib/node_modules");
+        let nvm_root = root.join("nvm/versions/node/v22.0.0/lib/node_modules");
+        let fnm_root =
+            root.join("home/.local/share/fnm/node-versions/v24.0.0/installation/lib/node_modules");
+        std::fs::create_dir_all(&active_root).unwrap();
+        std::fs::create_dir_all(&nvm_root).unwrap();
+        std::fs::create_dir_all(&fnm_root).unwrap();
+
+        let resolved = find_npm_global_root_with(
+            |cmd, args| {
+                assert_eq!(cmd, "npm");
+                assert_eq!(args, ["root", "-g"]);
+                format!("{}\n", active_root.display())
+            },
+            Some(root.join("home")),
+            Some(root.join("nvm")),
+            None,
+        );
+
+        assert_eq!(resolved, Some(active_root.clone()));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn npm_global_root_does_not_guess_across_multiple_nvm_versions() {
+        let root = test_root("npm_root_ambiguous_nvm");
+        let nvm_versions = root.join("nvm/versions/node");
+        std::fs::create_dir_all(nvm_versions.join("v20.0.0/lib/node_modules")).unwrap();
+        std::fs::create_dir_all(nvm_versions.join("v22.0.0/lib/node_modules")).unwrap();
+
+        let resolved = find_npm_global_root_with(
+            |_cmd, _args| String::new(),
+            None,
+            Some(root.join("nvm")),
+            None,
+        );
+
+        assert_eq!(resolved, None);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn finds_project_deps_in_directory() {
         let root = test_root("project_deps");
         let _ = std::fs::remove_dir_all(&root);
@@ -1592,24 +1688,37 @@ mod tests {
         }"#;
 
         let temp_caskroom = test_root("caskroom");
+        let temp_apps = test_root("apps");
         std::fs::create_dir_all(temp_caskroom.join("pdfextractor")).unwrap();
         std::fs::create_dir_all(temp_caskroom.join("packages")).unwrap();
+        std::fs::create_dir_all(temp_apps.join("PDFExtractor.app/Contents")).unwrap();
+        std::fs::write(temp_apps.join("PDFExtractor.app/Contents/app.bin"), b"app").unwrap();
 
-        let packages = parse_brew_cask_json(json_data, &temp_caskroom);
+        let packages = parse_brew_cask_json_with_app_roots(
+            json_data,
+            &temp_caskroom,
+            std::slice::from_ref(&temp_apps),
+        );
         assert_eq!(packages.len(), 2);
 
         let pdf = packages.iter().find(|p| p.name == "pdfextractor").unwrap();
         assert_eq!(pdf.version, "1.5");
         assert_eq!(
             pdf.path.as_ref().unwrap(),
+            &temp_apps.join("PDFExtractor.app")
+        );
+        assert_eq!(
+            pdf.metadata_path.as_ref().unwrap(),
             &temp_caskroom.join("pdfextractor")
         );
 
         let pkgs = packages.iter().find(|p| p.name == "packages").unwrap();
         assert_eq!(pkgs.version, "1.2.10 (installer-based)");
         assert_eq!(pkgs.path.as_ref().unwrap(), &temp_caskroom.join("packages"));
+        assert!(pkgs.metadata_path.is_none());
 
         std::fs::remove_dir_all(temp_caskroom).unwrap();
+        std::fs::remove_dir_all(temp_apps).unwrap();
     }
 
     fn test_root(name: &str) -> PathBuf {

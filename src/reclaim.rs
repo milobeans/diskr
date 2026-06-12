@@ -202,6 +202,8 @@ pub struct Finding {
     pub size: SizeInfo,
     /// Permission-denied directories encountered while sizing this finding.
     pub inaccessible: u32,
+    /// Mounted volumes skipped below /Volumes while sizing this finding.
+    pub skipped_mounts: u32,
     /// Number of directories rolled into this finding (1 for fixed locations).
     pub count: usize,
     pub paths: Vec<PathBuf>,
@@ -213,6 +215,7 @@ pub struct ReclaimReport {
     pub findings: Vec<Finding>,
     pub total: SizeInfo,
     pub inaccessible: u32,
+    pub skipped_mounts: u32,
 }
 
 /// Scan for reclaimable space under `root`, resolving fixed caches against `$HOME`.
@@ -243,10 +246,12 @@ pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
 
     let mut total = SizeInfo::default();
     let mut inaccessible = 0u32;
+    let mut skipped_mounts = 0u32;
     for finding in &findings {
         total.logical = total.logical.saturating_add(finding.size.logical);
         total.allocated = total.allocated.saturating_add(finding.size.allocated);
         inaccessible = inaccessible.saturating_add(finding.inaccessible);
+        skipped_mounts = skipped_mounts.saturating_add(finding.skipped_mounts);
     }
 
     ReclaimReport {
@@ -254,6 +259,7 @@ pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
         findings,
         total,
         inaccessible,
+        skipped_mounts,
     }
 }
 
@@ -263,6 +269,7 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<Finding> {
         .filter_map(|category| {
             let mut size = SizeInfo::default();
             let mut inaccessible = 0u32;
+            let mut skipped_mounts = 0u32;
             let mut paths = Vec::new();
             for rel in category.paths {
                 let candidate = home.join(rel);
@@ -273,6 +280,7 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<Finding> {
                 size.logical = size.logical.saturating_add(scanned.size.logical);
                 size.allocated = size.allocated.saturating_add(scanned.size.allocated);
                 inaccessible = inaccessible.saturating_add(scanned.inaccessible);
+                skipped_mounts = skipped_mounts.saturating_add(scanned.skipped_mounts);
                 paths.push(candidate);
             }
             if paths.is_empty() {
@@ -284,6 +292,7 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<Finding> {
                 note: category.note.to_string(),
                 size,
                 inaccessible,
+                skipped_mounts,
                 count: paths.len(),
                 paths,
             })
@@ -299,12 +308,14 @@ fn artifact_findings(root: &Path) -> Vec<Finding> {
         .filter_map(|(name, class, note)| {
             let mut size = SizeInfo::default();
             let mut inaccessible = 0u32;
+            let mut skipped_mounts = 0u32;
             let mut paths = Vec::new();
             for path in hits.iter().filter(|(hit_name, _)| hit_name == name) {
                 let scanned = bulkstat::scan_dir(&path.1, 0);
                 size.logical = size.logical.saturating_add(scanned.size.logical);
                 size.allocated = size.allocated.saturating_add(scanned.size.allocated);
                 inaccessible = inaccessible.saturating_add(scanned.inaccessible);
+                skipped_mounts = skipped_mounts.saturating_add(scanned.skipped_mounts);
                 paths.push(path.1.clone());
             }
             if paths.is_empty() {
@@ -316,6 +327,7 @@ fn artifact_findings(root: &Path) -> Vec<Finding> {
                 note: (*note).to_string(),
                 size,
                 inaccessible,
+                skipped_mounts,
                 count: paths.len(),
                 paths,
             })

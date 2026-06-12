@@ -64,6 +64,7 @@ diskr --thin-snapshots 10G --yes ~ # execute it
 | PageUp/PageDown | Move by a page |
 | Home/End | Jump to first or last item |
 | Enter | Open selected directory, disk, or package path |
+| i | Show details for the selected file, package, or disk |
 | p | Open packages pane or switch package view |
 | Backspace | Go to parent directory |
 | / | Search files in the current directory |
