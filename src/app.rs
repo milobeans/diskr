@@ -360,10 +360,12 @@ pub struct App {
     pub input_on_commit: Option<InputAction>,
 
     pub search_mode: bool,
+    search_filter_pinned: bool,
     pub search_query: String,
     pub search_matches: Vec<usize>,
 
     pub pkg_search_mode: bool,
+    pkg_filter_pinned: bool,
     pub pkg_search_query: String,
     pub pkg_search_matches: Vec<usize>,
     cached_pkg_visible_indices: Vec<usize>,
@@ -541,9 +543,11 @@ impl App {
             input_buffer: String::new(),
             input_on_commit: None,
             search_mode: false,
+            search_filter_pinned: false,
             search_query: String::new(),
             search_matches: Vec::new(),
             pkg_search_mode: false,
+            pkg_filter_pinned: false,
             pkg_search_query: String::new(),
             pkg_search_matches: Vec::new(),
             cached_pkg_visible_indices: Vec::new(),
@@ -687,7 +691,18 @@ impl App {
         previous_index: usize,
     ) -> Result<()> {
         self.rebuild_entries()?;
-        self.restore_selection(previous_selected, previous_index);
+        if self.search_filter_active() {
+            self.update_search();
+            self.selected = previous_selected
+                .and_then(|path| {
+                    self.search_matches
+                        .iter()
+                        .position(|&idx| self.entries[idx].path == path)
+                })
+                .unwrap_or_else(|| previous_index.min(self.search_matches.len().saturating_sub(1)));
+        } else {
+            self.restore_selection(previous_selected, previous_index);
+        }
         self.auto_scan();
         Ok(())
     }
@@ -792,7 +807,7 @@ impl App {
         let fallback_selected = self.selected.min(self.entries.len().saturating_sub(1));
         self.apply_sort();
         if let Some(path) = selected_path {
-            if self.search_mode && !self.search_query.is_empty() {
+            if self.search_filter_active() {
                 self.update_search();
                 self.selected = self
                     .search_matches
@@ -912,7 +927,7 @@ impl App {
     }
 
     pub fn visible_entry_count(&self) -> usize {
-        if self.search_mode && !self.search_query.is_empty() {
+        if self.search_filter_active() {
             self.search_matches.len()
         } else {
             self.entries.len()
@@ -920,7 +935,7 @@ impl App {
     }
 
     pub fn visible_entry_index(&self, visible_index: usize) -> Option<usize> {
-        if self.search_mode && !self.search_query.is_empty() {
+        if self.search_filter_active() {
             self.search_matches.get(visible_index).copied()
         } else if visible_index < self.entries.len() {
             Some(visible_index)
@@ -1057,7 +1072,7 @@ impl App {
         self.start_scan(dirs, status);
     }
 
-    /// Invoked by the `S` key. Scans every visible directory whose size is not known yet.
+    /// Invoked by the `S` key. Scans every visible directory with missing or stale size.
     pub fn scan_all_missing_visible(&mut self) {
         if self.confirming_delete {
             return;
@@ -1065,11 +1080,11 @@ impl App {
         let missing: Vec<PathBuf> = self
             .entries
             .iter()
-            .filter(|e| e.is_dir && e.size.is_none())
+            .filter(|e| entry_needs_scan(e))
             .map(|e| e.path.clone())
             .collect();
         if missing.is_empty() {
-            self.status = String::from("full scan complete · all visible sizes known");
+            self.status = String::from("full scan complete · all visible sizes fresh");
             return;
         }
         let dirs = self.scan_candidates(missing.len(), &missing);
@@ -1687,26 +1702,27 @@ impl App {
 
     /// Explain-first guardrail: emptying the Trash is permanent, so `E` only
     /// arms a confirmation here; the actual work happens in
-    /// [`App::confirm_empty_trash`] on a background thread.
+    /// [`App::confirm_empty_trash`] on a background thread. The operation is
+    /// global (Finder's Empty Trash), so it only arms when the loaded reclaim
+    /// report actually lists Trash — otherwise the confirmation would be
+    /// detached from what the user sees (#47).
     pub fn request_empty_trash(&mut self) {
         if self.confirming_delete || self.confirming_empty_trash || self.empty_trash_rx.is_some() {
             return;
         }
-        let size_note = self
-            .reclaim_report
-            .as_ref()
-            .and_then(|report| report.findings.iter().find(|f| f.label == "Trash"))
-            .map(|f| format!(" (~{})", human(f.size.allocated)))
-            .unwrap_or_default();
+        let Some(trash) = self.reclaim_trash_finding() else {
+            self.status = String::from("Trash is not in this reclaim report");
+            return;
+        };
+        let size_note = format!(" (~{})", human(trash.size.allocated));
         self.status = format!("Empty Trash permanently{size_note}? · y confirm · n cancel");
         self.confirming_empty_trash = true;
     }
 
-    pub fn reclaim_trash_size(&self) -> Option<u64> {
+    pub fn reclaim_trash_finding(&self) -> Option<&reclaim::Finding> {
         self.reclaim_report
             .as_ref()
             .and_then(|report| report.findings.iter().find(|f| f.label == "Trash"))
-            .map(|f| f.size.allocated)
     }
 
     pub fn cancel_empty_trash(&mut self) {
@@ -2163,7 +2179,7 @@ impl App {
         let Some(entry) = self.entries.get(entry_idx) else {
             return;
         };
-        if !entry.is_dir || entry.size.is_some() || entry.scanning {
+        if !entry_needs_scan(entry) || entry.scanning {
             return;
         }
         let name = entry.name.clone();
@@ -2339,7 +2355,7 @@ impl App {
                 let dependency_leaves = msg.graph.dependency_leaf_count();
                 self.dep_graph = Some(msg.graph);
                 self.rebuild_pkg_visible_indices();
-                if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+                if self.pkg_filter_active() {
                     self.update_pkg_search();
                 }
                 self.selected_pkg = self
@@ -2398,6 +2414,7 @@ impl App {
         self.pkg_search_matches.clear();
         self.pkg_search_query.clear();
         self.pkg_search_mode = false;
+        self.pkg_filter_pinned = false;
         if self.pkg_show_unused {
             self.status = String::from("showing dependency leaves only");
         } else {
@@ -2503,7 +2520,7 @@ impl App {
             PkgView::ProjectDeps => PkgView::SystemManagers,
         };
         self.rebuild_pkg_visible_indices();
-        if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+        if self.pkg_filter_active() {
             self.update_pkg_search();
         }
         self.selected_pkg = 0;
@@ -2536,7 +2553,7 @@ impl App {
     }
 
     pub fn pkg_item_count(&self) -> usize {
-        if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+        if self.pkg_filter_active() {
             return self.pkg_search_matches.len();
         }
         if self.cached_pkg_visible_indices.is_empty() {
@@ -2549,7 +2566,7 @@ impl App {
     }
 
     pub fn pkg_visible_index(&self, visible_index: usize) -> Option<usize> {
-        if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+        if self.pkg_filter_active() {
             return self.pkg_search_matches.get(visible_index).copied();
         }
         if self.cached_pkg_visible_indices.is_empty() {
@@ -2563,22 +2580,42 @@ impl App {
     }
 
     pub fn pkg_visible_indices(&self) -> &[usize] {
-        if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+        if self.pkg_filter_active() {
             &self.pkg_search_matches
         } else {
             &self.cached_pkg_visible_indices
         }
     }
 
-    pub fn enter_pkg_search(&mut self) {
-        self.pkg_search_mode = true;
-        self.pkg_search_query.clear();
-        self.pkg_search_matches.clear();
+    pub fn pkg_filter_active(&self) -> bool {
+        !self.pkg_search_query.is_empty() && (self.pkg_search_mode || self.pkg_filter_pinned)
     }
 
-    pub fn exit_pkg_search(&mut self) {
+    pub fn enter_pkg_search(&mut self) {
+        self.pkg_search_mode = true;
+        self.pkg_filter_pinned = false;
+        if self.pkg_search_query.is_empty() {
+            self.pkg_search_matches.clear();
+        }
+    }
+
+    pub fn keep_pkg_search(&mut self) {
+        if self.pkg_search_query.is_empty() {
+            self.clear_pkg_search();
+            return;
+        }
+        self.pkg_search_mode = false;
+        self.pkg_filter_pinned = true;
+        self.selected_pkg = self
+            .selected_pkg
+            .min(self.pkg_item_count().saturating_sub(1));
+        self.status = format!("package filter /{} kept · Esc clear", self.pkg_search_query);
+    }
+
+    pub fn clear_pkg_search(&mut self) {
         let real_index = self.pkg_visible_index(self.selected_pkg);
         self.pkg_search_mode = false;
+        self.pkg_filter_pinned = false;
         self.pkg_search_query.clear();
         self.pkg_search_matches.clear();
         if let Some(idx) = real_index {
@@ -2673,7 +2710,7 @@ impl App {
             .map(|(pkg, manager)| format!("{} {}", pkg.name, manager.label()).to_lowercase())
             .collect();
         self.rebuild_pkg_visible_indices();
-        if self.pkg_search_mode && !self.pkg_search_query.is_empty() {
+        if self.pkg_filter_active() {
             self.update_pkg_search();
         }
     }
@@ -2701,16 +2738,36 @@ impl App {
 
     pub fn enter_search(&mut self) {
         self.search_mode = true;
-        self.search_query.clear();
-        self.search_matches.clear();
-        self.file_list_offset = 0;
+        self.search_filter_pinned = false;
+        if self.search_query.is_empty() {
+            self.search_matches.clear();
+            self.file_list_offset = 0;
+        }
     }
 
-    pub fn exit_search(&mut self) {
+    pub fn search_filter_active(&self) -> bool {
+        !self.search_query.is_empty() && (self.search_mode || self.search_filter_pinned)
+    }
+
+    pub fn keep_search(&mut self) {
+        if self.search_query.is_empty() {
+            self.clear_search();
+            return;
+        }
+        self.search_mode = false;
+        self.search_filter_pinned = true;
+        self.selected = self
+            .selected
+            .min(self.visible_entry_count().saturating_sub(1));
+        self.status = format!("filter /{} kept · Esc clear", self.search_query);
+    }
+
+    pub fn clear_search(&mut self) {
         let selected_path = self
             .visible_entry_index(self.selected)
             .map(|entry_idx| self.entries.get(entry_idx).map(|entry| entry.path.clone()));
         self.search_mode = false;
+        self.search_filter_pinned = false;
         self.search_query.clear();
         self.search_matches.clear();
         self.file_list_offset = 0;
@@ -2719,6 +2776,10 @@ impl App {
                 self.selected = index;
             }
         }
+    }
+
+    pub fn exit_search(&mut self) {
+        self.clear_search();
     }
 
     pub fn search_push(&mut self, ch: char) {
@@ -3080,6 +3141,10 @@ fn full_disk_access_missing() -> bool {
         })
 }
 
+fn entry_needs_scan(entry: &Entry) -> bool {
+    entry.is_dir && (entry.size.is_none() || entry.size_stale)
+}
+
 fn limited_scan_status(action: &str, scanning: usize, total: usize) -> String {
     if scanning >= total {
         format!("{action}: {total} directories")
@@ -3370,10 +3435,82 @@ fn trim_leading_zeroes(digits: &[u8]) -> &[u8] {
     }
 }
 
+/// Reclaim report whose sole finding is Trash; shared by the empty-trash
+/// tests here and in main.rs (#47).
+#[cfg(test)]
+pub fn trash_only_report(root: &Path, allocated: u64) -> reclaim::ReclaimReport {
+    reclaim::ReclaimReport {
+        root: root.to_path_buf(),
+        findings: vec![reclaim::Finding {
+            label: String::from("Trash"),
+            class: reclaim::Reclaimability::Safe,
+            note: String::from("Already discarded items; emptying is permanent."),
+            size: SizeInfo::new(allocated, allocated),
+            inaccessible: 0,
+            skipped_mounts: 0,
+            count: 1,
+            paths: vec![root.join(".Trash")],
+            rollup: false,
+        }],
+        total: SizeInfo::new(allocated, allocated),
+        inaccessible: 0,
+        skipped_mounts: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn empty_trash_does_not_arm_without_trash_finding() {
+        let root = test_root("empty_trash_no_trash_finding");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Reclaim;
+
+        // No reclaim report loaded at all.
+        app.request_empty_trash();
+        assert!(!app.confirming_empty_trash);
+        assert_eq!(app.status, "Trash is not in this reclaim report");
+
+        // Report loaded, but it has no Trash finding.
+        app.reclaim_report = Some(reclaim::ReclaimReport {
+            root: root.clone(),
+            findings: Vec::new(),
+            total: SizeInfo::default(),
+            inaccessible: 0,
+            skipped_mounts: 0,
+        });
+        app.status.clear();
+        app.request_empty_trash();
+        assert!(!app.confirming_empty_trash);
+        assert_eq!(app.status, "Trash is not in this reclaim report");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_trash_arms_with_size_from_trash_finding() {
+        let root = test_root("empty_trash_with_trash_finding");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Reclaim;
+        app.reclaim_report = Some(trash_only_report(&root, 4096));
+
+        app.request_empty_trash();
+
+        assert!(app.confirming_empty_trash);
+        assert!(app.status.contains(&human(4096)));
+        let finding = app.reclaim_trash_finding().expect("trash finding");
+        assert_eq!(finding.size.allocated, 4096);
+        assert_eq!(finding.paths, vec![root.join(".Trash")]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn delete_request_is_pinned_to_original_entry() {
@@ -3479,6 +3616,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let mut app = App::new(root.clone()).unwrap();
+        app.reclaim_report = Some(trash_only_report(&root, 1024));
         app.request_empty_trash();
 
         // Arming the confirm must not start any background work.
@@ -3704,7 +3842,7 @@ mod tests {
             .collect();
         assert_eq!(searched_names, vec!["alpha"]);
 
-        app.exit_pkg_search();
+        app.clear_pkg_search();
         app.project_deps = vec![
             ProjectDeps {
                 path: root.join("Cargo.toml"),
@@ -3733,6 +3871,57 @@ mod tests {
             app.pkg_search_push(ch);
         }
         assert_eq!(app.pkg_visible_indices(), &[0]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_search_enter_keeps_filter_until_clear() {
+        let root = test_root("pkg_search_keep");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Packages;
+        app.pkg_reports = vec![packages::ManagerReport {
+            manager: packages::Manager::Brew,
+            packages: vec![
+                packages::Package {
+                    name: "alpha".into(),
+                    version: "1.0".into(),
+                    size: Some(SizeInfo::new(20, 20)),
+                    path: None,
+                    metadata_path: None,
+                },
+                packages::Package {
+                    name: "beta".into(),
+                    version: "1.0".into(),
+                    size: Some(SizeInfo::new(10, 10)),
+                    path: None,
+                    metadata_path: None,
+                },
+            ],
+            total_size: SizeInfo::new(30, 30),
+            available: true,
+        }];
+        app.rebuild_flat_packages();
+
+        app.enter_pkg_search();
+        for ch in "alp".chars() {
+            app.pkg_search_push(ch);
+        }
+        assert_eq!(app.pkg_visible_indices(), &[0]);
+
+        app.keep_pkg_search();
+
+        assert!(!app.pkg_search_mode);
+        assert!(app.pkg_filter_active());
+        assert_eq!(app.pkg_item_count(), 1);
+        assert_eq!(app.pkg_visible_indices(), &[0]);
+
+        app.clear_pkg_search();
+
+        assert!(!app.pkg_filter_active());
+        assert_eq!(app.pkg_item_count(), 2);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -4120,6 +4309,111 @@ mod tests {
     }
 
     #[test]
+    fn full_scan_includes_stale_visible_dirs_without_invalidating_cache() {
+        let root = test_root("full_scan_stale");
+        let fresh_dir = root.join("fresh");
+        let missing_dir = root.join("missing");
+        let stale_dir = root.join("stale");
+        fs::create_dir_all(&fresh_dir).unwrap();
+        fs::create_dir_all(&missing_dir).unwrap();
+        fs::create_dir_all(&stale_dir).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.record_cached_size(fresh_dir.clone(), SizeInfo::new(100, 128), 0, 100, false);
+        app.record_cached_size(stale_dir.clone(), SizeInfo::new(200, 256), 0, 100, true);
+        app.rebuild_entries().unwrap();
+        for entry in &mut app.entries {
+            entry.scanning = false;
+        }
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == stale_dir)
+            .unwrap();
+
+        app.scan_all_missing_visible();
+
+        let fresh = app
+            .entries
+            .iter()
+            .find(|entry| entry.path == fresh_dir)
+            .unwrap();
+        assert!(!fresh.scanning);
+        assert_eq!(fresh.size, Some(SizeInfo::new(100, 128)));
+
+        let missing = app
+            .entries
+            .iter()
+            .find(|entry| entry.path == missing_dir)
+            .unwrap();
+        assert!(missing.scanning);
+        assert_eq!(missing.size, None);
+
+        let stale = app
+            .entries
+            .iter()
+            .find(|entry| entry.path == stale_dir)
+            .unwrap();
+        assert!(stale.scanning);
+        assert_eq!(stale.size, Some(SizeInfo::new(200, 256)));
+        assert!(stale.size_stale);
+        assert_eq!(
+            app.size_cache.get(&stale_dir),
+            Some(&SizeInfo::new(200, 256))
+        );
+        assert!(app.status.contains("full scan: 2 directories"));
+
+        app.invalidate_pending_scan_results();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_scan_refreshes_stale_cached_directory() {
+        let root = test_root("selected_stale_scan");
+        let fresh_dir = root.join("fresh");
+        let stale_dir = root.join("stale");
+        fs::create_dir_all(&fresh_dir).unwrap();
+        fs::create_dir_all(&stale_dir).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.record_cached_size(fresh_dir.clone(), SizeInfo::new(100, 128), 0, 100, false);
+        app.record_cached_size(stale_dir.clone(), SizeInfo::new(200, 256), 0, 100, true);
+        app.rebuild_entries().unwrap();
+        for entry in &mut app.entries {
+            entry.scanning = false;
+        }
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == stale_dir)
+            .unwrap();
+
+        app.scan_selected_missing_dir();
+
+        let fresh = app
+            .entries
+            .iter()
+            .find(|entry| entry.path == fresh_dir)
+            .unwrap();
+        assert!(!fresh.scanning);
+
+        let stale = app
+            .entries
+            .iter()
+            .find(|entry| entry.path == stale_dir)
+            .unwrap();
+        assert!(stale.scanning);
+        assert_eq!(stale.size, Some(SizeInfo::new(200, 256)));
+        assert!(stale.size_stale);
+        assert_eq!(app.status, "scanning selected directory: stale");
+
+        app.invalidate_pending_scan_results();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn go_up_reselects_previous_directory_in_parent() {
         let root = test_root("go_up_selection");
         let child = root.join("child");
@@ -4399,6 +4693,41 @@ mod tests {
         app.exit_search();
 
         assert_eq!(app.entries[app.selected].name, "beta.txt");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_enter_keeps_filter_until_clear() {
+        let root = test_root("search_keep");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("alpha.txt"), b"x").unwrap();
+        fs::write(root.join("beta.txt"), b"x").unwrap();
+        fs::write(root.join("bravo.txt"), b"x").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        app.enter_search();
+        app.search_push('b');
+
+        assert_eq!(app.visible_entry_count(), 2);
+
+        app.keep_search();
+
+        assert!(!app.search_mode);
+        assert!(app.search_filter_active());
+        assert_eq!(app.visible_entry_count(), 2);
+        assert_eq!(app.visible_entry(0).unwrap().name, "beta.txt");
+
+        app.move_cursor(1);
+        assert_eq!(app.visible_entry(app.selected).unwrap().name, "bravo.txt");
+
+        app.clear_search();
+
+        assert!(!app.search_filter_active());
+        assert_eq!(app.visible_entry_count(), 3);
+        assert_eq!(app.entries[app.selected].name, "bravo.txt");
+
         fs::remove_dir_all(root).unwrap();
     }
 

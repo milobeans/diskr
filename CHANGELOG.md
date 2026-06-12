@@ -9,6 +9,24 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- Search and package-filter Enter now keeps the narrowed view active while
+  leaving input mode; Esc and Ctrl+C clear the kept filter. (#53)
+- `S` and the selected-directory scan path now rescan stale cached directory
+  sizes instead of only directories with no cached size, so one suspicious
+  row can be verified without invalidating the whole view. (#83)
+
+## [0.1.52] - 2026-06-12
+
+### Fixed
+
+- `E` in the Reclaim pane only arms the Empty Trash confirmation when the
+  loaded reclaim report actually lists a Trash finding, and the modal now
+  shows that finding's path alongside its size. Without a Trash finding the
+  status reports "Trash is not in this reclaim report" instead of arming a
+  global Finder Empty Trash detached from the visible report. (#47)
+
 ## [0.1.51] - 2026-06-12
 
 ### Added

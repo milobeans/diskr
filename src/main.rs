@@ -1305,11 +1305,11 @@ where
                     if app.search_mode {
                         let handled = match key.code {
                             KeyCode::Esc => {
-                                app.exit_search();
+                                app.clear_search();
                                 true
                             }
                             KeyCode::Enter => {
-                                app.exit_search();
+                                app.keep_search();
                                 true
                             }
                             KeyCode::Backspace => {
@@ -1354,11 +1354,11 @@ where
                     if app.pkg_search_mode {
                         let handled = match key.code {
                             KeyCode::Esc => {
-                                app.exit_pkg_search();
+                                app.clear_pkg_search();
                                 true
                             }
                             KeyCode::Enter => {
-                                app.exit_pkg_search();
+                                app.keep_pkg_search();
                                 true
                             }
                             KeyCode::Backspace => {
@@ -1712,10 +1712,10 @@ fn cancel_active_state(app: &mut App) {
         app.close_file_info();
     } else if app.input_mode != app::InputMode::None {
         app.exit_input_mode();
-    } else if app.search_mode {
-        app.exit_search();
-    } else if app.pkg_search_mode {
-        app.exit_pkg_search();
+    } else if app.search_mode || app.search_filter_active() {
+        app.clear_search();
+    } else if app.pkg_search_mode || app.pkg_filter_active() {
+        app.clear_pkg_search();
     } else if app.focus != Focus::Files {
         app.focus = Focus::Files;
     }
@@ -2117,6 +2117,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let mut app = App::new(root.clone()).unwrap();
+        // E only arms when the loaded reclaim report lists Trash (#47).
+        app.reclaim_report = Some(app::trash_only_report(&root, 1024));
         app.request_empty_trash();
         assert!(app.confirming_empty_trash);
 
@@ -2137,6 +2139,28 @@ mod tests {
 
         cancel_active_state(&mut app);
         assert!(!app.search_mode);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ctrl_c_clears_kept_search_filter() {
+        let root = test_root("ctrl_c_kept_search");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("alpha.txt"), b"x").unwrap();
+        fs::write(root.join("beta.txt"), b"x").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.enter_search();
+        app.search_push('b');
+        app.keep_search();
+        assert!(app.search_filter_active());
+
+        cancel_active_state(&mut app);
+
+        assert!(!app.search_mode);
+        assert!(!app.search_filter_active());
+        assert_eq!(app.visible_entry_count(), 2);
 
         fs::remove_dir_all(root).unwrap();
     }

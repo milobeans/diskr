@@ -6,7 +6,7 @@ A fast, macOS-native terminal file explorer and disk analyzer built in Rust.
 
 Most disk usage tools show you a tree of sizes and leave you to figure out the rest. diskr goes further: it tells you *what changed*, *what's reclaimable*, and *why your free space doesn't match what Finder says*.
 
-**Fast, lazy scanning.** Directory sizing uses `getattrlistbulk(2)`, a macOS syscall that returns attributes for many entries in a single kernel crossing. Where the typical `readdir` + `stat` pattern makes one syscall per file, diskr batches them -- 3-10x faster on directories with thousands of small files like `node_modules` or `~/Library/Caches`. Scans run on a thread pool and are started in small batches around the current selection, so opening `/` or another broad directory does not immediately walk every child subtree. Press `S` when you want to fill in every missing visible directory size without refreshing the directory or invalidating known sizes.
+**Fast, lazy scanning.** Directory sizing uses `getattrlistbulk(2)`, a macOS syscall that returns attributes for many entries in a single kernel crossing. Where the typical `readdir` + `stat` pattern makes one syscall per file, diskr batches them -- 3-10x faster on directories with thousands of small files like `node_modules` or `~/Library/Caches`. Scans run on a thread pool and are started in small batches around the current selection, so opening `/` or another broad directory does not immediately walk every child subtree. Press `S` when you want to fill in every missing or stale visible directory size without refreshing the directory or invalidating known fresh sizes.
 
 **Allocated vs. apparent size.** APFS clones, sparse files, and compressed files mean logical size and on-disk size often diverge. diskr tracks both, sorts by allocated size, and shows apparent size when they differ. This is the number you actually care about when reclaiming space.
 
@@ -68,7 +68,7 @@ diskr --thin-snapshots 10G --yes ~ # execute it
 | i | Show details for the selected file, package, or disk |
 | p | Open packages pane or switch package view |
 | Backspace | Go to parent directory |
-| / | Search files in the current directory |
+| / | Search files in the current directory or filter packages; Enter keeps, Esc clears |
 | Left/Right, h/l | Switch pane or package view |
 | Space | Quick Look selected item |
 | f | Reveal selected item in Finder |
@@ -76,13 +76,14 @@ diskr --thin-snapshots 10G --yes ~ # execute it
 | y | Copy selected item path to clipboard |
 | s | Open selected item location in Terminal |
 | r | Refresh the current view and rescan all visible directory sizes |
-| S | Scan every missing visible directory size without refreshing |
+| S | Scan every missing or stale visible directory size without refreshing |
 | o | Cycle sort mode |
 | . | Toggle hidden files |
 | d | Move selected item to Trash |
+| E | Empty Trash from the Reclaim pane, when the report lists a Trash finding |
 | Tab | Switch files/disks/packages pane |
 | q | Quit |
-| Esc / Ctrl+C | Focus Files pane / cancel modals and search |
+| Esc / Ctrl+C | Focus Files pane / cancel modals and clear search/filter |
 
 ## How it works
 

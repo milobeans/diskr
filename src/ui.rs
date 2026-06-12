@@ -1312,7 +1312,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
     let inner_width = area.width.saturating_sub(2);
 
     if item_count == 0 {
-        let message = if app.pkg_search_mode && !app.pkg_search_query.is_empty() {
+        let message = if app.pkg_filter_active() {
             "no matching packages"
         } else {
             match app.pkg_view {
@@ -1501,6 +1501,42 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
         return;
     }
+    if app.focus == Focus::Files && app.search_filter_active() {
+        let count = app.visible_entry_count();
+        let text = Line::from(vec![
+            Span::styled("filter ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("/{}", app.search_query),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {count} matches · / edit · Esc clear"),
+                Style::default().fg(Color::Gray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
+        return;
+    }
+    if app.focus == Focus::Packages && app.pkg_filter_active() {
+        let count = app.pkg_item_count();
+        let text = Line::from(vec![
+            Span::styled("package filter ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("/{}", app.pkg_search_query),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {count} matches · / edit · Esc clear"),
+                Style::default().fg(Color::Gray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
+        return;
+    }
     let mut spans = selection_status(app);
     if !app.status.is_empty() {
         spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
@@ -1629,18 +1665,29 @@ fn draw_confirm(f: &mut Frame, app: &App) {
 }
 
 fn draw_empty_trash_confirm(f: &mut Frame, app: &App) {
-    let area = centered_rect(60, 20, 48, 7, f.area());
+    let area = centered_rect(60, 20, 48, 8, f.area());
     f.render_widget(Clear, area);
-    let size_note = app
-        .reclaim_trash_size()
-        .map(|size| format!(" (~{})", crate::app::human(size)))
-        .unwrap_or_default();
+    // request_empty_trash only arms when the report lists Trash (#47), so the
+    // finding is normally present; the fallback covers a report swapped out
+    // by a reclaim re-scan while the confirmation is open.
+    let (path_note, size_note) = match app.reclaim_trash_finding() {
+        Some(finding) => (
+            finding
+                .paths
+                .first()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            format!(" (~{})", crate::app::human(finding.size.allocated)),
+        ),
+        None => (String::new(), String::new()),
+    };
     let body = vec![
         Line::from(""),
         Line::from(Span::styled(
             format!("Empty Trash{size_note}?"),
             Style::default().add_modifier(Modifier::BOLD),
         )),
+        Line::from(Span::styled(path_note, Style::default().fg(Color::Gray))),
         Line::from(Span::styled(
             "already-discarded items are removed permanently",
             Style::default().fg(Color::Gray),
