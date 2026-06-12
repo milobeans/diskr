@@ -1352,50 +1352,7 @@ where
                         continue;
                     }
                     if app.pkg_search_mode {
-                        let handled = match key.code {
-                            KeyCode::Esc => {
-                                app.clear_pkg_search();
-                                true
-                            }
-                            KeyCode::Enter => {
-                                app.keep_pkg_search();
-                                true
-                            }
-                            KeyCode::Backspace => {
-                                app.pkg_search_pop();
-                                true
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                app.move_cursor(1);
-                                true
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                app.move_cursor(-1);
-                                true
-                            }
-                            KeyCode::PageDown => {
-                                app.page_move(1);
-                                true
-                            }
-                            KeyCode::PageUp => {
-                                app.page_move(-1);
-                                true
-                            }
-                            KeyCode::Home => {
-                                app.move_to_start();
-                                true
-                            }
-                            KeyCode::End => {
-                                app.move_to_end();
-                                true
-                            }
-                            KeyCode::Char(ch) => {
-                                app.pkg_search_push(ch);
-                                true
-                            }
-                            _ => false,
-                        };
-                        if handled {
+                        if handle_pkg_search_key(app, key.code) {
                             needs_draw = true;
                         }
                         continue;
@@ -1722,6 +1679,52 @@ fn cancel_active_state(app: &mut App) {
     // In the base Files-focused state Esc is a no-op, so Ctrl+C is too.
 }
 
+fn handle_pkg_search_key(app: &mut App, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Esc => {
+            app.clear_pkg_search();
+            true
+        }
+        KeyCode::Enter => {
+            app.keep_pkg_search();
+            true
+        }
+        KeyCode::Backspace => {
+            app.pkg_search_pop();
+            true
+        }
+        KeyCode::Down => {
+            app.move_cursor(1);
+            true
+        }
+        KeyCode::Up => {
+            app.move_cursor(-1);
+            true
+        }
+        KeyCode::PageDown => {
+            app.page_move(1);
+            true
+        }
+        KeyCode::PageUp => {
+            app.page_move(-1);
+            true
+        }
+        KeyCode::Home => {
+            app.move_to_start();
+            true
+        }
+        KeyCode::End => {
+            app.move_to_end();
+            true
+        }
+        KeyCode::Char(ch) => {
+            app.pkg_search_push(ch);
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2011,6 +2014,63 @@ mod tests {
 
     fn key_nonchar(code: KeyCode) -> crossterm::event::KeyEvent {
         crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn package_search_treats_j_and_k_as_query_text() {
+        let root = test_root("pkg_search_jk");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Packages;
+        app.packages_loaded = true;
+        app.pkg_reports = vec![packages::ManagerReport {
+            manager: packages::Manager::Brew,
+            packages: vec![
+                packages::Package {
+                    name: String::from("jq"),
+                    version: String::from("1.0"),
+                    size: Some(crate::bulkstat::SizeInfo::new(30, 30)),
+                    path: None,
+                    metadata_path: None,
+                },
+                packages::Package {
+                    name: String::from("kubectl"),
+                    version: String::from("1.0"),
+                    size: Some(crate::bulkstat::SizeInfo::new(20, 20)),
+                    path: None,
+                    metadata_path: None,
+                },
+                packages::Package {
+                    name: String::from("alpha"),
+                    version: String::from("1.0"),
+                    size: Some(crate::bulkstat::SizeInfo::new(10, 10)),
+                    path: None,
+                    metadata_path: None,
+                },
+            ],
+            total_size: crate::bulkstat::SizeInfo::new(60, 60),
+            available: true,
+        }];
+        app.rebuild_flat_packages();
+
+        app.selected_pkg = 0;
+        app.enter_pkg_search();
+        assert!(handle_pkg_search_key(&mut app, KeyCode::Down));
+        assert_eq!(app.selected_pkg, 1);
+        assert!(app.pkg_search_query.is_empty());
+
+        assert!(handle_pkg_search_key(&mut app, KeyCode::Char('j')));
+        assert_eq!(app.pkg_search_query, "j");
+        assert_eq!(app.pkg_visible_indices(), &[0]);
+
+        app.clear_pkg_search();
+        app.enter_pkg_search();
+        assert!(handle_pkg_search_key(&mut app, KeyCode::Char('k')));
+        assert_eq!(app.pkg_search_query, "k");
+        assert_eq!(app.pkg_visible_indices(), &[1]);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

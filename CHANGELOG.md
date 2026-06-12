@@ -9,6 +9,14 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+## [0.1.54] - 2026-06-12
+
+### Fixed
+
+- Package filter mode now treats plain `j` and `k` as query text, so package
+  names like `jq` and `kubectl` can be typed while arrow keys still navigate.
+  (#52)
+
 ## [0.1.53] - 2026-06-12
 
 ### Fixed
