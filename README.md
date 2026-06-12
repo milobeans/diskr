@@ -71,12 +71,15 @@ diskr --thin-snapshots 10G --yes ~ # execute it
 | Space | Quick Look selected item |
 | f | Reveal selected item in Finder |
 | O | Open selected item with the default app |
+| y | Copy selected item path to clipboard |
+| s | Open selected item location in Terminal |
 | r | Refresh the current view and rescan all visible directory sizes |
 | o | Cycle sort mode |
 | . | Toggle hidden files |
 | d | Move selected item to Trash |
 | Tab | Switch files/disks/packages pane |
-| q, Esc | Quit |
+| q | Quit |
+| Esc | Focus Files pane / cancel modals and search |
 
 ## How it works
 

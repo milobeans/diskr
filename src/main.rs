@@ -312,7 +312,8 @@ Keys:
   B               Save history baseline for current directory
   E               Empty Trash (reclaim pane)
   Tab             Switch files/disks/packages/reclaim pane
-  q, Esc          Quit (Esc in input mode cancels)
+  q               Quit
+  Esc             Return to Files pane / close modals and search modes
 ",
         env!("CARGO_PKG_VERSION")
     );
@@ -1305,7 +1306,7 @@ where
                                 app.focus = Focus::Files;
                                 true
                             } else {
-                                return Ok(());
+                                false
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
@@ -1358,6 +1359,16 @@ where
                         }
                         KeyCode::Char('O') => {
                             launch_external_action(app, ExternalAction::Open);
+                            true
+                        }
+                        KeyCode::Char('y') => {
+                            app.copy_path_to_clipboard();
+                            true
+                        }
+                        KeyCode::Char('s') => {
+                            if let Err(err) = app.open_shell() {
+                                app.status = format!("open shell failed: {err}");
+                            }
                             true
                         }
                         KeyCode::Char('r') => {
