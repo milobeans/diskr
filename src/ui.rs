@@ -79,6 +79,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.confirming_uninstall {
         draw_uninstall_confirm(f, app);
     }
+    if app.confirming_empty_trash {
+        draw_empty_trash_confirm(f, app);
+    }
     if app.pkg_detail {
         draw_pkg_detail(f, app);
     }
@@ -128,6 +131,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(
             format!(" · {delta}"),
             Style::default().fg(Color::Green),
+        ));
+    }
+    if app.fda_limited {
+        spans.push(Span::styled(
+            " · limited access (no Full Disk Access)",
+            Style::default().fg(Color::Yellow),
         ));
     }
     let text = Line::from(spans);
@@ -208,7 +217,9 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                 ),
                 (false, None, _) => (String::from("?"), Style::default().fg(Color::DarkGray)),
             };
-            let icon = if e.is_dir {
+            let icon = if app.is_marked(&e.path) {
+                "✓ "
+            } else if e.is_dir {
                 "▸ "
             } else if e.is_symlink {
                 "↪ "
@@ -1327,21 +1338,59 @@ fn draw_help(f: &mut Frame, area: Rect) {
 }
 
 fn draw_confirm(f: &mut Frame, app: &App) {
-    let area = centered_rect(60, 20, 40, 6, f.area());
+    let area = centered_rect(60, 20, 40, 7, f.area());
     f.render_widget(Clear, area);
     let name = app.pending_delete_name();
-    let body = vec![
+    let mut body = vec![
         Line::from(""),
         Line::from(Span::styled(
             format!("Move to Trash: {name}"),
             Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
+    if let Some(summary) = app.pending_batch_summary() {
+        body.push(Line::from(Span::styled(
+            summary,
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    body.push(Line::from(""));
+    body.push(Line::from("press  y  to confirm   ·   n  to cancel"));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("confirm")
+        .border_style(Style::default().fg(Color::Red));
+    f.render_widget(
+        Paragraph::new(body)
+            .block(block)
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
+fn draw_empty_trash_confirm(f: &mut Frame, app: &App) {
+    let area = centered_rect(60, 20, 48, 7, f.area());
+    f.render_widget(Clear, area);
+    let size_note = app
+        .reclaim_trash_size()
+        .map(|size| format!(" (~{})", crate::app::human(size)))
+        .unwrap_or_default();
+    let body = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("Empty Trash{size_note}?"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "already-discarded items are removed permanently",
+            Style::default().fg(Color::Gray),
         )),
         Line::from(""),
         Line::from("press  y  to confirm   ·   n  to cancel"),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("confirm")
+        .title("empty trash")
         .border_style(Style::default().fg(Color::Red));
     f.render_widget(
         Paragraph::new(body)

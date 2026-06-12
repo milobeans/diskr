@@ -162,6 +162,9 @@ pub struct App {
     marked: HashSet<PathBuf>,
     size_cache: HashMap<PathBuf, SizeInfo>,
     inaccessible_cache: HashMap<PathBuf, u32>,
+    /// True when TCC blocks reads under ~/Library (no Full Disk Access);
+    /// scans there will undercount, so the header shows a persistent hint.
+    pub fda_limited: bool,
     cache_age: HashMap<PathBuf, u64>,
     stale_size_cache: HashSet<PathBuf>,
     size_cache_dirty: bool,
@@ -216,6 +219,8 @@ pub struct App {
     pub confirming_uninstall: bool,
     pending_uninstall: Option<UninstallTarget>,
     uninstall_rx: Option<Receiver<UninstallResult>>,
+    pub confirming_empty_trash: bool,
+    empty_trash_rx: Option<Receiver<Result<(), String>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -324,6 +329,7 @@ impl App {
             stale_size_cache,
             size_cache_dirty,
             last_size_cache_save: Instant::now(),
+            fda_limited: false,
             entry_index: HashMap::new(),
             cached_flat_packages: Vec::new(),
             last_sort: Instant::now(),
@@ -366,7 +372,10 @@ impl App {
             confirming_uninstall: false,
             pending_uninstall: None,
             uninstall_rx: None,
+            confirming_empty_trash: false,
+            empty_trash_rx: None,
         };
+        app.fda_limited = full_disk_access_missing();
         app.refresh_disks();
         app.reload()?;
         app.refresh_history_state();
@@ -497,7 +506,6 @@ impl App {
             });
         }
         self.apply_sort();
-        self.rebuild_entry_index();
         Ok(())
     }
 
@@ -520,6 +528,9 @@ impl App {
                 .sort_by_key(|e| Reverse(e.size.map(size_sort_key).unwrap_or(0))),
             SortMode::Modified => self.entries.sort_by_key(|e| Reverse(e.modified)),
         }
+        // Sorting reorders entries, so path→index lookups (used to route
+        // late-arriving scan results) must be rebuilt with the new positions.
+        self.rebuild_entry_index();
         self.last_sort = Instant::now();
         self.sort_dirty = false;
     }
@@ -683,6 +694,7 @@ impl App {
                     if let Some(entry) = self.entries.get(entry_idx).cloned() {
                         if entry.is_dir {
                             self.exit_search();
+                            self.marked.clear();
                             self.cwd = entry.path;
                             self.selected = 0;
                             self.reload()?;
@@ -693,6 +705,7 @@ impl App {
             }
             Focus::Disks => {
                 if let Some(disk) = self.disks.get(self.selected_disk) {
+                    self.marked.clear();
                     self.cwd = disk.mount.clone();
                     self.focus = Focus::Files;
                     self.selected = 0;
@@ -714,6 +727,7 @@ impl App {
         }
         let previous_cwd = self.cwd.clone();
         if let Some(parent) = self.cwd.parent().map(|p| p.to_path_buf()) {
+            self.marked.clear();
             self.cwd = parent;
             self.reload_with_selection(Some(previous_cwd), self.selected)?;
             self.refresh_history_state();
@@ -725,6 +739,7 @@ impl App {
         if self.confirming_delete {
             return Ok(());
         }
+        self.marked.clear();
         self.show_hidden = !self.show_hidden;
         self.reload()
     }
@@ -887,6 +902,7 @@ impl App {
         changed |= self.drain_reclaim_results();
         changed |= self.drain_top_files_results();
         changed |= self.drain_disk_info_results();
+        changed |= self.drain_empty_trash_results();
         changed
     }
 
@@ -1280,20 +1296,71 @@ impl App {
         self.disk_info_scan_rx = None;
     }
 
+    /// Explain-first guardrail: emptying the Trash is permanent, so `E` only
+    /// arms a confirmation here; the actual work happens in
+    /// [`App::confirm_empty_trash`] on a background thread.
     pub fn request_empty_trash(&mut self) {
-        if self.confirming_delete {
+        if self.confirming_delete || self.confirming_empty_trash || self.empty_trash_rx.is_some() {
             return;
         }
-        match crate::fs_ops::empty_trash() {
-            Ok(()) => {
+        let size_note = self
+            .reclaim_report
+            .as_ref()
+            .and_then(|report| report.findings.iter().find(|f| f.label == "Trash"))
+            .map(|f| format!(" (~{})", human(f.size.allocated)))
+            .unwrap_or_default();
+        self.status = format!("Empty Trash permanently{size_note}? · y confirm · n cancel");
+        self.confirming_empty_trash = true;
+    }
+
+    pub fn reclaim_trash_size(&self) -> Option<u64> {
+        self.reclaim_report
+            .as_ref()
+            .and_then(|report| report.findings.iter().find(|f| f.label == "Trash"))
+            .map(|f| f.size.allocated)
+    }
+
+    pub fn cancel_empty_trash(&mut self) {
+        self.confirming_empty_trash = false;
+        self.status = String::from("empty trash cancelled");
+    }
+
+    pub fn confirm_empty_trash(&mut self) {
+        self.confirming_empty_trash = false;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.empty_trash_rx = Some(rx);
+        self.status = String::from("emptying Trash…");
+        thread::spawn(move || {
+            let result = crate::fs_ops::empty_trash().map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn drain_empty_trash_results(&mut self) -> bool {
+        let recv = match self.empty_trash_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+        match recv {
+            Ok(Ok(())) => {
+                self.empty_trash_rx = None;
                 self.status = String::from("Trash emptied");
                 self.refresh_disks();
                 if self.focus == Focus::Reclaim {
                     self.request_reclaim_scan();
                 }
+                true
             }
-            Err(e) => {
+            Ok(Err(e)) => {
+                self.empty_trash_rx = None;
                 self.status = format!("empty trash failed: {e}");
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.empty_trash_rx = None;
+                self.status = String::from("empty trash failed");
+                true
             }
         }
     }
@@ -1355,6 +1422,7 @@ impl App {
             || self.packages_loading
             || self.deps_loading
             || self.uninstall_rx.is_some()
+            || self.empty_trash_rx.is_some()
     }
 
     pub fn request_delete(&mut self) {
@@ -2328,6 +2396,27 @@ impl App {
         );
     }
 
+    pub fn is_marked(&self, path: &Path) -> bool {
+        self.marked.contains(path)
+    }
+
+    /// Count plus first few names for the batch-delete confirm modal, so stale
+    /// or unexpected marks are visible before the user confirms.
+    pub fn pending_batch_summary(&self) -> Option<String> {
+        if !matches!(self.pending_delete, Some(DeleteTarget::Batch)) {
+            return None;
+        }
+        let mut names: Vec<&str> = self
+            .marked
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        names.sort_unstable();
+        let preview = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+        let suffix = if names.len() > 3 { ", …" } else { "" };
+        Some(format!("{} marked: {preview}{suffix}", names.len()))
+    }
+
     pub fn toggle_mark(&mut self) {
         if self.confirming_delete {
             return;
@@ -2460,6 +2549,25 @@ fn modal_window_bounds(
     offset = offset.min(count.saturating_sub(1));
     let end = offset.saturating_add(max_rows).min(count);
     (offset, end)
+}
+
+/// True when a TCC-protected directory exists but cannot be listed — the
+/// telltale of a terminal running without Full Disk Access. ENOENT (dir
+/// absent) is not evidence either way, so only PermissionDenied counts.
+fn full_disk_access_missing() -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    ["Library/Mail", "Library/Safari", "Library/Messages"]
+        .iter()
+        .any(|rel| {
+            let probe = home.join(rel);
+            probe.symlink_metadata().is_ok()
+                && matches!(
+                    std::fs::read_dir(&probe),
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+                )
+        })
 }
 
 fn limited_scan_status(action: &str, scanning: usize, total: usize) -> String {
@@ -2762,6 +2870,94 @@ mod tests {
         app.cancel_delete();
         assert!(!app.confirming_delete);
         assert!(app.pending_delete.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn marks_clear_when_changing_directory_or_visibility() {
+        let root = test_root("marks_nav");
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+
+        let file_path = root.join("a.txt");
+        app.selected = app
+            .entries
+            .iter()
+            .position(|e| e.path == file_path)
+            .unwrap();
+        app.toggle_mark();
+        assert!(app.is_marked(&file_path));
+
+        app.selected = app.entries.iter().position(|e| e.path == sub).unwrap();
+        app.enter().unwrap();
+        assert!(!app.is_marked(&file_path), "enter() must clear marks");
+
+        app.go_up().unwrap();
+        app.selected = app
+            .entries
+            .iter()
+            .position(|e| e.path == file_path)
+            .unwrap();
+        app.toggle_mark();
+        assert!(app.is_marked(&file_path));
+        app.toggle_hidden().unwrap();
+        assert!(!app.is_marked(&file_path), "toggle_hidden must clear marks");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn request_delete_batches_marked_items_with_summary() {
+        let root = test_root("batch_request");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        fs::write(root.join("b.txt"), b"bb").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        app.selected = 0;
+        app.toggle_mark();
+        app.move_cursor(1);
+        app.toggle_mark();
+
+        app.request_delete();
+
+        assert!(app.confirming_delete);
+        assert!(matches!(app.pending_delete, Some(DeleteTarget::Batch)));
+        let summary = app.pending_batch_summary().unwrap();
+        assert!(
+            summary.starts_with("2 marked: a.txt, b.txt"),
+            "unexpected summary: {summary}"
+        );
+
+        app.cancel_delete();
+        assert!(app.pending_batch_summary().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_trash_requires_confirmation_before_running() {
+        let root = test_root("empty_trash_confirm");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.request_empty_trash();
+
+        // Arming the confirm must not start any background work.
+        assert!(app.confirming_empty_trash);
+        assert!(app.empty_trash_rx.is_none());
+        assert!(app.status.starts_with("Empty Trash permanently"));
+
+        app.cancel_empty_trash();
+        assert!(!app.confirming_empty_trash);
+        assert!(app.empty_trash_rx.is_none());
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3424,6 +3620,103 @@ mod tests {
         assert_eq!(c_char_array_to_string(&bytes), "ab");
         assert_eq!(c_char_array_to_string(&[]), "");
         assert_eq!(c_char_array_to_string(&[0]), "");
+    }
+
+    #[test]
+    fn dir_size_arriving_after_mid_scan_resort_lands_on_its_own_entry() {
+        let root = test_root("stale_entry_index");
+        fs::create_dir_all(&root).unwrap();
+        let dir_a = root.join("dir_a");
+        let dir_b = root.join("dir_b");
+        let todo = root.join("todo.py");
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.entries = vec![
+            Entry {
+                name: String::from("dir_a"),
+                name_lower: String::from("dir_a"),
+                path: dir_a.clone(),
+                is_dir: true,
+                is_symlink: false,
+                size: Some(SizeInfo::new(20_000, 20_480)),
+                size_stale: false,
+                cached_at: None,
+                inaccessible: 0,
+                modified: None,
+                scanning: false,
+            },
+            Entry {
+                name: String::from("dir_b"),
+                name_lower: String::from("dir_b"),
+                path: dir_b.clone(),
+                is_dir: true,
+                is_symlink: false,
+                size: Some(SizeInfo::new(1_000, 1_024)),
+                size_stale: false,
+                cached_at: None,
+                inaccessible: 0,
+                modified: None,
+                scanning: false,
+            },
+            Entry {
+                name: String::from("todo.py"),
+                name_lower: String::from("todo.py"),
+                path: todo.clone(),
+                is_dir: false,
+                is_symlink: false,
+                size: Some(SizeInfo::new(2_048, 4_096)),
+                size_stale: false,
+                cached_at: None,
+                inaccessible: 0,
+                modified: None,
+                scanning: false,
+            },
+        ];
+        app.entry_index =
+            std::collections::HashMap::from([(dir_a.clone(), 0), (dir_b.clone(), 1), (todo, 2)]);
+        app.sort = SortMode::SizeDesc;
+        app.apply_sort();
+        let order: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(order, ["dir_a", "todo.py", "dir_b"]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.scan_rx = rx;
+        app.active_scan_id = 1;
+        app.scan_total = 1;
+
+        // On the buggy path, apply_sort left entry_index in the old order, so
+        // this dir_b result was written to index 1: todo.py.
+        tx.send(ScanMsg::DirSize {
+            scan_id: 1,
+            path: dir_b.clone(),
+            size: SizeInfo::new(508 * 1024 * 1024, 508 * 1024 * 1024),
+            inaccessible: 0,
+        })
+        .unwrap();
+        app.drain_scan_results();
+
+        let todo = app
+            .entries
+            .iter()
+            .find(|e| e.name == "todo.py")
+            .expect("todo.py entry");
+        assert_eq!(
+            todo.size.map(|s| s.logical),
+            Some(2_048),
+            "file entry must keep its own metadata size, got {:?}",
+            todo.size
+        );
+        let dir_b = app
+            .entries
+            .iter()
+            .find(|e| e.name == "dir_b")
+            .expect("dir_b entry");
+        assert_eq!(
+            dir_b.size,
+            Some(SizeInfo::new(508 * 1024 * 1024, 508 * 1024 * 1024)),
+            "dir_b scan result must land on dir_b"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn test_root(name: &str) -> PathBuf {

@@ -1020,6 +1020,23 @@ where
                         }
                         continue;
                     }
+                    if app.confirming_empty_trash {
+                        let handled = match key.code {
+                            KeyCode::Char('y') => {
+                                app.confirm_empty_trash();
+                                true
+                            }
+                            KeyCode::Char('n') | KeyCode::Esc => {
+                                app.cancel_empty_trash();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
                     if app.pkg_detail {
                         let handled = match key.code {
                             KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
