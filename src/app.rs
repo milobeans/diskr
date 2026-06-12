@@ -378,6 +378,9 @@ pub struct App {
 
     pub files_area: ratatui_core::layout::Rect,
     pub file_list_offset: usize,
+    pub disk_page_rows: usize,
+    pub package_page_rows: usize,
+    pub reclaim_page_rows: usize,
 
     pending_delete: Option<DeleteTarget>,
     marked: HashSet<PathBuf>,
@@ -558,6 +561,9 @@ impl App {
             scan_skipped_mounts: 0,
             files_area: ratatui_core::layout::Rect::default(),
             file_list_offset: 0,
+            disk_page_rows: 1,
+            package_page_rows: 1,
+            reclaim_page_rows: 1,
             pending_delete: None,
             marked: HashSet::new(),
             size_cache,
@@ -880,8 +886,46 @@ impl App {
     }
 
     pub fn page_move(&mut self, pages: i32) {
-        let height = self.files_area.height.saturating_sub(2).max(1) as i32;
-        self.move_cursor(pages * height);
+        let delta = pages as i64 * self.active_page_rows() as i64;
+        match self.focus {
+            Focus::Files => {
+                let item_count = self.visible_entry_count();
+                if let Some(selected) = page_target_index(self.selected, delta, item_count) {
+                    self.selected = selected;
+                    self.scan_selected_missing_dir();
+                }
+            }
+            Focus::Disks => {
+                if let Some(selected) =
+                    page_target_index(self.selected_disk, delta, self.disks.len())
+                {
+                    self.selected_disk = selected;
+                }
+            }
+            Focus::Packages => {
+                if let Some(selected) =
+                    page_target_index(self.selected_pkg, delta, self.pkg_item_count())
+                {
+                    self.selected_pkg = selected;
+                }
+            }
+            Focus::Reclaim => {
+                if let Some(selected) =
+                    page_target_index(self.selected_reclaim, delta, self.reclaim_item_count())
+                {
+                    self.selected_reclaim = selected;
+                }
+            }
+        }
+    }
+
+    fn active_page_rows(&self) -> usize {
+        match self.focus {
+            Focus::Files => self.files_area.height.saturating_sub(2).max(1) as usize,
+            Focus::Disks => self.disk_page_rows.max(1),
+            Focus::Packages => self.package_page_rows.max(1),
+            Focus::Reclaim => self.reclaim_page_rows.max(1),
+        }
     }
 
     pub fn move_to_start(&mut self) {
@@ -3435,6 +3479,14 @@ fn trim_leading_zeroes(digits: &[u8]) -> &[u8] {
     }
 }
 
+fn page_target_index(current: usize, delta: i64, item_count: usize) -> Option<usize> {
+    if item_count == 0 {
+        return None;
+    }
+    let max_index = item_count.saturating_sub(1) as i64;
+    Some((current as i64 + delta).clamp(0, max_index) as usize)
+}
+
 /// Reclaim report whose sole finding is Trash; shared by the empty-trash
 /// tests here and in main.rs (#47).
 #[cfg(test)]
@@ -3607,6 +3659,97 @@ mod tests {
 
         app.cancel_delete();
         assert!(app.pending_batch_summary().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn page_move_uses_active_pane_rows_and_clamps() {
+        let root = test_root("page_move_per_pane");
+        fs::create_dir_all(&root).unwrap();
+        for idx in 0..10 {
+            fs::write(root.join(format!("file-{idx}.txt")), b"x").unwrap();
+        }
+
+        let mut app = App::new(root.clone()).unwrap();
+
+        app.focus = Focus::Files;
+        app.files_area = ratatui_core::layout::Rect::new(0, 0, 80, 6);
+        app.selected = 0;
+        app.page_move(1);
+        assert_eq!(app.selected, 4);
+        app.page_move(10);
+        assert_eq!(app.selected, app.visible_entry_count().saturating_sub(1));
+        app.page_move(-10);
+        assert_eq!(app.selected, 0);
+
+        app.focus = Focus::Disks;
+        app.disks = (0..10)
+            .map(|idx| DiskInfo {
+                name: format!("disk-{idx}"),
+                mount: root.join(format!("disk-{idx}")),
+                total: 100,
+                available: 40,
+            })
+            .collect();
+        app.disk_page_rows = 3;
+        app.selected_disk = 1;
+        app.page_move(1);
+        assert_eq!(app.selected_disk, 4);
+        app.page_move(10);
+        assert_eq!(app.selected_disk, app.disks.len().saturating_sub(1));
+        app.page_move(-10);
+        assert_eq!(app.selected_disk, 0);
+
+        app.focus = Focus::Packages;
+        app.packages_loaded = true;
+        app.cached_flat_packages = vec![
+            make_flat_package("alpha"),
+            make_flat_package("beta"),
+            make_flat_package("gamma"),
+            make_flat_package("delta"),
+            make_flat_package("epsilon"),
+        ];
+        app.package_page_rows = 2;
+        app.selected_pkg = 1;
+        app.page_move(1);
+        assert_eq!(app.selected_pkg, 3);
+        app.page_move(10);
+        assert_eq!(app.selected_pkg, app.pkg_item_count().saturating_sub(1));
+        app.page_move(-10);
+        assert_eq!(app.selected_pkg, 0);
+
+        app.focus = Focus::Reclaim;
+        app.reclaim_report = Some(reclaim::ReclaimReport {
+            root: root.clone(),
+            findings: (0..6)
+                .map(|idx| reclaim::Finding {
+                    label: format!("finding-{idx}"),
+                    class: reclaim::Reclaimability::Safe,
+                    note: String::from("test"),
+                    size: SizeInfo::new(1, 1),
+                    inaccessible: 0,
+                    skipped_mounts: 0,
+                    count: 1,
+                    paths: vec![root.join(format!("reclaim-{idx}"))],
+                    rollup: false,
+                })
+                .collect(),
+            total: SizeInfo::new(6, 6),
+            inaccessible: 0,
+            skipped_mounts: 0,
+        });
+        app.reclaim_page_rows = 2;
+        app.selected_reclaim = 2;
+        app.page_move(1);
+        assert_eq!(app.selected_reclaim, 4);
+        app.page_move(10);
+        assert_eq!(
+            app.selected_reclaim,
+            app.reclaim_item_count().saturating_sub(1)
+        );
+        app.page_move(-10);
+        assert_eq!(app.selected_reclaim, 0);
+
         fs::remove_dir_all(root).unwrap();
     }
 

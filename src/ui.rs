@@ -329,7 +329,8 @@ fn file_window_bounds(
     (offset, end)
 }
 
-fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
+fn draw_disks(f: &mut Frame, area: Rect, app: &mut App) {
+    app.disk_page_rows = 1;
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -365,6 +366,7 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let max_rows = (inner.height / 4).max(1) as usize;
+    app.disk_page_rows = max_rows;
     let (offset, end) = disk_window_bounds(app.selected_disk, app.disks.len(), max_rows);
     let visible_disks = &app.disks[offset..end];
     let rows = Layout::default()
@@ -414,8 +416,9 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_reclaim_panel(f: &mut Frame, app: &App) {
+fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
     let area = centered_rect(70, 70, 72, 22, f.area());
+    app.reclaim_page_rows = area.height.saturating_sub(2).max(1) as usize;
     f.render_widget(Clear, area);
 
     if app.reclaim_loading {
@@ -1162,7 +1165,8 @@ fn file_info_meta_line(label: &'static str, value: Option<SystemTime>) -> Line<'
     ])
 }
 
-fn draw_packages(f: &mut Frame, area: Rect, app: &App) {
+fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
+    app.package_page_rows = area.height.saturating_sub(2).max(1) as usize;
     if area.height == 0 || area.width == 0 {
         return;
     }

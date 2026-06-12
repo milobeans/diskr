@@ -17,6 +17,14 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
   names like `jq` and `kubectl` can be typed while arrow keys still navigate.
   (#52)
 
+## [0.1.55] - 2026-06-12
+
+### Fixed
+
+- PageUp/PageDown now jump by the active pane's visible rows in Files,
+  Disks, Packages, and Reclaim, and page moves clamp at the first/last row
+  instead of wrapping unexpectedly through the list. (#50)
+
 ## [0.1.53] - 2026-06-12
 
 ### Fixed
