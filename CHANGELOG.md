@@ -9,6 +9,26 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+## [0.1.50] - 2026-06-12
+
+### Changed
+
+- Replaced rayon with a purpose-built std-only work-stealing pool
+  (`src/pool.rs`): per-worker deques with steal-oldest balancing, batched
+  task spawns, idle-gated wakeups, and sync waiters that help drain the
+  queue. Scan results and wall-clock throughput are unchanged (verified
+  against the rayon build on wide, deep, and /Applications-shaped trees);
+  rayon, rayon-core, crossbeam-deque, crossbeam-epoch, and crossbeam-utils
+  leave the dependency graph (81 -> 76 locked crates). (#79)
+- The walker now descends directory chains on one worker, accumulating
+  results locally and merging into shared scan state once per chain instead
+  of locking a global aggregate once per directory; chain descent opens
+  children with `openat(2)` relative to the held parent fd, resolving one
+  path component instead of re-walking the full path. (#78)
+- Release builds use fat LTO instead of thin; with the dependency removal
+  the binary shrinks ~8% (1,449,840 -> 1,333,392 bytes on Apple Silicon).
+  (#80)
+
 ## [0.1.49] - 2026-06-12
 
 ### Fixed

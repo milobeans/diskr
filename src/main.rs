@@ -3,6 +3,7 @@ mod bulkstat;
 mod fs_ops;
 mod history;
 mod packages;
+mod pool;
 mod reclaim;
 mod scanner;
 mod space;

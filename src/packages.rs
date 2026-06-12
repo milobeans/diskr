@@ -3,9 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 
-use rayon::prelude::*;
-
 use crate::bulkstat::{self, SizeInfo};
+use crate::pool;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Package {
@@ -484,76 +483,76 @@ fn parse_brew_cask_json_with_app_roots(
         return Vec::new();
     };
 
-    casks
-        .into_par_iter()
-        .filter_map(|cask| {
-            let token = cask.get("token")?.as_str()?.to_string();
-            let version = cask
-                .get("installed")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+    pool::par_map(casks, |cask| {
+        let token = cask.get("token")?.as_str()?.to_string();
+        let version = cask
+            .get("installed")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
-            let mut is_installer_based = false;
-            let mut app_names = Vec::new();
+        let mut is_installer_based = false;
+        let mut app_names = Vec::new();
 
-            if let Some(artifacts) = cask.get("artifacts").and_then(|a| a.as_array()) {
-                for art in artifacts {
-                    if art.get("pkg").is_some() || art.get("installer").is_some() {
-                        is_installer_based = true;
-                    }
-                    if let Some(apps) = art.get("app").and_then(|a| a.as_array()) {
-                        for app in apps {
-                            if let Some(app_str) = app.as_str() {
-                                app_names.push(app_str.to_string());
-                            }
+        if let Some(artifacts) = cask.get("artifacts").and_then(|a| a.as_array()) {
+            for art in artifacts {
+                if art.get("pkg").is_some() || art.get("installer").is_some() {
+                    is_installer_based = true;
+                }
+                if let Some(apps) = art.get("app").and_then(|a| a.as_array()) {
+                    for app in apps {
+                        if let Some(app_str) = app.as_str() {
+                            app_names.push(app_str.to_string());
                         }
                     }
                 }
             }
+        }
 
-            let mut version_display = version;
-            if is_installer_based {
-                version_display.push_str(" (installer-based)");
-            }
+        let mut version_display = version;
+        if is_installer_based {
+            version_display.push_str(" (installer-based)");
+        }
 
-            let pkg_path = caskroom.join(&token);
-            let mut size = if pkg_path.is_dir() {
-                bulkstat::scan_dir(&pkg_path, 0).size
-            } else {
-                SizeInfo::default()
-            };
-            let mut primary_app_path = None;
+        let pkg_path = caskroom.join(&token);
+        let mut size = if pkg_path.is_dir() {
+            bulkstat::scan_dir(&pkg_path, 0).size
+        } else {
+            SizeInfo::default()
+        };
+        let mut primary_app_path = None;
 
-            if !is_installer_based {
-                for app_name in &app_names {
-                    if let Some(app_path) = find_cask_app_path(app_name, app_roots) {
-                        let app_size = bulkstat::scan_dir(&app_path, 0).size;
-                        size.logical = size.logical.saturating_add(app_size.logical);
-                        size.allocated = size.allocated.saturating_add(app_size.allocated);
-                        if primary_app_path.is_none() && app_path != pkg_path {
-                            primary_app_path = Some(app_path);
-                        }
+        if !is_installer_based {
+            for app_name in &app_names {
+                if let Some(app_path) = find_cask_app_path(app_name, app_roots) {
+                    let app_size = bulkstat::scan_dir(&app_path, 0).size;
+                    size.logical = size.logical.saturating_add(app_size.logical);
+                    size.allocated = size.allocated.saturating_add(app_size.allocated);
+                    if primary_app_path.is_none() && app_path != pkg_path {
+                        primary_app_path = Some(app_path);
                     }
                 }
             }
+        }
 
-            let action_path = primary_app_path.unwrap_or_else(|| pkg_path.clone());
-            let metadata_path = if action_path != pkg_path {
-                Some(pkg_path)
-            } else {
-                None
-            };
+        let action_path = primary_app_path.unwrap_or_else(|| pkg_path.clone());
+        let metadata_path = if action_path != pkg_path {
+            Some(pkg_path)
+        } else {
+            None
+        };
 
-            Some(Package {
-                name: token,
-                version: version_display,
-                size: Some(size),
-                path: Some(action_path),
-                metadata_path,
-            })
+        Some(Package {
+            name: token,
+            version: version_display,
+            size: Some(size),
+            path: Some(action_path),
+            metadata_path,
         })
-        .collect()
+    })
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn find_cask_app_path(app_name: &str, app_roots: &[PathBuf]) -> Option<PathBuf> {
@@ -584,20 +583,17 @@ fn scan_brew_dir(install_dir: &Path) -> Vec<Package> {
         })
         .collect();
 
-    entries
-        .into_par_iter()
-        .map(|(name, pkg_path)| {
-            let version = latest_subdir_name(&pkg_path);
-            let size = Some(bulkstat::scan_dir(&pkg_path, 0).size);
-            Package {
-                name,
-                version,
-                size,
-                path: Some(pkg_path),
-                metadata_path: None,
-            }
-        })
-        .collect()
+    pool::par_map(entries, |(name, pkg_path)| {
+        let version = latest_subdir_name(&pkg_path);
+        let size = Some(bulkstat::scan_dir(&pkg_path, 0).size);
+        Package {
+            name,
+            version,
+            size,
+            path: Some(pkg_path),
+            metadata_path: None,
+        }
+    })
 }
 
 fn latest_subdir_name(dir: &Path) -> String {
@@ -638,23 +634,20 @@ fn scan_npm_global() -> Vec<Package> {
         })
         .collect();
 
-    entries
-        .into_par_iter()
-        .map(|(name, version)| {
-            let pkg_path = global_root.as_ref().map(|root| root.join(&name));
-            let size = pkg_path
-                .as_ref()
-                .filter(|path| path.is_dir())
-                .map(|path| bulkstat::scan_dir(path, 0).size);
-            Package {
-                name,
-                version,
-                size,
-                path: pkg_path.filter(|path| path.is_dir()),
-                metadata_path: None,
-            }
-        })
-        .collect()
+    pool::par_map(entries, |(name, version)| {
+        let pkg_path = global_root.as_ref().map(|root| root.join(&name));
+        let size = pkg_path
+            .as_ref()
+            .filter(|path| path.is_dir())
+            .map(|path| bulkstat::scan_dir(path, 0).size);
+        Package {
+            name,
+            version,
+            size,
+            path: pkg_path.filter(|path| path.is_dir()),
+            metadata_path: None,
+        }
+    })
 }
 
 fn find_npm_global_root() -> Option<PathBuf> {
@@ -748,23 +741,20 @@ fn scan_pip() -> Vec<Package> {
         })
         .collect();
 
-    entries
-        .into_par_iter()
-        .map(|(name, version)| {
-            let (size, path) = if let Some(sp) = &site_packages {
-                find_pip_package_size_and_path(sp, &name)
-            } else {
-                (None, None)
-            };
-            Package {
-                name,
-                version,
-                size,
-                path,
-                metadata_path: None,
-            }
-        })
-        .collect()
+    pool::par_map(entries, |(name, version)| {
+        let (size, path) = if let Some(sp) = &site_packages {
+            find_pip_package_size_and_path(sp, &name)
+        } else {
+            (None, None)
+        };
+        Package {
+            name,
+            version,
+            size,
+            path,
+            metadata_path: None,
+        }
+    })
 }
 
 fn scan_cargo() -> Vec<Package> {
@@ -900,33 +890,32 @@ fn scan_bun_global() -> Vec<Package> {
         })
         .collect();
 
-    entries
-        .into_par_iter()
-        .map(|(name, version)| {
-            let (size, path) = if let Some(global_dir) = &bun_global {
-                let pkg_path = global_dir.join(&name);
-                if pkg_path.is_dir() {
-                    (Some(bulkstat::scan_dir(&pkg_path, 0).size), Some(pkg_path))
-                } else {
-                    (None, None)
-                }
+    pool::par_map(entries, |(name, version)| {
+        let (size, path) = if let Some(global_dir) = &bun_global {
+            let pkg_path = global_dir.join(&name);
+            if pkg_path.is_dir() {
+                (Some(bulkstat::scan_dir(&pkg_path, 0).size), Some(pkg_path))
             } else {
                 (None, None)
-            };
-            Package {
-                name,
-                version,
-                size,
-                path,
-                metadata_path: None,
             }
-        })
-        .collect()
+        } else {
+            (None, None)
+        };
+        Package {
+            name,
+            version,
+            size,
+            path,
+            metadata_path: None,
+        }
+    })
 }
 
 pub fn find_project_deps(root: &Path, max_depth: usize) -> Vec<ProjectDeps> {
     let results = std::sync::Mutex::new(Vec::new());
-    find_project_deps_parallel(root, 0, max_depth, &results);
+    pool::par_drain(vec![(root.to_path_buf(), 0usize)], |(dir, depth), queue| {
+        scan_project_dir(&dir, depth, max_depth, &results, queue);
+    });
     let mut results = results.into_inner().unwrap_or_default();
     results.sort_by(|a, b| {
         let a_size = a.deps_size.map(|s| s.allocated).unwrap_or(0);
@@ -946,11 +935,12 @@ const PROJECT_MANIFESTS: &[(&str, &str, &str)] = &[
     ("composer.json", "composer", "vendor"),
 ];
 
-fn find_project_deps_parallel(
+fn scan_project_dir(
     dir: &Path,
     depth: usize,
     max_depth: usize,
     results: &std::sync::Mutex<Vec<ProjectDeps>>,
+    queue: &pool::WorkQueue<(PathBuf, usize)>,
 ) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
@@ -984,42 +974,39 @@ fn find_project_deps_parallel(
         }
     }
 
-    let new_deps: Vec<_> = found_manifests
-        .into_par_iter()
-        .map(|(manifest, mgr, deps_dir_name)| {
-            let dep_count = count_manifest_deps(dir, manifest);
-            let (deps_size, deps_dir) = if !deps_dir_name.is_empty() {
-                let deps_path = dir.join(deps_dir_name);
-                if deps_path.is_dir() {
-                    (
-                        Some(bulkstat::scan_dir(&deps_path, 0).size),
-                        Some(deps_path),
-                    )
-                } else {
-                    (None, None)
-                }
+    let new_deps = pool::par_map(found_manifests, |(manifest, mgr, deps_dir_name)| {
+        let dep_count = count_manifest_deps(dir, manifest);
+        let (deps_size, deps_dir) = if !deps_dir_name.is_empty() {
+            let deps_path = dir.join(deps_dir_name);
+            if deps_path.is_dir() {
+                (
+                    Some(bulkstat::scan_dir(&deps_path, 0).size),
+                    Some(deps_path),
+                )
             } else {
                 (None, None)
-            };
-            ProjectDeps {
-                path: dir.to_path_buf(),
-                manager_label: mgr,
-                manifest,
-                dep_count,
-                deps_size,
-                deps_dir,
             }
-        })
-        .collect();
+        } else {
+            (None, None)
+        };
+        ProjectDeps {
+            path: dir.to_path_buf(),
+            manager_label: mgr,
+            manifest,
+            dep_count,
+            deps_size,
+            deps_dir,
+        }
+    });
 
     if !new_deps.is_empty() {
         results.lock().unwrap().extend(new_deps);
     }
 
     if depth < max_depth {
-        children.par_iter().for_each(|child| {
-            find_project_deps_parallel(child, depth + 1, max_depth, results);
-        });
+        for child in children {
+            queue.push((child, depth + 1));
+        }
     }
 }
 

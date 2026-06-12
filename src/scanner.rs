@@ -1,13 +1,12 @@
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 
 use crate::bulkstat;
 use crate::bulkstat::SizeInfo;
-use rayon::prelude::*;
 
 pub type ScanId = u64;
 
@@ -49,47 +48,58 @@ impl Scanner {
     }
 
     /// Scan each directory in `dirs` for its recursive logical and allocated size.
-    /// Must NOT block the UI thread.
+    /// Must NOT block the UI thread: each directory becomes an asynchronous
+    /// walk on the shared pool, and the worker finishing the last one emits
+    /// `AllDone`. A cancelled walk reports nothing, so `AllDone` never fires
+    /// for a superseded scan.
     pub fn scan_all(&self, scan_id: ScanId, dirs: Vec<PathBuf>) -> std::io::Result<()> {
-        let tx = self.tx.clone();
         let generation = self
             .generation
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         let cancellation =
             bulkstat::ScanCancellation::new(Arc::clone(&self.generation), generation);
-        std::thread::Builder::new()
-            .name(String::from("diskr-scan"))
-            .spawn(move || {
-                dirs.into_par_iter().for_each(|dir| {
-                    if cancellation.is_cancelled() {
-                        return;
-                    }
-                    let _ = tx.send(ScanMsg::DirStarted {
+        if dirs.is_empty() {
+            if !cancellation.is_cancelled() {
+                let _ = self.tx.send(ScanMsg::AllDone { scan_id });
+            }
+            return Ok(());
+        }
+        let remaining = Arc::new(AtomicUsize::new(dirs.len()));
+        // The shared injector is FIFO, so directories start in listing order.
+        for dir in dirs {
+            let started_tx = self.tx.clone();
+            let started_path = dir.clone();
+            let done_tx = self.tx.clone();
+            let remaining = Arc::clone(&remaining);
+            bulkstat::scan_dir_async(
+                dir.clone(),
+                0,
+                cancellation.clone(),
+                move || {
+                    let _ = started_tx.send(ScanMsg::DirStarted {
                         scan_id,
-                        path: dir.clone(),
+                        path: started_path,
                     });
-                    let Some(scan) = bulkstat::scan_dir_with_cancellation(&dir, 0, &cancellation)
-                    else {
+                },
+                move |result| {
+                    let Some(scan) = result else {
                         return;
                     };
-                    if cancellation.is_cancelled() {
-                        return;
-                    }
-                    let _ = tx.send(ScanMsg::DirSize {
+                    let _ = done_tx.send(ScanMsg::DirSize {
                         scan_id,
                         path: dir,
                         size: scan.size,
                         inaccessible: scan.inaccessible,
                         skipped_mounts: scan.skipped_mounts,
                     });
-                });
-
-                if !cancellation.is_cancelled() {
-                    let _ = tx.send(ScanMsg::AllDone { scan_id });
-                }
-            })
-            .map(|_| ())
+                    if remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        let _ = done_tx.send(ScanMsg::AllDone { scan_id });
+                    }
+                },
+            );
+        }
+        Ok(())
     }
 }
 

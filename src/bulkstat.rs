@@ -26,11 +26,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
-use rayon::Scope;
+use crate::pool::TaskGroup;
 
 // sys/attr.h constants (stable macOS ABI)
 const ATTR_BIT_MAP_COUNT: u16 = 5;
@@ -144,62 +144,145 @@ pub fn scan_dir_with_cancellation(
     }
 
     let policy_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let context = ScanContext {
-        policy: ScanPolicy::new(&policy_root, meta.dev()),
-        seen_hard_links: Mutex::new(HashSet::new()),
-    };
-    let aggregate = Mutex::new(ScanAggregate::default());
-
-    rayon::scope(|scope| {
-        spawn_scan(
-            scope,
-            root.to_path_buf(),
-            top_file_limit,
-            &aggregate,
-            &context,
-            cancellation,
-        );
-    });
+    let state = Arc::new(WalkState::new(
+        ScanPolicy::new(&policy_root, meta.dev()),
+        top_file_limit,
+        cancellation.clone(),
+    ));
+    let group = TaskGroup::new();
+    spawn_walk(root.to_path_buf(), Arc::clone(&state), &group);
+    group.wait();
 
     if cancellation.is_cancelled() {
         return None;
     }
-
-    Some(
-        aggregate
-            .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .finish(),
-    )
+    Some(state.finish())
 }
 
-#[derive(Default)]
-struct ScanAggregate {
-    size: SizeInfo,
-    largest_files: BinaryHeap<Reverse<FileCandidate>>,
-    inaccessible: u32,
-    skipped_mounts: u32,
-}
-
-impl ScanAggregate {
-    fn merge(&mut self, partial: DirectoryScan, top_file_limit: usize) {
-        self.size.add_file(partial.size);
-        self.inaccessible = self.inaccessible.saturating_add(partial.inaccessible);
-        self.skipped_mounts = self.skipped_mounts.saturating_add(partial.skipped_mounts);
-        if top_file_limit == 0 {
+/// Asynchronous scan on the shared pool. `on_start` runs when the walk is
+/// dequeued; `on_done` runs on the worker that finishes last, with `None`
+/// when the scan was cancelled. Never blocks the calling thread.
+pub fn scan_dir_async(
+    root: PathBuf,
+    top_file_limit: usize,
+    cancellation: ScanCancellation,
+    on_start: impl FnOnce() + Send + 'static,
+    on_done: impl FnOnce(Option<DirScan>) + Send + 'static,
+) {
+    let result_state: Arc<Mutex<Option<Arc<WalkState>>>> = Arc::new(Mutex::new(None));
+    let finish_state = Arc::clone(&result_state);
+    let finish_cancellation = cancellation.clone();
+    let group = TaskGroup::with_finish(move || {
+        if finish_cancellation.is_cancelled() {
+            on_done(None);
             return;
         }
-        for Reverse(candidate) in partial.largest_files {
-            push_file_candidate(&mut self.largest_files, top_file_limit, candidate);
+        let state = finish_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        // No state means the root was missing or not a directory; report an
+        // empty scan, matching the sync path.
+        on_done(Some(state.map(|state| state.finish()).unwrap_or_default()));
+    });
+    let walk_group = Arc::clone(&group);
+    group.spawn(move || {
+        if cancellation.is_cancelled() {
+            return;
+        }
+        on_start();
+        let Ok(meta) = std::fs::symlink_metadata(&root) else {
+            return;
+        };
+        if !meta.file_type().is_dir() {
+            return;
+        }
+        let policy_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let state = Arc::new(WalkState::new(
+            ScanPolicy::new(&policy_root, meta.dev()),
+            top_file_limit,
+            cancellation.clone(),
+        ));
+        *result_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&state));
+        walk_task(root, state, walk_group);
+    });
+    group.arm();
+}
+
+/// Shared accumulator for one walk. Sizes and counters are relaxed atomics
+/// so completed directories merge without a global lock (#78); the
+/// largest-files heap keeps a mutex but is only touched when a top-files
+/// report was requested.
+struct WalkState {
+    context: ScanContext,
+    top_file_limit: usize,
+    cancellation: ScanCancellation,
+    logical: AtomicU64,
+    allocated: AtomicU64,
+    inaccessible: AtomicU32,
+    skipped_mounts: AtomicU32,
+    largest_files: Mutex<BinaryHeap<Reverse<FileCandidate>>>,
+}
+
+impl WalkState {
+    fn new(policy: ScanPolicy, top_file_limit: usize, cancellation: ScanCancellation) -> Self {
+        Self {
+            context: ScanContext {
+                policy,
+                seen_hard_links: Mutex::new(HashSet::new()),
+            },
+            top_file_limit,
+            cancellation,
+            logical: AtomicU64::new(0),
+            allocated: AtomicU64::new(0),
+            inaccessible: AtomicU32::new(0),
+            skipped_mounts: AtomicU32::new(0),
+            largest_files: Mutex::new(BinaryHeap::new()),
         }
     }
 
-    fn finish(self) -> DirScan {
+    fn merge(&self, partial: DirectoryScan) {
+        self.logical
+            .fetch_add(partial.size.logical, Ordering::Relaxed);
+        self.allocated
+            .fetch_add(partial.size.allocated, Ordering::Relaxed);
+        if partial.inaccessible > 0 {
+            self.inaccessible
+                .fetch_add(partial.inaccessible, Ordering::Relaxed);
+        }
+        if partial.skipped_mounts > 0 {
+            self.skipped_mounts
+                .fetch_add(partial.skipped_mounts, Ordering::Relaxed);
+        }
+        if self.top_file_limit == 0 || partial.largest_files.is_empty() {
+            return;
+        }
+        let mut heap = self
+            .largest_files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for Reverse(candidate) in partial.largest_files {
+            push_file_candidate(&mut heap, self.top_file_limit, candidate);
+        }
+    }
+
+    fn finish(&self) -> DirScan {
+        let heap = std::mem::take(
+            &mut *self
+                .largest_files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
         DirScan {
-            size: self.size,
-            largest_files: sorted_largest_files(self.largest_files),
-            inaccessible: self.inaccessible,
-            skipped_mounts: self.skipped_mounts,
+            size: SizeInfo::new(
+                self.logical.load(Ordering::Relaxed),
+                self.allocated.load(Ordering::Relaxed),
+            ),
+            largest_files: sorted_largest_files(heap),
+            inaccessible: self.inaccessible.load(Ordering::Relaxed),
+            skipped_mounts: self.skipped_mounts.load(Ordering::Relaxed),
         }
     }
 }
@@ -236,61 +319,125 @@ impl ScanPolicy {
     }
 }
 
-fn spawn_scan<'scope>(
-    scope: &Scope<'scope>,
-    dir: PathBuf,
-    top_file_limit: usize,
-    aggregate: &'scope Mutex<ScanAggregate>,
-    context: &'scope ScanContext,
-    cancellation: &'scope ScanCancellation,
-) {
-    scope.spawn(move |scope| {
-        if cancellation.is_cancelled() {
-            return;
-        }
-        let partial = scan_one_dir(&dir, top_file_limit, context, cancellation);
-        if cancellation.is_cancelled() {
-            return;
-        }
-        let DirectoryScan {
-            size,
-            largest_files,
-            subdirs,
-            inaccessible,
-            skipped_mounts,
-        } = partial;
-
-        for subdir in subdirs {
-            if cancellation.is_cancelled() {
-                return;
-            }
-            spawn_scan(
-                scope,
-                subdir,
-                top_file_limit,
-                aggregate,
-                context,
-                cancellation,
-            );
-        }
-        if cancellation.is_cancelled() {
-            return;
-        }
-        let mut shared = aggregate.lock().unwrap();
-        shared.merge(
-            DirectoryScan {
-                size,
-                largest_files,
-                subdirs: Vec::new(),
-                inaccessible,
-                skipped_mounts,
-            },
-            top_file_limit,
-        );
-    });
+fn spawn_walk(dir: PathBuf, state: Arc<WalkState>, group: &Arc<TaskGroup>) {
+    let walk_group = Arc::clone(group);
+    group.spawn(move || walk_task(dir, state, walk_group));
 }
 
-fn scan_one_dir(
+/// Scans `dir`, then keeps descending into one subdirectory per iteration
+/// while handing the remaining siblings to the pool in a single batch.
+/// The inline continuation keeps deep chains on one worker, cuts queue
+/// traffic to one batched push per branching directory, and lets the chain
+/// accumulate locally so shared `WalkState` counters are touched once per
+/// chain instead of once per directory (#78).
+///
+/// While descending, the child is opened with `openat(2)` relative to the
+/// held parent fd, so the kernel resolves one path component instead of
+/// re-walking the full path per directory — on deep trees plain `open(2)`
+/// is a large share of scan time. Only chain descent holds an fd; spawned
+/// branch tasks reopen by full path, keeping open fds bounded by worker
+/// count.
+fn walk_task(mut dir: PathBuf, state: Arc<WalkState>, group: Arc<TaskGroup>) {
+    let mut chain = DirectoryScan::default();
+    let mut fd = match open_dir(&dir) {
+        Ok(fd) => Some(fd),
+        Err(errno) => {
+            chain.inaccessible = inaccessible_from_errno(errno);
+            None
+        }
+    };
+    while let Some(current) = fd.take() {
+        if state.cancellation.is_cancelled() {
+            return;
+        }
+        let mut partial = scan_open_dir(
+            &current,
+            &dir,
+            state.top_file_limit,
+            &state.context,
+            &state.cancellation,
+        );
+        let mut subdirs = std::mem::take(&mut partial.subdirs);
+        if state.cancellation.is_cancelled() {
+            return;
+        }
+        chain.size.add_file(partial.size);
+        chain.inaccessible = chain.inaccessible.saturating_add(partial.inaccessible);
+        chain.skipped_mounts = chain.skipped_mounts.saturating_add(partial.skipped_mounts);
+        for Reverse(candidate) in partial.largest_files {
+            push_file_candidate(&mut chain.largest_files, state.top_file_limit, candidate);
+        }
+        let next = subdirs.pop();
+        if !subdirs.is_empty() {
+            let tasks: Vec<_> = subdirs
+                .into_iter()
+                .map(|subdir| {
+                    let state = Arc::clone(&state);
+                    let group = Arc::clone(&group);
+                    move || walk_task(subdir, state, group)
+                })
+                .collect();
+            group.spawn_all(tasks);
+        }
+        if let Some(subdir) = next {
+            match subdir.file_name().map(|name| open_subdir(&current, name)) {
+                Some(Ok(child)) => {
+                    fd = Some(child);
+                    dir = subdir;
+                }
+                Some(Err(errno)) => {
+                    chain.inaccessible = chain
+                        .inaccessible
+                        .saturating_add(inaccessible_from_errno(errno));
+                }
+                None => {}
+            }
+        }
+    }
+    state.merge(chain);
+}
+
+/// Owned directory fd, closed on drop.
+struct DirFd(libc::c_int);
+
+impl Drop for DirFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// EACCES/EPERM means real data was skipped (no Full Disk Access, ACLs);
+/// ENOENT is just a deletion race during the walk and stays silent.
+fn inaccessible_from_errno(errno: Option<i32>) -> u32 {
+    u32::from(matches!(errno, Some(libc::EACCES) | Some(libc::EPERM)))
+}
+
+fn open_dir(dir: &Path) -> Result<DirFd, Option<i32>> {
+    let c_path = CString::new(dir.as_os_str().as_bytes()).map_err(|_| None)?;
+    open_dir_c(&c_path, libc::AT_FDCWD)
+}
+
+fn open_subdir(parent: &DirFd, name: &OsStr) -> Result<DirFd, Option<i32>> {
+    let c_name = CString::new(name.as_bytes()).map_err(|_| None)?;
+    open_dir_c(&c_name, parent.0)
+}
+
+fn open_dir_c(path: &CString, dirfd: libc::c_int) -> Result<DirFd, Option<i32>> {
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error());
+    }
+    Ok(DirFd(fd))
+}
+
+fn scan_open_dir(
+    fd: &DirFd,
     dir: &Path,
     top_file_limit: usize,
     context: &ScanContext,
@@ -299,26 +446,7 @@ fn scan_one_dir(
     if cancellation.is_cancelled() {
         return DirectoryScan::default();
     }
-    let c_path = match CString::new(dir.as_os_str().as_bytes()) {
-        Ok(p) => p,
-        Err(_) => return DirectoryScan::default(),
-    };
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        // EACCES/EPERM means real data was skipped (no Full Disk Access, ACLs);
-        // ENOENT is just a deletion race during the walk and stays silent.
-        let errno = std::io::Error::last_os_error().raw_os_error();
-        let inaccessible = u32::from(matches!(errno, Some(libc::EACCES) | Some(libc::EPERM)));
-        return DirectoryScan {
-            inaccessible,
-            ..DirectoryScan::default()
-        };
-    }
+    let fd = fd.0;
 
     let mut attrlist = Attrlist {
         bitmapcount: ATTR_BIT_MAP_COUNT,
@@ -510,7 +638,6 @@ fn scan_one_dir(
         }
     });
 
-    unsafe { libc::close(fd) };
     partial
 }
 
