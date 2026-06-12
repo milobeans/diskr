@@ -60,6 +60,7 @@ diskr --thin-snapshots 10G --yes ~ # execute it
 
 | Key | Action |
 | --- | --- |
+| ? | Show full keyboard help |
 | Up/Down, j/k | Move selection |
 | PageUp/PageDown | Move by a page |
 | Home/End | Jump to first or last item |

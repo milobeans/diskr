@@ -9,6 +9,14 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+## [0.1.51] - 2026-06-12
+
+### Added
+
+- Added a `?` keyboard help overlay backed by the shared TUI keymap, and
+  shortened the footer to advertise `? help` instead of trying to fit every
+  shortcut on one line. (#56)
+
 ## [0.1.50] - 2026-06-12
 
 ### Changed

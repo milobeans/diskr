@@ -2,6 +2,7 @@ mod app;
 mod bulkstat;
 mod fs_ops;
 mod history;
+mod keymap;
 mod packages;
 mod pool;
 mod reclaim;
@@ -288,7 +289,7 @@ fn parse_top_limit(value: &str) -> Result<usize> {
 }
 
 fn print_help() {
-    println!(
+    print!(
         "\
 diskr {}
 
@@ -306,39 +307,19 @@ Usage:
   diskr --thin-snapshots SIZE [--yes] [PATH]
 
 Keys:
-  Up/Down, j/k    Move selection
-  PageUp/PageDown  Move by a page
-  Home/End        Jump to first or last item
-  Enter           Open selected directory or disk/package path
-  Backspace       Go to parent directory
-  /               Search files or filter packages
-  i               Show file, package, or disk details in the active pane
-  u               Toggle dependency-leaf package filter
-  x               Uninstall selected package via its manager
-  Left/Right, h/l Switch pane or package view
-  Space           Quick Look selected item
-  f               Reveal selected item in Finder
-  O               Open selected item with default app
-  r               Refresh view and scan all visible directory sizes
-  S               Scan every missing visible directory size
-  o               Cycle sort mode
-  p               Open packages pane / switch package view
-  .               Toggle hidden files
-  d               Move selected item to Trash
-  c               Rename selected item (files pane)
-  n               Create new directory (files pane)
-  v               Toggle mark on selected item (files pane)
-  a               Mark all visible items (files pane)
-  R               Re-scan reclaim pane
-  t               Open top-files list for selected directory/cwd
-  B               Save history baseline for current directory
-  E               Empty Trash (reclaim pane)
-  Tab             Switch files/disks/packages/reclaim pane
-  q               Quit
-  Esc, Ctrl+C     Return to Files pane / close modals and search modes
 ",
         env!("CARGO_PKG_VERSION")
     );
+    print_key_help();
+}
+
+fn print_key_help() {
+    for section in keymap::HELP_SECTIONS {
+        println!("\n{}:", section.title);
+        for binding in section.bindings {
+            println!("  {:<16} {}", binding.key, binding.action);
+        }
+    }
 }
 
 fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
@@ -1039,6 +1020,19 @@ where
                     if char_modifier_inhibited(&key) {
                         continue;
                     }
+                    if app.show_help {
+                        let handled = match key.code {
+                            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                                app.close_help();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            needs_draw = true;
+                        }
+                        continue;
+                    }
                     if app.confirming_delete {
                         let handled = match key.code {
                             KeyCode::Char('y') => {
@@ -1407,6 +1401,10 @@ where
                         continue;
                     }
                     let handled = match key.code {
+                        KeyCode::Char('?') => {
+                            app.open_help();
+                            true
+                        }
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Esc => {
                             if app.focus != Focus::Files {
@@ -1694,7 +1692,9 @@ fn char_modifier_inhibited(key: &crossterm::event::KeyEvent) -> bool {
 // Cancel whatever active state the app is in, mirroring Esc in each mode.
 // Used by Ctrl+C so it always acts as a safe "get me out of here" chord.
 fn cancel_active_state(app: &mut App) {
-    if app.confirming_delete {
+    if app.show_help {
+        app.close_help();
+    } else if app.confirming_delete {
         app.cancel_delete();
     } else if app.confirming_uninstall {
         app.cancel_uninstall();
@@ -2050,6 +2050,10 @@ mod tests {
             'O',
             KeyModifiers::SHIFT
         )));
+        assert!(!char_modifier_inhibited(&key_char(
+            '?',
+            KeyModifiers::SHIFT
+        )));
     }
 
     #[test]
@@ -2088,6 +2092,21 @@ mod tests {
 
         cancel_active_state(&mut app);
         assert!(!app.confirming_delete);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ctrl_c_closes_help_overlay() {
+        let root = test_root("ctrl_c_help_overlay");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.open_help();
+        assert!(app.show_help);
+
+        cancel_active_state(&mut app);
+        assert!(!app.show_help);
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -344,6 +344,7 @@ pub struct App {
     pub focus: Focus,
     pub disks: Vec<DiskInfo>,
     pub status: String,
+    pub show_help: bool,
     pub confirming_delete: bool,
 
     pub pkg_reports: Vec<ManagerReport>,
@@ -527,6 +528,7 @@ impl App {
             focus: Focus::Files,
             disks: Vec::new(),
             status: String::from("i info · Space preview · f Finder · O open"),
+            show_help: false,
             confirming_delete: false,
             pkg_reports: Vec::new(),
             project_deps: Vec::new(),
@@ -1191,6 +1193,14 @@ impl App {
 
     pub fn disk_info_open(&self) -> bool {
         self.disk_info_open
+    }
+
+    pub fn open_help(&mut self) {
+        self.show_help = true;
+    }
+
+    pub fn close_help(&mut self) {
+        self.show_help = false;
     }
 
     pub fn top_files_loading(&self) -> bool {

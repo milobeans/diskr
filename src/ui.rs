@@ -19,6 +19,7 @@ use crate::app::{
     InputMode, PkgView, SortMode,
 };
 use crate::bulkstat::SizeInfo;
+use crate::keymap::{self, KeySection};
 use crate::packages::{DepEvidence, PackageUseStatus};
 use crate::reclaim::Reclaimability;
 
@@ -92,6 +93,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if app.input_mode != InputMode::None {
         draw_input_overlay(f, app);
+    }
+    if app.show_help {
+        draw_help_overlay(f);
     }
 }
 
@@ -1518,74 +1522,79 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let label = |s: &'static str| Span::styled(s, Style::default().fg(Color::Gray));
     let sep = || Span::styled(" · ", Style::default().fg(Color::DarkGray));
 
-    let text = Line::from(vec![
-        key("↑↓/jk"),
-        label(" move"),
-        sep(),
-        key("Pg/Home"),
-        label(" jump"),
-        sep(),
-        key("←→/hl"),
-        label(" pane/view"),
-        sep(),
-        key("/"),
-        label(" search"),
-        sep(),
-        key("⏎"),
-        label(" open"),
-        sep(),
-        key("⌫"),
-        label(" up"),
-        sep(),
-        key("Space"),
-        label(" preview"),
-        sep(),
-        key("f"),
-        label(" finder"),
-        sep(),
-        key("O"),
-        label(" open"),
-        sep(),
-        key("y"),
-        label(" copy"),
-        sep(),
-        key("s"),
-        label(" terminal"),
-        sep(),
-        key("r"),
-        label(" refresh"),
-        sep(),
-        key("S"),
-        label(" scan all"),
-        sep(),
-        key("o"),
-        label(" sort"),
-        sep(),
-        key("p"),
-        label(" packages"),
-        sep(),
-        key("."),
-        label(" hidden"),
-        sep(),
-        key("d"),
-        label(" trash"),
-        sep(),
-        key("i"),
-        label(" info"),
-        sep(),
-        key("u"),
-        label(" leaves"),
-        sep(),
-        key("x"),
-        label(" uninstall"),
-        sep(),
-        key("Tab"),
-        label(" pane"),
-        sep(),
-        key("q"),
-        label(" quit"),
-    ]);
+    let mut spans = Vec::new();
+    for binding in keymap::footer_bindings() {
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        spans.push(key(binding.key));
+        spans.push(label(" "));
+        spans.push(label(binding.action));
+    }
+    let text = Line::from(spans);
     f.render_widget(Paragraph::new(text), area);
+}
+
+fn draw_help_overlay(f: &mut Frame) {
+    let area = centered_rect(84, 80, 64, 22, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" keyboard help ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width >= 76 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner);
+        let split = keymap::HELP_SECTIONS.len().div_ceil(2);
+        draw_help_column(f, columns[0], &keymap::HELP_SECTIONS[..split]);
+        draw_help_column(f, columns[1], &keymap::HELP_SECTIONS[split..]);
+    } else {
+        draw_help_column(f, inner, keymap::HELP_SECTIONS);
+    }
+}
+
+fn draw_help_column(f: &mut Frame, area: Rect, sections: &[KeySection]) {
+    let key_width = sections
+        .iter()
+        .flat_map(|section| section.bindings.iter())
+        .map(|binding| binding.key.chars().count())
+        .max()
+        .unwrap_or(1)
+        .min(16);
+    let mut lines = Vec::new();
+
+    for (section_idx, section) in sections.iter().enumerate() {
+        if section_idx > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            section.title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for binding in section.bindings {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    pad_key(binding.key, key_width),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(binding.action, Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn draw_confirm(f: &mut Frame, app: &App) {
@@ -1975,6 +1984,15 @@ fn truncate_start(s: &str, max: usize) -> String {
     }
     let tail: String = s.chars().skip(len.saturating_sub(max - 1)).collect();
     format!("…{tail}")
+}
+
+fn pad_key(s: &str, width: usize) -> String {
+    let mut out = s.to_string();
+    let len = s.chars().count();
+    for _ in len..width {
+        out.push(' ');
+    }
+    out
 }
 
 fn selection_status(app: &App) -> Vec<Span<'static>> {
