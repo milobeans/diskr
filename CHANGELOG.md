@@ -6,6 +6,15 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.63] - 2026-06-13
+
+### Changed
+
+- Relaxed the `ratatui-core` and `ratatui-widgets` dependency pins from exact
+  patch versions to caret ranges, so diskr can pick up compatible upstream
+  fixes without a manifest edit while keeping the existing custom crossterm
+  backend path.
+
 ## [0.1.62] - 2026-06-13
 
 ### Changed
