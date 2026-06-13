@@ -9,6 +9,15 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+## [0.1.60] - 2026-06-13
+
+### Fixed
+
+- History baselines now stay parsed in memory for the TUI session, and
+  baseline diffs index the prior child list once instead of linearly
+  rescanning it per entry, which removes repeated `history.json` parses on
+  navigation and avoids quadratic diff time on large directories. (#68)
+
 ## [0.1.59] - 2026-06-13
 
 ### Fixed

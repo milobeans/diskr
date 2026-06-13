@@ -433,6 +433,7 @@ pub struct App {
 
     pub history_baseline: Option<history::ScanRecord>,
     pub history_diff: Option<history::DiffReport>,
+    history_records: HashMap<PathBuf, history::ScanRecord>,
     active_history_request_id: u64,
     history_loading: bool,
     history_rx: Option<Receiver<HistoryMsg>>,
@@ -499,6 +500,7 @@ impl App {
             HashSet::new(),
         );
         let mut size_cache_dirty = false;
+        let history_records = history::load_records().unwrap_or_default();
         let cache_warning = match state::load_size_cache() {
             Ok(mut entries) => {
                 if entries.len() > state::SIZE_CACHE_MAX_ENTRIES {
@@ -610,6 +612,7 @@ impl App {
             file_info_open: false,
             history_baseline: None,
             history_diff: None,
+            history_records,
             active_history_request_id: 0,
             history_loading: false,
             history_rx: None,
@@ -640,7 +643,11 @@ impl App {
     }
 
     pub fn refresh_history_state(&mut self) {
-        let baseline = history::load_record_for_path(&self.cwd).unwrap_or(None);
+        let baseline = self
+            .cwd
+            .canonicalize()
+            .ok()
+            .and_then(|path| self.history_records.get(&path).cloned());
         self.apply_history_baseline(baseline);
     }
 
@@ -1466,6 +1473,8 @@ impl App {
                         true
                     }
                     HistoryResult::Save(Ok(record)) => {
+                        self.history_records
+                            .insert(record.path.clone(), record.clone());
                         self.history_baseline = Some(record);
                         self.history_diff = None;
                         self.status = String::from("baseline saved");

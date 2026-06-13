@@ -7,6 +7,7 @@
 //! touching the filesystem.
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -117,13 +118,19 @@ pub fn diff_from_record(baseline: &ScanRecord, path: &Path) -> Result<DiffReport
 /// Pure diff of two scan records. `before`/`after` need not be sorted.
 pub fn diff_records(before: &ScanRecord, after: &ScanRecord) -> DiffReport {
     let mut changes: Vec<ChildChange> = Vec::new();
+    let before_by_name: HashMap<&str, SizeInfo> = before
+        .children
+        .iter()
+        .map(|child| (child.name.as_str(), child.size))
+        .collect();
+    let after_names: std::collections::HashSet<&str> = after
+        .children
+        .iter()
+        .map(|child| child.name.as_str())
+        .collect();
 
     for child in &after.children {
-        let prior = before
-            .children
-            .iter()
-            .find(|c| c.name == child.name)
-            .map(|c| c.size);
+        let prior = before_by_name.get(child.name.as_str()).copied();
         let change = ChildChange {
             name: child.name.clone(),
             before: prior,
@@ -136,7 +143,7 @@ pub fn diff_records(before: &ScanRecord, after: &ScanRecord) -> DiffReport {
 
     // Removed children: present before, absent now.
     for child in &before.children {
-        if !after.children.iter().any(|c| c.name == child.name) {
+        if !after_names.contains(child.name.as_str()) {
             changes.push(ChildChange {
                 name: child.name.clone(),
                 before: Some(child.size),
@@ -223,8 +230,11 @@ fn history_file() -> PathBuf {
 }
 
 fn load_history() -> Result<serde_json::Map<String, serde_json::Value>> {
-    let path = history_file();
-    let text = match std::fs::read_to_string(&path) {
+    load_history_from_path(&history_file())
+}
+
+fn load_history_from_path(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(serde_json::Map::new()),
         Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
@@ -240,17 +250,29 @@ fn load_history() -> Result<serde_json::Map<String, serde_json::Value>> {
     }
 }
 
+pub fn load_records() -> Result<HashMap<PathBuf, ScanRecord>> {
+    load_records_from_path(&history_file())
+}
+
+fn load_records_from_path(path: &Path) -> Result<HashMap<PathBuf, ScanRecord>> {
+    let history = load_history_from_path(path)?;
+    Ok(history
+        .into_iter()
+        .map(|(path, value)| {
+            let path = PathBuf::from(path);
+            let record = record_from_json(&path, &value);
+            (path, record)
+        })
+        .collect())
+}
+
 /// Load the saved baseline for a path if one exists.
 pub fn load_record_for_path(path: &Path) -> Result<Option<ScanRecord>> {
     let canonical = path
         .canonicalize()
         .with_context(|| format!("resolve {}", path.display()))?;
-    let history = load_history()?;
-    let key = canonical.to_string_lossy().into_owned();
-    let Some(value) = history.get(&key) else {
-        return Ok(None);
-    };
-    Ok(Some(record_from_json(&canonical, value)))
+    let history = load_records()?;
+    Ok(history.get(&canonical).cloned())
 }
 
 fn store_record(record: &ScanRecord) -> Result<()> {
@@ -405,5 +427,35 @@ mod tests {
     fn total_sums_children() {
         let rec = record(vec![child("a", 100), child("b", 250)]);
         assert_eq!(rec.total().allocated, 350);
+    }
+
+    #[test]
+    fn load_records_uses_json_keys_for_paths() {
+        let path = std::env::temp_dir().join(format!(
+            "diskr_history_{}_{}.json",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::write(
+            &path,
+            r#"{
+  "/tmp/first": {"path":"/wrong","timestamp":1,"children":[]},
+  "/tmp/second": {"timestamp":2,"children":[]}
+}"#,
+        )
+        .unwrap();
+
+        let records = load_records_from_path(&path).unwrap();
+
+        assert_eq!(
+            records.get(Path::new("/tmp/first")).unwrap().path,
+            PathBuf::from("/tmp/first")
+        );
+        assert_eq!(
+            records.get(Path::new("/tmp/second")).unwrap().path,
+            PathBuf::from("/tmp/second")
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }
