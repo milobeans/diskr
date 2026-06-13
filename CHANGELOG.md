@@ -6,6 +6,8 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.61] - 2026-06-13
+
 ### Fixed
 
 - Reclaim findings now reserve separate list and detail regions, so the
