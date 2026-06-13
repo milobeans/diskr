@@ -6,6 +6,11 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Reclaim findings now reserve separate list and detail regions, so the
+  selected finding details no longer cover the middle of the findings list.
+
 ### Changed
 
 - Moved private maintenance materials out of the public repository, including

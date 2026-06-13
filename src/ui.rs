@@ -422,10 +422,10 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
     let area = centered_rect(70, 70, 72, 22, f.area());
-    app.reclaim_page_rows = area.height.saturating_sub(2).max(1) as usize;
     f.render_widget(Clear, area);
 
     if app.reclaim_loading {
+        app.reclaim_page_rows = area.height.saturating_sub(2).max(1) as usize;
         let inner = Block::default().borders(Borders::ALL).title(" reclaim ");
         let body = Paragraph::new(vec![
             Line::from(""),
@@ -451,6 +451,7 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
     let report = match app.reclaim_report.as_ref() {
         Some(report) => report,
         None => {
+            app.reclaim_page_rows = area.height.saturating_sub(2).max(1) as usize;
             let inner = Block::default().borders(Borders::ALL).title(" reclaim ");
             let body = Paragraph::new("press R to scan reclaim recommendations")
                 .block(inner)
@@ -462,6 +463,7 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
 
     let item_count = report.findings.len();
     if item_count == 0 {
+        app.reclaim_page_rows = area.height.saturating_sub(2).max(1) as usize;
         let inner = Block::default().borders(Borders::ALL).title(" reclaim ");
         let body = Paragraph::new("no reclaim candidates found")
             .block(inner)
@@ -469,6 +471,9 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
         f.render_widget(body, area);
         return;
     }
+
+    let (list_area, detail_area) = reclaim_panel_layout(area);
+    app.reclaim_page_rows = list_area.height.saturating_sub(2).max(1) as usize;
 
     let items: Vec<ListItem> = report
         .findings
@@ -512,11 +517,11 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
             // Roll-up rows are shown for context; their bytes are already
             // counted inside child findings and excluded from the total.
             let label_text = if finding.rollup {
-                let available = area.width.saturating_sub(52) as usize;
+                let available = list_area.width.saturating_sub(52) as usize;
                 let base = truncate(&finding.label, available.saturating_sub(10));
                 format!("{base} [subtotal]")
             } else {
-                truncate(&finding.label, area.width.saturating_sub(52) as usize)
+                truncate(&finding.label, list_area.width.saturating_sub(52) as usize)
             };
             spans.push(Span::styled(label_text, Style::default().fg(Color::White)));
             ListItem::new(Line::from(spans))
@@ -543,11 +548,9 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
 
     let mut state = ListState::default();
     state.select(Some(app.selected_reclaim.min(item_count.saturating_sub(1))));
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
 
     if let Some(finding) = app.selected_reclaim_finding() {
-        let detail_area = centered_rect(70, 28, 72, 9, f.area());
-        f.render_widget(Clear, detail_area);
         let size_line = format!(
             "{} · {} paths",
             if finding.size.allocated == finding.size.logical {
@@ -594,6 +597,14 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
             .border_style(Style::default().fg(Color::DarkGray));
         f.render_widget(Paragraph::new(lines).block(block), detail_area);
     }
+}
+
+fn reclaim_panel_layout(area: Rect) -> (Rect, Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(7), Constraint::Length(9)])
+        .split(area);
+    (chunks[0], chunks[1])
 }
 
 fn finding_count_label(count: usize) -> String {
@@ -2742,6 +2753,20 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let got = centered_rect(60, 20, 40, 6, area);
         assert_eq!(got.height, 6);
+    }
+
+    #[test]
+    fn reclaim_panel_layout_keeps_detail_below_list() {
+        let area = Rect::new(15, 4, 70, 28);
+        let (list, detail) = reclaim_panel_layout(area);
+
+        assert_eq!(list.x, area.x);
+        assert_eq!(detail.x, area.x);
+        assert_eq!(list.width, area.width);
+        assert_eq!(detail.width, area.width);
+        assert_eq!(list.y + list.height, detail.y);
+        assert_eq!(detail.height, 9);
+        assert!(list.height >= 7);
     }
 
     #[test]
