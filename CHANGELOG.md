@@ -18,6 +18,12 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
   managers surface a diagnostic warning in the TUI status line, CLI text output,
   and JSON reports instead of silently showing "0 packages." (#49)
 
+- Resolved the audit paper-cut grab bag covering Reclaim refresh routing,
+  package-pane focus behavior, diff labels, file-row alignment/truncation,
+  disk labels, Full Disk Access rechecks, Empty Trash duplicate-request
+  status, input cursor visibility, background batch delete, stale dead-code
+  allowances, `HOMEBREW_PREFIX`, and PEP 621 dependency arrays. (#70)
+
 ## [0.1.57] - 2026-06-13
 
 ### Fixed
