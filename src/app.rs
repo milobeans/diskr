@@ -1475,6 +1475,7 @@ impl App {
                     HistoryResult::Save(Ok(record)) => {
                         self.history_records
                             .insert(record.path.clone(), record.clone());
+                        history::prune_records(&mut self.history_records);
                         self.history_baseline = Some(record);
                         self.history_diff = None;
                         self.status = String::from("baseline saved");
@@ -4436,6 +4437,50 @@ mod tests {
         assert!(app.history_loading);
         assert!(app.history_rx.is_some());
         assert!(app.history_diff.is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn history_save_result_prunes_cached_baselines() {
+        let root = test_root("history_save_prune");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        for idx in 0..history::HISTORY_MAX_RECORDS {
+            let path = PathBuf::from(format!("/tmp/history-{idx}"));
+            app.history_records.insert(
+                path.clone(),
+                history::ScanRecord {
+                    path,
+                    timestamp: idx as u64,
+                    children: Vec::new(),
+                },
+            );
+        }
+
+        let canonical = root.canonicalize().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.active_history_request_id = 7;
+        app.history_rx = Some(rx);
+        app.history_loading = true;
+        tx.send(HistoryMsg {
+            request_id: 7,
+            cwd: root.clone(),
+            result: HistoryResult::Save(Ok(history::ScanRecord {
+                path: canonical.clone(),
+                timestamp: history::HISTORY_MAX_RECORDS as u64 + 10,
+                children: Vec::new(),
+            })),
+        })
+        .unwrap();
+
+        assert!(app.drain_history_results());
+        assert_eq!(app.history_records.len(), history::HISTORY_MAX_RECORDS);
+        assert!(app.history_records.contains_key(&canonical));
+        assert!(!app
+            .history_records
+            .contains_key(Path::new("/tmp/history-0")));
 
         fs::remove_dir_all(root).unwrap();
     }

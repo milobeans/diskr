@@ -6,6 +6,14 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.62] - 2026-06-13
+
+### Changed
+
+- Saved history baselines now retain only the newest 512 directories on disk
+  and in memory, so `history.json` and the TUI baseline cache cannot grow
+  without bound as more paths are saved.
+
 ## [0.1.61] - 2026-06-13
 
 ### Fixed

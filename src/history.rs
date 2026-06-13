@@ -16,6 +16,8 @@ use crate::{
     state,
 };
 
+pub(crate) const HISTORY_MAX_RECORDS: usize = 512;
+
 /// One immediate child of a scanned directory, with its recursive size.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChildSize {
@@ -229,10 +231,6 @@ fn history_file() -> PathBuf {
     state::state_dir().join("history.json")
 }
 
-fn load_history() -> Result<serde_json::Map<String, serde_json::Value>> {
-    load_history_from_path(&history_file())
-}
-
 fn load_history_from_path(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -256,14 +254,18 @@ pub fn load_records() -> Result<HashMap<PathBuf, ScanRecord>> {
 
 fn load_records_from_path(path: &Path) -> Result<HashMap<PathBuf, ScanRecord>> {
     let history = load_history_from_path(path)?;
-    Ok(history
+    let mut records: HashMap<PathBuf, ScanRecord> = history
         .into_iter()
         .map(|(path, value)| {
             let path = PathBuf::from(path);
             let record = record_from_json(&path, &value);
             (path, record)
         })
-        .collect())
+        .collect();
+    if prune_records(&mut records) {
+        store_records_to_path(path, &records)?;
+    }
+    Ok(records)
 }
 
 /// Load the saved baseline for a path if one exists.
@@ -278,14 +280,42 @@ pub fn load_record_for_path(path: &Path) -> Result<Option<ScanRecord>> {
 fn store_record(record: &ScanRecord) -> Result<()> {
     let dir = state::state_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let mut history = load_history()?;
-    history.insert(
-        record.path.to_string_lossy().into_owned(),
-        record_to_json(record),
-    );
-    let text = serde_json::to_string_pretty(&serde_json::Value::Object(history))?;
     let path = history_file();
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    let mut records = load_records_from_path(&path)?;
+    records.insert(record.path.clone(), record.clone());
+    prune_records(&mut records);
+    store_records_to_path(&path, &records)?;
+    Ok(())
+}
+
+pub(crate) fn prune_records(records: &mut HashMap<PathBuf, ScanRecord>) -> bool {
+    if records.len() <= HISTORY_MAX_RECORDS {
+        return false;
+    }
+    let mut ordered: Vec<_> = records.drain().collect();
+    ordered.sort_by(|(path_a, a), (path_b, b)| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| path_a.cmp(path_b))
+    });
+    ordered.truncate(HISTORY_MAX_RECORDS);
+    records.extend(ordered);
+    true
+}
+
+fn store_records_to_path(path: &Path, records: &HashMap<PathBuf, ScanRecord>) -> Result<()> {
+    let mut ordered: Vec<_> = records.iter().collect();
+    ordered.sort_by(|(path_a, a), (path_b, b)| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| path_a.cmp(path_b))
+    });
+    let mut history = serde_json::Map::with_capacity(ordered.len());
+    for (path, record) in ordered {
+        history.insert(path.to_string_lossy().into_owned(), record_to_json(record));
+    }
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(history))?;
+    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -455,6 +485,46 @@ mod tests {
             records.get(Path::new("/tmp/second")).unwrap().path,
             PathBuf::from("/tmp/second")
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_records_prunes_older_entries() {
+        let path = std::env::temp_dir().join(format!(
+            "diskr_history_prune_{}_{}.json",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut history = serde_json::Map::new();
+        for idx in 0..(HISTORY_MAX_RECORDS + 2) {
+            let path = PathBuf::from(format!("/tmp/history-{idx}"));
+            history.insert(
+                path.to_string_lossy().into_owned(),
+                record_to_json(&ScanRecord {
+                    path,
+                    timestamp: idx as u64,
+                    children: Vec::new(),
+                }),
+            );
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::Value::Object(history)).unwrap(),
+        )
+        .unwrap();
+
+        let records = load_records_from_path(&path).unwrap();
+        let pruned_text = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(records.len(), HISTORY_MAX_RECORDS);
+        assert!(!records.contains_key(Path::new("/tmp/history-0")));
+        assert!(records.contains_key(Path::new(&format!(
+            "/tmp/history-{}",
+            HISTORY_MAX_RECORDS + 1
+        ))));
+        let pruned_value: serde_json::Value = serde_json::from_str(&pruned_text).unwrap();
+        assert_eq!(pruned_value.as_object().unwrap().len(), HISTORY_MAX_RECORDS);
 
         let _ = std::fs::remove_file(path);
     }
