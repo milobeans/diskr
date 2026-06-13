@@ -9,6 +9,16 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+## [0.1.59] - 2026-06-13
+
+### Fixed
+
+- Package-manager command timeouts now start each manager probe in its own
+  process group and kill the whole group on deadline, so a helper process that
+  inherits stdout/stderr can no longer keep `--packages` or the TUI package
+  scan hung past the timeout. Regression coverage locks the shell-background
+  case that previously blocked forever. (#89)
+
 ## [0.1.58] - 2026-06-13
 
 ### Fixed

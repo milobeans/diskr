@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -1319,6 +1320,7 @@ fn run_command(cmd: &str, args: &[&str]) -> CommandResult {
 fn run_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> CommandResult {
     let mut command = Command::new(cmd);
     command.args(args);
+    command.process_group(0);
     if cmd == "brew" {
         command.env("HOMEBREW_NO_AUTO_UPDATE", "1");
     }
@@ -1361,13 +1363,13 @@ fn run_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Comm
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                terminate_command(&mut child);
                 let _ = child.wait();
                 break None;
             }
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(_) => {
-                let _ = child.kill();
+                terminate_command(&mut child);
                 let _ = child.wait();
                 break None;
             }
@@ -1390,6 +1392,18 @@ fn run_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Comm
             success: false,
             timed_out: true,
         },
+    }
+}
+
+fn terminate_command(child: &mut std::process::Child) {
+    let pid = child.id() as libc::pid_t;
+    if pid <= 0 {
+        let _ = child.kill();
+        return;
+    }
+
+    if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+        let _ = child.kill();
     }
 }
 
@@ -2011,6 +2025,27 @@ dev = ["pytest", "ruff"]
     #[test]
     fn run_command_times_out_on_slow_process() {
         let result = run_command_with_timeout("sleep", &["60"], Duration::from_millis(200));
+        assert!(result.timed_out);
+        assert!(!result.success);
+    }
+
+    #[test]
+    fn run_command_timeout_kills_grandchildren_holding_stdout_open() {
+        use std::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_command_with_timeout(
+                "sh",
+                &["-c", "sleep 5 & wait"],
+                Duration::from_millis(200),
+            );
+            tx.send(result).unwrap();
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("timed-out command should return even when a grandchild inherits stdout");
         assert!(result.timed_out);
         assert!(!result.success);
     }
