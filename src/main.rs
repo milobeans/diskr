@@ -606,7 +606,11 @@ fn change_status(change: &history::ChildChange) -> &'static str {
     match (change.before, change.after) {
         (None, Some(_)) => "new",
         (Some(_), None) => "removed",
-        _ if change.delta_allocated() >= 0 => "grew",
+        _ if change.delta_allocated() > 0
+            || (change.delta_allocated() == 0 && change.delta_logical() > 0) =>
+        {
+            "grew"
+        }
         _ => "shrank",
     }
 }
@@ -720,13 +724,17 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
                         })
                     })
                     .collect();
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "manager": r.manager.label(),
                     "count": r.packages.len(),
                     "total_logical": r.total_size.logical,
                     "total_allocated": r.total_size.allocated,
                     "packages": pkgs,
-                })
+                });
+                if let Some(w) = &r.warning {
+                    obj["warning"] = serde_json::json!(w);
+                }
+                obj
             })
             .collect();
         let projects: Vec<_> = project_deps
@@ -759,6 +767,11 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             continue;
         }
         any_manager = true;
+        if let Some(w) = &report.warning {
+            println!("{}: {w}", report.manager.label());
+            println!();
+            continue;
+        }
         println!(
             "{}: {} packages · {}",
             report.manager.label(),
@@ -1436,6 +1449,8 @@ where
                         KeyCode::Char('r') => {
                             if app.focus == Focus::Packages {
                                 app.refresh_packages();
+                            } else if app.focus == Focus::Reclaim {
+                                app.request_reclaim_scan();
                             } else {
                                 app.force_rescan();
                             }
@@ -1511,7 +1526,7 @@ where
                             }
                         }
                         KeyCode::Char('p') => {
-                            app.focus = Focus::Packages;
+                            set_focus(app, Focus::Packages);
                             app.load_packages();
                             true
                         }
@@ -1631,9 +1646,6 @@ fn set_focus(app: &mut App, focus: Focus) {
     if app.focus == Focus::Reclaim {
         app.open_reclaim_for_focus();
     }
-    if app.focus == Focus::Packages {
-        app.load_packages();
-    }
 }
 
 // Returns true if a key event is a Char key modified by CONTROL, ALT, or SUPER.
@@ -1732,6 +1744,38 @@ mod tests {
 
     fn parse(parts: &[&str]) -> Result<CliAction> {
         parse_args(parts.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn change_status_uses_logical_delta_when_allocated_is_unchanged() {
+        let shrank = history::ChildChange {
+            name: String::from("logical-only"),
+            before: Some(bulkstat::SizeInfo::new(200, 100)),
+            after: Some(bulkstat::SizeInfo::new(120, 100)),
+        };
+        let grew = history::ChildChange {
+            name: String::from("logical-only"),
+            before: Some(bulkstat::SizeInfo::new(120, 100)),
+            after: Some(bulkstat::SizeInfo::new(200, 100)),
+        };
+
+        assert_eq!(change_status(&shrank), "shrank");
+        assert_eq!(change_status(&grew), "grew");
+    }
+
+    #[test]
+    fn focus_transit_to_packages_does_not_start_package_scan() {
+        let root = test_root("focus_packages_no_scan");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        set_focus(&mut app, Focus::Packages);
+
+        assert!(matches!(app.focus, Focus::Packages));
+        assert!(!app.packages_loading);
+        assert!(!app.packages_loaded);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1948,6 +1992,7 @@ mod tests {
             }],
             total_size: crate::bulkstat::SizeInfo::default(),
             available: true,
+            warning: None,
         }];
         app.project_deps = vec![packages::ProjectDeps {
             path: root.clone(),
@@ -2051,6 +2096,7 @@ mod tests {
             ],
             total_size: crate::bulkstat::SizeInfo::new(60, 60),
             available: true,
+            warning: None,
         }];
         app.rebuild_flat_packages();
 

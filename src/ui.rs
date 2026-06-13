@@ -104,7 +104,7 @@ fn draw_input_overlay(f: &mut Frame, app: &App) {
     let block = Block::default()
         .title(app.input_prompt.as_str())
         .borders(Borders::ALL);
-    let text = vec![Line::from(""), Line::from(app.input_buffer.as_str())];
+    let text = vec![Line::from(""), Line::from(format!("{}▏", app.input_buffer))];
     let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
     f.render_widget(Clear, area);
     f.render_widget(paragraph, area);
@@ -162,11 +162,16 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     let show_modified = app.sort == SortMode::Modified;
     let (name_width, size_width, modified_width, bar_width) =
         file_columns(area.width.saturating_sub(2), show_modified);
+    let visible_count = app.visible_entry_count();
+    let title = if app.search_filter_active() {
+        format!("files ({visible_count}/{})", app.entries.len())
+    } else {
+        format!("files ({})", app.entries.len())
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("files ({})", app.entries.len()))
+        .title(title)
         .border_style(Style::default().fg(border_color));
-    let visible_count = app.visible_entry_count();
     if visible_count == 0 {
         let message = if app.entries.is_empty() {
             "empty directory"
@@ -249,14 +254,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
             };
             let mut spans = vec![
                 Span::styled(icon, Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!(
-                        "{:<width$}",
-                        truncate(&e.name, name_width),
-                        width = name_width
-                    ),
-                    name_style,
-                ),
+                Span::styled(pad_truncated(&e.name, name_width), name_style),
             ];
             let (bar_text, bar_percent, bar_style) = file_size_bar(
                 e.size.map(size_sort_key),
@@ -268,14 +266,20 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(format!("{size_str:>size_width$}"), size_style));
             }
-            if bar_width > 0 && !e.scanning {
+            if bar_width > 0 {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled(bar_text, bar_style));
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    bar_percent,
-                    Style::default().fg(Color::DarkGray),
-                ));
+                if e.scanning {
+                    spans.push(Span::raw(" ".repeat(bar_width)));
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::raw("    "));
+                } else {
+                    spans.push(Span::styled(bar_text, bar_style));
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        bar_percent,
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
             }
             if show_modified && modified_width > 0 {
                 let modified = format_modified_time(e.modified);
@@ -2013,10 +2017,20 @@ fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    if s.chars().count() <= max {
+    if display_width(s) <= max {
         s.to_string()
     } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        let mut out = String::new();
+        let mut width = 0;
+        let limit = max.saturating_sub(1);
+        for ch in s.chars() {
+            let ch_width = char_display_width(ch);
+            if width + ch_width > limit {
+                break;
+            }
+            out.push(ch);
+            width += ch_width;
+        }
         out.push('…');
         out
     }
@@ -2026,15 +2040,68 @@ fn truncate_start(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    let len = s.chars().count();
-    if len <= max {
+    if display_width(s) <= max {
         return s.to_string();
     }
     if max == 1 {
         return String::from("…");
     }
-    let tail: String = s.chars().skip(len.saturating_sub(max - 1)).collect();
+    let mut tail = Vec::new();
+    let mut width = 0;
+    let limit = max.saturating_sub(1);
+    for ch in s.chars().rev() {
+        let ch_width = char_display_width(ch);
+        if width + ch_width > limit {
+            break;
+        }
+        tail.push(ch);
+        width += ch_width;
+    }
+    let tail: String = tail.into_iter().rev().collect();
     format!("…{tail}")
+}
+
+fn pad_truncated(s: &str, width: usize) -> String {
+    let mut out = truncate(s, width);
+    let padding = width.saturating_sub(display_width(&out));
+    out.extend(std::iter::repeat_n(' ', padding));
+    out
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    if ch.is_control()
+        || matches!(
+            ch,
+            '\u{0300}'..='\u{036F}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+        )
+    {
+        return 0;
+    }
+
+    if matches!(
+        ch,
+        '\u{1100}'..='\u{115F}'
+            | '\u{2329}'..='\u{232A}'
+            | '\u{2E80}'..='\u{A4CF}'
+            | '\u{AC00}'..='\u{D7A3}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FE10}'..='\u{FE19}'
+            | '\u{FE30}'..='\u{FE6F}'
+            | '\u{FF00}'..='\u{FF60}'
+            | '\u{FFE0}'..='\u{FFE6}'
+            | '\u{1F300}'..='\u{1FAFF}'
+    ) {
+        2
+    } else {
+        1
+    }
 }
 
 fn pad_key(s: &str, width: usize) -> String {
@@ -2169,11 +2236,7 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
             Some(disk) => {
                 let free = human(disk.available);
                 let total = human(disk.total);
-                let label = if disk.name.is_empty() {
-                    disk.mount.display().to_string()
-                } else {
-                    disk.name.clone()
-                };
+                let label = disk_label(disk);
                 spans.push(Span::styled("disk ", Style::default().fg(Color::DarkGray)));
                 spans.push(Span::styled(
                     truncate(&label, 28),
@@ -2331,11 +2394,21 @@ fn disk_window_bounds(selected: usize, total_items: usize, max_rows: usize) -> (
 }
 
 fn disk_label(disk: &crate::app::DiskInfo) -> String {
+    let volume = volume_label(&disk.mount);
     if disk.name.is_empty() {
-        disk.mount.display().to_string()
+        format!("{volume}  {}", disk.mount.display())
     } else {
-        format!("{}  {}", disk.name, disk.mount.display())
+        format!("{volume}  {} ({})", disk.mount.display(), disk.name)
     }
+}
+
+fn volume_label(mount: &std::path::Path) -> String {
+    mount
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| String::from("Root volume"))
 }
 
 fn size_detail(size: SizeInfo) -> String {
@@ -2639,6 +2712,20 @@ mod tests {
     }
 
     #[test]
+    fn truncate_uses_terminal_display_width() {
+        let truncated = truncate("漢字abc", 5);
+        assert_eq!(truncated, "漢字…");
+        assert_eq!(display_width(&truncated), 5);
+    }
+
+    #[test]
+    fn pad_truncated_pads_by_terminal_display_width() {
+        let padded = pad_truncated("漢字a", 6);
+        assert_eq!(display_width(&padded), 6);
+        assert_eq!(padded, "漢字a ");
+    }
+
+    #[test]
     fn truncate_start_keeps_path_tail() {
         assert_eq!(truncate_start("/Users/milo/Downloads", 10), "…Downloads");
     }
@@ -2726,6 +2813,21 @@ mod tests {
         assert_eq!(disk_window_bounds(0, 12, 3), (0, 3));
         assert_eq!(disk_window_bounds(8, 12, 3), (7, 10));
         assert_eq!(disk_window_bounds(11, 12, 3), (9, 12));
+    }
+
+    #[test]
+    fn disk_label_prefers_mount_component_over_device_node() {
+        let disk = crate::app::DiskInfo {
+            name: String::from("/dev/disk3s1"),
+            mount: std::path::PathBuf::from("/Volumes/Projects"),
+            total: 100,
+            available: 50,
+        };
+
+        assert_eq!(
+            disk_label(&disk),
+            "Projects  /Volumes/Projects (/dev/disk3s1)"
+        );
     }
 
     #[test]

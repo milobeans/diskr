@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::bulkstat::{self, SizeInfo};
 use crate::pool;
@@ -185,6 +187,17 @@ pub struct ManagerReport {
     pub packages: Vec<Package>,
     pub total_size: SizeInfo,
     pub available: bool,
+    pub warning: Option<String>,
+}
+
+const CMD_TIMEOUT: Duration = Duration::from_secs(10);
+const CMD_TIMEOUT_SLOW: Duration = Duration::from_secs(30);
+
+struct CommandResult {
+    stdout: String,
+    stderr: String,
+    success: bool,
+    timed_out: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +223,7 @@ pub fn scan_managers() -> Vec<ManagerReport> {
             packages: Vec::new(),
             total_size: SizeInfo::default(),
             available: false,
+            warning: Some("scan thread panicked".into()),
         });
         reports[index] = Some(report);
     }
@@ -275,11 +289,11 @@ fn package_dep_info(
 }
 
 fn scan_brew_dep_graph() -> HashMap<String, DepInfo> {
-    let output = run_command("brew", &["deps", "--installed", "--for-each"]);
-    if output.is_empty() {
+    let result = run_command("brew", &["deps", "--installed", "--for-each"]);
+    if result.stdout.is_empty() {
         return HashMap::new();
     }
-    parse_brew_dep_graph(&output)
+    parse_brew_dep_graph(&result.stdout)
 }
 
 fn parse_brew_dep_graph(output: &str) -> HashMap<String, DepInfo> {
@@ -321,11 +335,11 @@ fn scan_pip_dep_graph(names: &[String]) -> HashMap<String, DepInfo> {
     for name in names {
         args.push(name);
     }
-    let output = run_pip_command(&args);
-    if output.is_empty() {
+    let result = run_pip_command(&args);
+    if result.stdout.is_empty() {
         return HashMap::new();
     }
-    parse_pip_show_output(&output)
+    parse_pip_show_output(&result.stdout)
 }
 
 fn parse_pip_show_output(output: &str) -> HashMap<String, DepInfo> {
@@ -421,11 +435,12 @@ fn scan_manager(manager: Manager) -> ManagerReport {
             packages: Vec::new(),
             total_size: SizeInfo::default(),
             available: false,
+            warning: None,
         };
     }
 
-    let packages = match manager {
-        Manager::Brew => scan_brew_formulae(),
+    let (packages, warning) = match manager {
+        Manager::Brew => (scan_brew_formulae(), None),
         Manager::BrewCask => scan_brew_casks(),
         Manager::Npm => scan_npm_global(),
         Manager::Pip => scan_pip(),
@@ -446,7 +461,27 @@ fn scan_manager(manager: Manager) -> ManagerReport {
         packages,
         total_size,
         available: true,
+        warning,
     }
+}
+
+fn cmd_warning(result: &CommandResult, manager_label: &str) -> Option<String> {
+    if result.timed_out {
+        return Some(format!("{manager_label}: timed out"));
+    }
+    if !result.success {
+        let detail = result.stderr.lines().next().unwrap_or("").trim();
+        if detail.is_empty() {
+            return Some(format!("{manager_label}: exited with error"));
+        }
+        let truncated = if detail.len() > 120 {
+            format!("{}...", &detail[..120])
+        } else {
+            detail.to_string()
+        };
+        return Some(format!("{manager_label}: {truncated}"));
+    }
+    None
 }
 
 fn scan_brew_formulae() -> Vec<Package> {
@@ -454,13 +489,18 @@ fn scan_brew_formulae() -> Vec<Package> {
     scan_brew_dir(&cellar)
 }
 
-fn scan_brew_casks() -> Vec<Package> {
-    let output = run_command("brew", &["info", "--cask", "--json=v2", "--installed"]);
-    if output.is_empty() {
-        return Vec::new();
+fn scan_brew_casks() -> (Vec<Package>, Option<String>) {
+    let result = run_command_with_timeout(
+        "brew",
+        &["info", "--cask", "--json=v2", "--installed"],
+        CMD_TIMEOUT_SLOW,
+    );
+    let warning = cmd_warning(&result, "brew cask");
+    if result.stdout.is_empty() {
+        return (Vec::new(), warning);
     }
     let caskroom = brew_prefix().join("Caskroom");
-    parse_brew_cask_json(&output, &caskroom)
+    (parse_brew_cask_json(&result.stdout, &caskroom), warning)
 }
 
 fn parse_brew_cask_json(output: &str, caskroom: &Path) -> Vec<Package> {
@@ -608,16 +648,17 @@ fn latest_subdir_name(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn scan_npm_global() -> Vec<Package> {
-    let output = run_command("npm", &["list", "-g", "--depth=0", "--json"]);
-    if output.is_empty() {
-        return Vec::new();
+fn scan_npm_global() -> (Vec<Package>, Option<String>) {
+    let result = run_command("npm", &["list", "-g", "--depth=0", "--json"]);
+    let warning = cmd_warning(&result, "npm");
+    if result.stdout.is_empty() {
+        return (Vec::new(), warning);
     }
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output) else {
-        return Vec::new();
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result.stdout) else {
+        return (Vec::new(), warning);
     };
     let Some(deps) = parsed.get("dependencies").and_then(|d| d.as_object()) else {
-        return Vec::new();
+        return (Vec::new(), warning);
     };
 
     let global_root = find_npm_global_root();
@@ -634,7 +675,7 @@ fn scan_npm_global() -> Vec<Package> {
         })
         .collect();
 
-    pool::par_map(entries, |(name, version)| {
+    let packages = pool::par_map(entries, |(name, version)| {
         let pkg_path = global_root.as_ref().map(|root| root.join(&name));
         let size = pkg_path
             .as_ref()
@@ -647,7 +688,8 @@ fn scan_npm_global() -> Vec<Package> {
             path: pkg_path.filter(|path| path.is_dir()),
             metadata_path: None,
         }
-    })
+    });
+    (packages, warning)
 }
 
 fn find_npm_global_root() -> Option<PathBuf> {
@@ -657,7 +699,7 @@ fn find_npm_global_root() -> Option<PathBuf> {
         Some(PathBuf::from("/usr/local/lib/node_modules"))
     };
     find_npm_global_root_with(
-        run_command,
+        |cmd, args| run_command(cmd, args).stdout,
         std::env::var_os("HOME").map(PathBuf::from),
         std::env::var_os("NVM_DIR").map(PathBuf::from),
         known_root,
@@ -714,16 +756,17 @@ fn single_version_node_modules_root(base: &Path, suffix: &Path) -> Option<PathBu
     Some(first)
 }
 
-fn scan_pip() -> Vec<Package> {
-    let output = run_pip_command(&["list", "--format=json"]);
-    if output.is_empty() {
-        return Vec::new();
+fn scan_pip() -> (Vec<Package>, Option<String>) {
+    let result = run_pip_command(&["list", "--format=json"]);
+    let warning = cmd_warning(&result, "pip");
+    if result.stdout.is_empty() {
+        return (Vec::new(), warning);
     }
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output) else {
-        return Vec::new();
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result.stdout) else {
+        return (Vec::new(), warning);
     };
     let Some(arr) = parsed.as_array() else {
-        return Vec::new();
+        return (Vec::new(), warning);
     };
 
     let site_packages = find_pip_site_packages();
@@ -741,7 +784,7 @@ fn scan_pip() -> Vec<Package> {
         })
         .collect();
 
-    pool::par_map(entries, |(name, version)| {
+    let packages = pool::par_map(entries, |(name, version)| {
         let (size, path) = if let Some(sp) = &site_packages {
             find_pip_package_size_and_path(sp, &name)
         } else {
@@ -754,14 +797,17 @@ fn scan_pip() -> Vec<Package> {
             path,
             metadata_path: None,
         }
-    })
+    });
+    (packages, warning)
 }
 
-fn scan_cargo() -> Vec<Package> {
-    let output = run_command("cargo", &["install", "--list"]);
-    if output.is_empty() {
-        return Vec::new();
+fn scan_cargo() -> (Vec<Package>, Option<String>) {
+    let result = run_command("cargo", &["install", "--list"]);
+    let warning = cmd_warning(&result, "cargo");
+    if result.stdout.is_empty() {
+        return (Vec::new(), warning);
     }
+    let output = &result.stdout;
 
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let cargo_bin = home.as_ref().map(|h| h.join(".cargo/bin"));
@@ -853,13 +899,14 @@ fn scan_cargo() -> Vec<Package> {
         &cargo_bin,
     );
 
-    packages
+    (packages, warning)
 }
 
-fn scan_bun_global() -> Vec<Package> {
-    let output = run_command("bun", &["pm", "ls", "-g"]);
-    if output.is_empty() {
-        return Vec::new();
+fn scan_bun_global() -> (Vec<Package>, Option<String>) {
+    let result = run_command("bun", &["pm", "ls", "-g"]);
+    let warning = cmd_warning(&result, "bun");
+    if result.stdout.is_empty() {
+        return (Vec::new(), warning);
     }
 
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -867,7 +914,8 @@ fn scan_bun_global() -> Vec<Package> {
         .as_ref()
         .map(|h| h.join(".bun/install/global/node_modules"));
 
-    let entries: Vec<_> = output
+    let entries: Vec<_> = result
+        .stdout
         .lines()
         .filter_map(|line| {
             let line = line.trim();
@@ -890,7 +938,7 @@ fn scan_bun_global() -> Vec<Package> {
         })
         .collect();
 
-    pool::par_map(entries, |(name, version)| {
+    let packages = pool::par_map(entries, |(name, version)| {
         let (size, path) = if let Some(global_dir) = &bun_global {
             let pkg_path = global_dir.join(&name);
             if pkg_path.is_dir() {
@@ -908,7 +956,8 @@ fn scan_bun_global() -> Vec<Package> {
             path,
             metadata_path: None,
         }
-    })
+    });
+    (packages, warning)
 }
 
 pub fn find_project_deps(root: &Path, max_depth: usize) -> Vec<ProjectDeps> {
@@ -1119,18 +1168,69 @@ fn count_requirements_deps(content: &str) -> usize {
 
 fn count_pyproject_deps(content: &str) -> usize {
     let mut count = 0;
-    let mut in_deps = false;
+    let mut section = String::new();
+    let mut in_string_array = false;
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_deps = trimmed.contains("dependencies");
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if in_deps
-            && ((trimmed.starts_with('"') || trimmed.starts_with('\''))
-                || (trimmed.contains('=') && !trimmed.starts_with('#')))
-        {
-            count += 1;
+        if in_string_array {
+            count += count_quoted_toml_strings(trimmed);
+            if trimmed.contains(']') {
+                in_string_array = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            section.clear();
+            section.push_str(trimmed);
+            continue;
+        }
+
+        let Some((key, value)) = trimmed.split_once('=') else {
+            if section.contains("dependencies")
+                && (trimmed.starts_with('"') || trimmed.starts_with('\''))
+            {
+                count += 1;
+            }
+            continue;
+        };
+
+        let key = key.trim();
+        let value = value.trim();
+        if section == "[project]" && key == "dependencies" {
+            count += count_quoted_toml_strings(value);
+            in_string_array = value.contains('[') && !value.contains(']');
+        } else if section.contains("dependencies") {
+            if value.contains('[') {
+                count += count_quoted_toml_strings(value);
+                in_string_array = !value.contains(']');
+            } else {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn count_quoted_toml_strings(value: &str) -> usize {
+    let mut count = 0;
+    let mut in_quote = None;
+    let mut escaped = false;
+    for ch in value.chars() {
+        match in_quote {
+            Some(_) if escaped => {
+                escaped = false;
+            }
+            Some('"') if ch == '\\' => escaped = true,
+            Some(quote) if ch == quote => {
+                in_quote = None;
+                count += 1;
+            }
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => in_quote = Some(ch),
+            None => {}
         }
     }
     count
@@ -1212,22 +1312,88 @@ fn is_executable(path: PathBuf) -> bool {
     }
 }
 
-fn run_command(cmd: &str, args: &[&str]) -> String {
+fn run_command(cmd: &str, args: &[&str]) -> CommandResult {
+    run_command_with_timeout(cmd, args, CMD_TIMEOUT)
+}
+
+fn run_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> CommandResult {
     let mut command = Command::new(cmd);
     command.args(args);
     if cmd == "brew" {
         command.env("HOMEBREW_NO_AUTO_UPDATE", "1");
     }
-    command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default()
+    let mut child = match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return CommandResult {
+                stdout: String::new(),
+                stderr: e.to_string(),
+                success: false,
+                timed_out: false,
+            }
+        }
+    };
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_handle = thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let stderr_handle = thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+
+    match status {
+        Some(s) => CommandResult {
+            stdout,
+            stderr,
+            success: s.success(),
+            timed_out: false,
+        },
+        None => CommandResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: false,
+            timed_out: true,
+        },
+    }
 }
 
-fn run_pip_command(args: &[&str]) -> String {
+fn run_pip_command(args: &[&str]) -> CommandResult {
     match pip_command() {
         Some(PipCommand::Pip3) => run_command("pip3", args),
         Some(PipCommand::Python3Module) => {
@@ -1235,7 +1401,12 @@ fn run_pip_command(args: &[&str]) -> String {
             pip_args.extend_from_slice(args);
             run_command("python3", &pip_args)
         }
-        None => String::new(),
+        None => CommandResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: false,
+            timed_out: false,
+        },
     }
 }
 
@@ -1250,6 +1421,7 @@ fn pip_command() -> Option<PipCommand> {
         return Some(PipCommand::Pip3);
     }
     let has_python_pip = !run_command("python3", &["-m", "pip", "--version"])
+        .stdout
         .trim()
         .is_empty();
     if command_exists("python3") && has_python_pip {
@@ -1411,6 +1583,13 @@ fn allocated_size_from_metadata(meta: &std::fs::Metadata) -> u64 {
 }
 
 fn brew_prefix() -> PathBuf {
+    brew_prefix_from_env(std::env::var_os("HOMEBREW_PREFIX"))
+}
+
+fn brew_prefix_from_env(prefix: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty()) {
+        return PathBuf::from(prefix);
+    }
     if cfg!(target_arch = "aarch64") {
         PathBuf::from("/opt/homebrew")
     } else {
@@ -1419,11 +1598,11 @@ fn brew_prefix() -> PathBuf {
 }
 
 fn find_pip_site_packages() -> Option<PathBuf> {
-    let output = run_command(
+    let result = run_command(
         "python3",
         &["-c", "import site; print(site.getsitepackages()[0])"],
     );
-    let path = output.trim();
+    let path = result.stdout.trim();
     if path.is_empty() {
         return None;
     }
@@ -1455,6 +1634,41 @@ mod tests {
     fn count_requirements() {
         let content = "flask==2.0\nrequests>=2.28\n# comment\n-r base.txt\n\nnumpy\n";
         assert_eq!(count_requirements_deps(content), 3);
+    }
+
+    #[test]
+    fn count_pyproject_pep621_inline_dependencies() {
+        let content = r#"
+[project]
+name = "demo"
+dependencies = ["requests>=2", "click"]
+"#;
+
+        assert_eq!(count_pyproject_deps(content), 2);
+    }
+
+    #[test]
+    fn count_pyproject_pep621_multiline_dependencies() {
+        let content = r#"
+[project]
+dependencies = [
+  "requests>=2",
+  "click",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+"#;
+
+        assert_eq!(count_pyproject_deps(content), 4);
+    }
+
+    #[test]
+    fn brew_prefix_honors_homebrew_prefix_env_value() {
+        assert_eq!(
+            brew_prefix_from_env(Some(std::ffi::OsString::from("/custom/homebrew"))),
+            PathBuf::from("/custom/homebrew")
+        );
     }
 
     #[test]
@@ -1776,6 +1990,97 @@ mod tests {
 
         std::fs::remove_dir_all(temp_caskroom).unwrap();
         std::fs::remove_dir_all(temp_apps).unwrap();
+    }
+
+    #[test]
+    fn run_command_captures_stdout_on_success() {
+        let result = run_command("echo", &["hello"]);
+        assert!(result.success);
+        assert!(!result.timed_out);
+        assert_eq!(result.stdout.trim(), "hello");
+    }
+
+    #[test]
+    fn run_command_captures_stderr_on_failure() {
+        let result = run_command("ls", &["/nonexistent_path_diskr_test_49"]);
+        assert!(!result.success);
+        assert!(!result.timed_out);
+        assert!(!result.stderr.is_empty());
+    }
+
+    #[test]
+    fn run_command_times_out_on_slow_process() {
+        let result = run_command_with_timeout("sleep", &["60"], Duration::from_millis(200));
+        assert!(result.timed_out);
+        assert!(!result.success);
+    }
+
+    #[test]
+    fn run_command_reports_missing_command() {
+        let result = run_command("diskr_nonexistent_cmd_49", &[]);
+        assert!(!result.success);
+        assert!(!result.timed_out);
+        assert!(!result.stderr.is_empty());
+    }
+
+    #[test]
+    fn cmd_warning_returns_none_on_success() {
+        let result = CommandResult {
+            stdout: "output".into(),
+            stderr: String::new(),
+            success: true,
+            timed_out: false,
+        };
+        assert!(cmd_warning(&result, "test").is_none());
+    }
+
+    #[test]
+    fn cmd_warning_reports_timeout() {
+        let result = CommandResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: false,
+            timed_out: true,
+        };
+        assert_eq!(cmd_warning(&result, "brew"), Some("brew: timed out".into()));
+    }
+
+    #[test]
+    fn cmd_warning_includes_first_stderr_line() {
+        let result = CommandResult {
+            stdout: String::new(),
+            stderr: "error: externally-managed-environment\nmore detail".into(),
+            success: false,
+            timed_out: false,
+        };
+        let w = cmd_warning(&result, "pip").unwrap();
+        assert_eq!(w, "pip: error: externally-managed-environment");
+    }
+
+    #[test]
+    fn cmd_warning_truncates_long_stderr() {
+        let long_line = "x".repeat(200);
+        let result = CommandResult {
+            stdout: String::new(),
+            stderr: long_line,
+            success: false,
+            timed_out: false,
+        };
+        let w = cmd_warning(&result, "npm").unwrap();
+        assert!(w.ends_with("..."));
+        assert!(w.len() < 140);
+    }
+
+    #[test]
+    fn scan_manager_propagates_warning_field() {
+        let report = ManagerReport {
+            manager: Manager::Brew,
+            packages: Vec::new(),
+            total_size: SizeInfo::default(),
+            available: true,
+            warning: Some("brew cask: timed out".into()),
+        };
+        assert_eq!(report.warning.as_deref(), Some("brew cask: timed out"));
     }
 
     fn test_root(name: &str) -> PathBuf {

@@ -9,6 +9,15 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+## [0.1.58] - 2026-06-13
+
+### Fixed
+
+- Package-manager scans now time out after 10 seconds (30 seconds for slow
+  `brew cask` metadata) instead of blocking forever, and failed or timed-out
+  managers surface a diagnostic warning in the TUI status line, CLI text output,
+  and JSON reports instead of silently showing "0 packages." (#49)
+
 ## [0.1.57] - 2026-06-13
 
 ### Fixed

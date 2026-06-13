@@ -130,7 +130,6 @@ pub struct DiskInfo {
     pub available: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct FileInfo {
     pub name: String,
@@ -368,7 +367,7 @@ pub struct App {
     pkg_filter_pinned: bool,
     pub pkg_search_query: String,
     pub pkg_search_matches: Vec<usize>,
-    cached_pkg_visible_indices: Vec<usize>,
+    cached_pkg_visible_indices: Option<Vec<usize>>,
     cached_pkg_search_text: Vec<String>,
     cached_project_dep_search_text: Vec<String>,
 
@@ -454,6 +453,7 @@ pub struct App {
     uninstall_rx: Option<Receiver<UninstallResult>>,
     pub confirming_empty_trash: bool,
     empty_trash_rx: Option<Receiver<Result<(), String>>>,
+    batch_delete_rx: Option<Receiver<BatchDeleteMsg>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -485,8 +485,9 @@ struct UninstallResult {
     result: Result<String, String>,
 }
 
-impl PkgView {
-    // Methods related to PkgView...
+struct BatchDeleteMsg {
+    deleted: Vec<PathBuf>,
+    failures: Vec<(PathBuf, String)>,
 }
 
 impl App {
@@ -553,7 +554,7 @@ impl App {
             pkg_filter_pinned: false,
             pkg_search_query: String::new(),
             pkg_search_matches: Vec::new(),
-            cached_pkg_visible_indices: Vec::new(),
+            cached_pkg_visible_indices: None,
             cached_pkg_search_text: Vec::new(),
             cached_project_dep_search_text: Vec::new(),
             scan_total: 0,
@@ -626,6 +627,7 @@ impl App {
             uninstall_rx: None,
             confirming_empty_trash: false,
             empty_trash_rx: None,
+            batch_delete_rx: None,
         };
         app.fda_limited = full_disk_access_missing();
         app.refresh_disks();
@@ -1076,6 +1078,7 @@ impl App {
         if self.confirming_delete {
             return;
         }
+        self.fda_limited = full_disk_access_missing();
         self.invalidate_pending_scan_results();
         let previous_selected = self
             .entries
@@ -1233,6 +1236,7 @@ impl App {
         changed |= self.drain_disk_info_results();
         changed |= self.drain_history_results();
         changed |= self.drain_empty_trash_results();
+        changed |= self.drain_batch_delete_results();
         changed
     }
 
@@ -1617,6 +1621,7 @@ impl App {
         if self.reclaim_loading {
             return;
         }
+        self.fda_limited = full_disk_access_missing();
         let cwd = self.cwd.clone();
         let scan_id = self.next_reclaim_scan_id();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1751,7 +1756,16 @@ impl App {
     /// report actually lists Trash — otherwise the confirmation would be
     /// detached from what the user sees (#47).
     pub fn request_empty_trash(&mut self) {
-        if self.confirming_delete || self.confirming_empty_trash || self.empty_trash_rx.is_some() {
+        if self.empty_trash_rx.is_some() {
+            self.status = String::from("empty trash already in progress");
+            return;
+        }
+        if self.confirming_empty_trash {
+            self.status = String::from("empty trash confirmation already open");
+            return;
+        }
+        if self.confirming_delete {
+            self.status = String::from("finish current delete confirmation first");
             return;
         }
         let Some(trash) = self.reclaim_trash_finding() else {
@@ -1873,6 +1887,7 @@ impl App {
             || self.deps_loading
             || self.uninstall_rx.is_some()
             || self.empty_trash_rx.is_some()
+            || self.batch_delete_rx.is_some()
     }
 
     pub fn request_delete(&mut self) {
@@ -1903,7 +1918,7 @@ impl App {
                 }
             }
             Focus::Packages => {
-                if self.cached_pkg_visible_indices.is_empty()
+                if self.cached_pkg_visible_indices.is_none()
                     && match self.pkg_view {
                         PkgView::SystemManagers => !self.cached_flat_packages.is_empty(),
                         PkgView::ProjectDeps => !self.project_deps.is_empty(),
@@ -2036,34 +2051,89 @@ impl App {
                     Err(e) => self.status = format!("delete failed: {e}"),
                 },
                 DeleteTarget::Batch => {
-                    let marked = self.marked.clone();
+                    let marked: Vec<PathBuf> = self.marked.iter().cloned().collect();
                     self.marked.clear();
-                    let mut failures = Vec::new();
-                    for path in marked {
-                        if let Err(e) = crate::fs_ops::delete_to_trash(&path) {
-                            failures.push((path, e));
-                        } else {
-                            self.invalidate_cache_for(&path);
-                        }
-                    }
-                    self.refresh_disks();
-                    self.reload()?;
-                    self.refresh_history_state();
-                    if failures.is_empty() {
-                        self.status = String::from("moved marked items to trash");
-                    } else {
-                        let names: Vec<String> = failures
-                            .iter()
-                            .filter_map(|(p, _)| {
-                                p.file_name().map(|n| n.to_string_lossy().into_owned())
-                            })
-                            .collect();
-                        self.status = format!("some items failed: {}", names.join(", "));
-                    }
+                    self.start_batch_delete_with(marked, crate::fs_ops::delete_to_trash);
                 }
             }
         }
         Ok(())
+    }
+
+    fn start_batch_delete_with(&mut self, paths: Vec<PathBuf>, delete: fn(&Path) -> Result<()>) {
+        if paths.is_empty() {
+            self.status = String::from("nothing marked for deletion");
+            return;
+        }
+        if self.batch_delete_rx.is_some() {
+            self.status = String::from("batch delete already in progress");
+            return;
+        }
+
+        let total = paths.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.batch_delete_rx = Some(rx);
+        self.status = format!("moving {total} marked {} to Trash...", item_noun(total));
+
+        thread::spawn(move || {
+            let mut deleted = Vec::new();
+            let mut failures = Vec::new();
+            for path in paths {
+                match delete(&path) {
+                    Ok(()) => deleted.push(path),
+                    Err(err) => failures.push((path, err.to_string())),
+                }
+            }
+            let _ = tx.send(BatchDeleteMsg { deleted, failures });
+        });
+    }
+
+    fn drain_batch_delete_results(&mut self) -> bool {
+        let recv = match self.batch_delete_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+
+        match recv {
+            Ok(msg) => {
+                self.batch_delete_rx = None;
+                for path in &msg.deleted {
+                    self.invalidate_cache_for(path);
+                }
+                self.refresh_disks();
+                let reload_result = self.reload();
+                self.refresh_history_state();
+
+                let deleted_count = msg.deleted.len();
+                let delete_status = if msg.failures.is_empty() {
+                    format!(
+                        "moved {deleted_count} marked {} to trash",
+                        item_noun(deleted_count)
+                    )
+                } else {
+                    let names: Vec<String> = msg
+                        .failures
+                        .iter()
+                        .filter_map(|(p, _)| {
+                            p.file_name().map(|n| n.to_string_lossy().into_owned())
+                        })
+                        .collect();
+                    format!("some items failed: {}", names.join(", "))
+                };
+
+                self.status = match reload_result {
+                    Ok(()) => delete_status,
+                    Err(err) => format!("{delete_status} · reload failed: {err}"),
+                };
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.batch_delete_rx = None;
+                self.status = String::from("batch delete failed");
+                true
+            }
+        }
     }
 
     pub fn pending_delete_name(&self) -> &str {
@@ -2356,12 +2426,22 @@ impl App {
                     self.pkg_scan_rx = None;
                     if msg.include_managers {
                         let total = self.cached_flat_packages.len();
-                        self.status = format!(
+                        let warnings: Vec<&str> = self
+                            .pkg_reports
+                            .iter()
+                            .filter_map(|r| r.warning.as_deref())
+                            .collect();
+                        let base = format!(
                             "{} packages across {} managers · {} projects · scanning deps…",
                             total,
                             self.pkg_reports.iter().filter(|r| r.available).count(),
                             self.project_deps.len()
                         );
+                        if warnings.is_empty() {
+                            self.status = base;
+                        } else {
+                            self.status = format!("{base} ({})", warnings.join("; "));
+                        }
                         self.start_dep_scan();
                     } else {
                         self.status = format!(
@@ -2618,43 +2698,47 @@ impl App {
             PkgView::SystemManagers => self.cached_flat_packages.len(),
             PkgView::ProjectDeps => self.project_deps.len(),
         };
-        self.cached_pkg_visible_indices = (0..total)
-            .filter(|&i| self.pkg_passes_unused_filter(i))
-            .collect();
+        self.cached_pkg_visible_indices = Some(
+            (0..total)
+                .filter(|&i| self.pkg_passes_unused_filter(i))
+                .collect(),
+        );
     }
 
     pub fn pkg_item_count(&self) -> usize {
         if self.pkg_filter_active() {
             return self.pkg_search_matches.len();
         }
-        if self.cached_pkg_visible_indices.is_empty() {
-            return match self.pkg_view {
+        match &self.cached_pkg_visible_indices {
+            Some(indices) => indices.len(),
+            None => match self.pkg_view {
                 PkgView::SystemManagers => self.cached_flat_packages.len(),
                 PkgView::ProjectDeps => self.project_deps.len(),
-            };
+            },
         }
-        self.cached_pkg_visible_indices.len()
     }
 
     pub fn pkg_visible_index(&self, visible_index: usize) -> Option<usize> {
         if self.pkg_filter_active() {
             return self.pkg_search_matches.get(visible_index).copied();
         }
-        if self.cached_pkg_visible_indices.is_empty() {
-            let total = match self.pkg_view {
-                PkgView::SystemManagers => self.cached_flat_packages.len(),
-                PkgView::ProjectDeps => self.project_deps.len(),
-            };
-            return (visible_index < total).then_some(visible_index);
+        match &self.cached_pkg_visible_indices {
+            Some(indices) => indices.get(visible_index).copied(),
+            None => {
+                let total = match self.pkg_view {
+                    PkgView::SystemManagers => self.cached_flat_packages.len(),
+                    PkgView::ProjectDeps => self.project_deps.len(),
+                };
+                (visible_index < total).then_some(visible_index)
+            }
         }
-        self.cached_pkg_visible_indices.get(visible_index).copied()
     }
 
     pub fn pkg_visible_indices(&self) -> &[usize] {
         if self.pkg_filter_active() {
             &self.pkg_search_matches
         } else {
-            &self.cached_pkg_visible_indices
+            self.cached_pkg_visible_indices.as_deref().unwrap_or(&[])
         }
     }
 
@@ -2692,8 +2776,8 @@ impl App {
         if let Some(idx) = real_index {
             self.selected_pkg = self
                 .cached_pkg_visible_indices
-                .iter()
-                .position(|&i| i == idx)
+                .as_ref()
+                .and_then(|indices| indices.iter().position(|&i| i == idx))
                 .unwrap_or(0);
         }
     }
@@ -2715,9 +2799,9 @@ impl App {
 
     fn update_pkg_search(&mut self) {
         let query = self.pkg_search_query.to_lowercase();
+        let indices = self.cached_pkg_visible_indices.as_deref().unwrap_or(&[]);
         self.pkg_search_matches = match self.pkg_view {
-            PkgView::SystemManagers => self
-                .cached_pkg_visible_indices
+            PkgView::SystemManagers => indices
                 .iter()
                 .copied()
                 .filter(|&i| {
@@ -2726,8 +2810,7 @@ impl App {
                         .is_some_and(|text| text.contains(&query))
                 })
                 .collect(),
-            PkgView::ProjectDeps => self
-                .cached_pkg_visible_indices
+            PkgView::ProjectDeps => indices
                 .iter()
                 .copied()
                 .filter(|&i| {
@@ -3134,7 +3217,6 @@ impl App {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn selected_path(&self) -> Option<PathBuf> {
         match self.focus {
             Focus::Files => self.visible_entry(self.selected).map(|e| e.path.clone()),
@@ -3221,6 +3303,14 @@ fn limited_scan_status(action: &str, scanning: usize, total: usize) -> String {
         format!("{action}: {total} directories")
     } else {
         format!("{action}: {scanning}/{total} directories · move or r to scan more")
+    }
+}
+
+fn item_noun(count: usize) -> &'static str {
+    if count == 1 {
+        "item"
+    } else {
+        "items"
     }
 }
 
@@ -3433,7 +3523,6 @@ fn c_char_array_to_string(chars: &[libc::c_char]) -> String {
         .into_owned()
 }
 
-#[allow(dead_code)]
 fn copy_to_clipboard(text: &str) -> Result<()> {
     use std::io::Write;
     use std::process::Stdio;
@@ -3592,6 +3681,22 @@ mod tests {
     }
 
     #[test]
+    fn empty_trash_re_request_reports_pending_worker() {
+        let root = test_root("empty_trash_pending_status");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.empty_trash_rx = Some(rx);
+
+        app.request_empty_trash();
+
+        assert_eq!(app.status, "empty trash already in progress");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn delete_request_is_pinned_to_original_entry() {
         let root = test_root("delete_modal");
         fs::create_dir_all(&root).unwrap();
@@ -3686,6 +3791,31 @@ mod tests {
 
         app.cancel_delete();
         assert!(app.pending_batch_summary().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_delete_result_invalidates_and_reports_without_blocking() {
+        let root = test_root("batch_delete_worker_result");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.txt");
+        fs::write(&path, b"a").unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.size_cache.insert(path.clone(), SizeInfo::new(10, 10));
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.batch_delete_rx = Some(rx);
+        tx.send(BatchDeleteMsg {
+            deleted: vec![path.clone()],
+            failures: Vec::new(),
+        })
+        .unwrap();
+
+        assert!(app.drain_scan_results());
+        assert!(app.batch_delete_rx.is_none());
+        assert!(!app.size_cache.contains_key(&path));
+        assert_eq!(app.status, "moved 1 marked item to trash");
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3936,6 +4066,43 @@ mod tests {
     }
 
     #[test]
+    fn empty_visibility_cache_blocks_actions_on_hidden_packages() {
+        let root = test_root("pkg_empty_vis");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Packages;
+        app.pkg_view = PkgView::SystemManagers;
+        app.cached_flat_packages = vec![(
+            packages::Package {
+                name: "shared-lib".into(),
+                version: "2.0".into(),
+                size: None,
+                path: None,
+                metadata_path: None,
+            },
+            packages::Manager::Brew,
+        )];
+        app.dep_graph = Some(DepGraph::from_entries(vec![(
+            packages::Manager::Brew,
+            "shared-lib",
+            packages::DepInfo {
+                dependencies: Vec::new(),
+                dependents: vec!["app".into()],
+                evidence: packages::DepEvidence::ManagerGraph,
+            },
+        )]));
+
+        app.toggle_unused_filter();
+
+        assert_eq!(app.pkg_item_count(), 0);
+        assert_eq!(app.pkg_visible_index(0), None);
+        assert!(app.pkg_visible_indices().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn package_visibility_cache_tracks_filter_view_and_search_transitions() {
         let root = test_root("pkg_visibility_cache");
         fs::create_dir_all(&root).unwrap();
@@ -3962,6 +4129,7 @@ mod tests {
             ],
             total_size: SizeInfo::new(30, 30),
             available: true,
+            warning: None,
         }];
         app.dep_graph = Some(DepGraph::from_entries(vec![
             (
@@ -4072,6 +4240,7 @@ mod tests {
             ],
             total_size: SizeInfo::new(30, 30),
             available: true,
+            warning: None,
         }];
         app.rebuild_flat_packages();
 
