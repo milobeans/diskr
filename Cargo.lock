@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "diskr"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "anyhow",
  "crossterm",

@@ -2154,11 +2154,38 @@ impl App {
         }
     }
 
+    fn remove_cached_subtree(&mut self, path: &Path) {
+        let mut removed = false;
+        self.size_cache.retain(|cached, _| {
+            let keep = !cached.starts_with(path);
+            removed |= !keep;
+            keep
+        });
+        self.inaccessible_cache.retain(|cached, _| {
+            let keep = !cached.starts_with(path);
+            removed |= !keep;
+            keep
+        });
+        self.cache_age.retain(|cached, _| {
+            let keep = !cached.starts_with(path);
+            removed |= !keep;
+            keep
+        });
+        self.stale_size_cache.retain(|cached| {
+            let keep = !cached.starts_with(path);
+            removed |= !keep;
+            keep
+        });
+        if removed {
+            self.size_cache_dirty = true;
+        }
+    }
+
     /// When a path changes (deletion, write), its own cache entry and every
     /// ancestor's cached size are now stale.
     fn invalidate_cache_for(&mut self, path: &Path) {
         self.invalidate_pending_scan_results();
-        self.remove_cached_size(path);
+        self.remove_cached_subtree(path);
         let mut p = path.parent();
         while let Some(parent) = p {
             self.remove_cached_size(parent);
@@ -4677,6 +4704,29 @@ mod tests {
         assert!(!app.inaccessible_cache.contains_key(&cached));
         assert!(!app.cache_age.contains_key(&cached));
         assert!(!app.stale_size_cache.contains(&cached));
+        assert!(app.size_cache_dirty);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_invalidation_removes_cached_descendants() {
+        let root = test_root("cache_invalidation_descendants");
+        let cached = root.join("cached");
+        let child = cached.join("child");
+        fs::create_dir_all(&child).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.record_cached_size(cached.clone(), SizeInfo::new(10, 20), 0, 123, false);
+        app.record_cached_size(child.clone(), SizeInfo::new(4, 8), 1, 456, true);
+
+        app.invalidate_cache_for(&cached);
+
+        assert!(!app.size_cache.contains_key(&cached));
+        assert!(!app.size_cache.contains_key(&child));
+        assert!(!app.inaccessible_cache.contains_key(&child));
+        assert!(!app.cache_age.contains_key(&child));
+        assert!(!app.stale_size_cache.contains(&child));
         assert!(app.size_cache_dirty);
 
         fs::remove_dir_all(root).unwrap();

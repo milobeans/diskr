@@ -9,6 +9,15 @@ historical entries, to the matching finding in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## [Unreleased]
 
+## [0.1.57] - 2026-06-13
+
+### Fixed
+
+- Cache invalidation now drops cached sizes, stale markers, inaccessible
+  counts, and cache ages for the changed path and every cached descendant, so
+  deleting and recreating a directory cannot resurrect stale child sizes from
+  the old tree. (#66)
+
 ## [0.1.56] - 2026-06-12
 
 ### Fixed
