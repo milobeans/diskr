@@ -2051,7 +2051,7 @@ mod tests {
         ))
     }
 
-    // ---- modifier guard tests (#51) ----
+    // ---- modifier guard tests ----
 
     fn key_char(ch: char, mods: KeyModifiers) -> crossterm::event::KeyEvent {
         crossterm::event::KeyEvent::new(KeyCode::Char(ch), mods)
@@ -2223,7 +2223,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let mut app = App::new(root.clone()).unwrap();
-        // E only arms when the loaded reclaim report lists Trash (#47).
+        // E only arms when the loaded reclaim report lists Trash.
         app.reclaim_report = Some(app::trash_only_report(&root, 1024));
         app.request_empty_trash();
         assert!(app.confirming_empty_trash);

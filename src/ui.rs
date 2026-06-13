@@ -1675,7 +1675,7 @@ fn draw_confirm(f: &mut Frame, app: &App) {
 fn draw_empty_trash_confirm(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 20, 48, 8, f.area());
     f.render_widget(Clear, area);
-    // request_empty_trash only arms when the report lists Trash (#47), so the
+    // request_empty_trash only arms when the report lists Trash, so the
     // finding is normally present; the fallback covers a report swapped out
     // by a reclaim re-scan while the confirmation is open.
     let (path_note, size_note) = match app.reclaim_trash_finding() {

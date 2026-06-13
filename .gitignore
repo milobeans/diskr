@@ -2,3 +2,10 @@ target/
 .DS_Store
 .idea/
 .junie/
+
+# Local-only maintenance and agent protocol files.
+/AGENTS.md
+/CLAUDE.md
+/docs/AUDIT.md
+/docs/ISSUES.md
+/docs/internal/

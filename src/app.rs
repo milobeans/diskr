@@ -1763,7 +1763,7 @@ impl App {
     /// [`App::confirm_empty_trash`] on a background thread. The operation is
     /// global (Finder's Empty Trash), so it only arms when the loaded reclaim
     /// report actually lists Trash — otherwise the confirmation would be
-    /// detached from what the user sees (#47).
+    /// detached from what the user sees.
     pub fn request_empty_trash(&mut self) {
         if self.empty_trash_rx.is_some() {
             self.status = String::from("empty trash already in progress");
@@ -3613,7 +3613,7 @@ fn page_target_index(current: usize, delta: i64, item_count: usize) -> Option<us
 }
 
 /// Reclaim report whose sole finding is Trash; shared by the empty-trash
-/// tests here and in main.rs (#47).
+/// tests here and in main.rs.
 #[cfg(test)]
 pub fn trash_only_report(root: &Path, allocated: u64) -> reclaim::ReclaimReport {
     reclaim::ReclaimReport {
@@ -5329,7 +5329,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // --- issue #60: package detail modal must resolve against the active view ---
+    // --- package detail modal must resolve against the active view ---
 
     fn make_flat_package(name: &str) -> (packages::Package, packages::Manager) {
         (

@@ -24,6 +24,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6.0.2
+      - name: Verify private maintenance docs stay untracked
+        run: |
+          for path in AGENTS.md CLAUDE.md docs/AUDIT.md docs/ISSUES.md; do
+            if git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+              echo "$path is private maintenance material and must not be tracked" >&2
+              exit 1
+            fi
+          done
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

@@ -1,4 +1,4 @@
-//! Std-only replacement for the rayon machinery diskr actually used (#79):
+//! Std-only replacement for the rayon machinery diskr actually used:
 //! a fixed worker pool that runs the non-blocking bulkstat walk tasks, plus
 //! scoped parallel helpers for package scanning.
 //!

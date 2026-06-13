@@ -555,7 +555,7 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
-    // --- issue #46: rollup / double-counting tests ---
+    // --- rollup / double-counting tests ---
 
     /// Parent + child both present: the parent is marked rollup, and the
     /// total equals only the child's bytes, not parent + child.

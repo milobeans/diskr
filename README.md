@@ -97,15 +97,16 @@ APFS space reporting combines `statfs(2)` for mount-level stats, a narrow parser
 
 diskr is macOS-only. The minimum supported Rust version is 1.88.0.
 
-Planned work lives in [ROADMAP.md](ROADMAP.md), known issues in
-[docs/ISSUES.md](docs/ISSUES.md), and release history in
-[CHANGELOG.md](CHANGELOG.md). Contributors (human or agent) should read
-[AGENTS.md](AGENTS.md) for the development workflow.
+Planned work lives in [ROADMAP.md](ROADMAP.md), and release history lives in
+[CHANGELOG.md](CHANGELOG.md). Private maintenance trackers, audit notes, and
+agent workflow instructions are intentionally kept out of the public
+repository.
 
 ## Release Checks
 
 ```sh
 cargo fmt -- --check
+cargo check --locked
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
 cargo package --locked
@@ -126,6 +127,9 @@ Release flow:
 2. Update `Cargo.toml` to the new crate version.
 3. Refresh `Cargo.lock` if needed and push the version bump to `main`.
 4. Create and push a matching tag like `v0.1.14`.
+
+CI and release jobs reject private maintenance files if they are accidentally
+tracked again.
 
 ```sh
 git tag -a v0.1.14 -m "v0.1.14"

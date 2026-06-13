@@ -212,7 +212,7 @@ pub fn scan_dir_async(
 }
 
 /// Shared accumulator for one walk. Sizes and counters are relaxed atomics
-/// so completed directories merge without a global lock (#78); the
+/// so completed directories merge without a global lock; the
 /// largest-files heap keeps a mutex but is only touched when a top-files
 /// report was requested.
 struct WalkState {
@@ -329,7 +329,7 @@ fn spawn_walk(dir: PathBuf, state: Arc<WalkState>, group: &Arc<TaskGroup>) {
 /// The inline continuation keeps deep chains on one worker, cuts queue
 /// traffic to one batched push per branching directory, and lets the chain
 /// accumulate locally so shared `WalkState` counters are touched once per
-/// chain instead of once per directory (#78).
+/// chain instead of once per directory.
 ///
 /// While descending, the child is opened with `openat(2)` relative to the
 /// held parent fd, so the kernel resolves one path component instead of

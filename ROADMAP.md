@@ -4,10 +4,10 @@
 The strongest direction is to explain why space disappeared, what changed over
 time, and what is actually reclaimable.
 
-This file tracks product direction at the feature level. Bugs and small
-improvements live in [docs/ISSUES.md](docs/ISSUES.md); shipped work is
-recorded in [CHANGELOG.md](CHANGELOG.md). See [AGENTS.md](AGENTS.md) for when
-to update which file.
+This file tracks product direction at the feature level. Shipped work is
+recorded in [CHANGELOG.md](CHANGELOG.md). Detailed maintenance trackers, audit
+notes, and workflow instructions are private project materials and are not
+published in this repository.
 
 ## Highest-Leverage Features
 
@@ -79,30 +79,30 @@ a static 22-binding help strip, header text restating default settings)
 makes the TUI feel cluttered, while the differentiated intelligence (reclaim
 classification, diff deltas, top files) hides behind stacked modals. The fix
 is not more panels — it is moving the intelligence into the file list itself
-and making every other element earn its pixels. Tracked as issues #71-#77 in
-[docs/ISSUES.md](docs/ISSUES.md):
+and making every other element earn its pixels.
 
 - Fix the share-bar/percentage denominators, which today are computed over
-  the scroll window instead of the directory (#71 — bug, do first).
+  the scroll window instead of the directory.
 - Context-sensitive help strip plus a `?` keymap overlay, driven by one
-  shared keymap table (#72, with #56/#40/#69).
+  shared keymap table.
 - Files-pane density: column header with sort indicator, always-on modified
   column, magnitude-coded size colors, summary title with cwd total and scan
-  coverage, visible mark totals (#73).
+  coverage, visible mark totals.
 - Inline reclaim classification chips in the browser — the product-defining
-  move; the same thesis as audit finding 15 applied to the main surface
-  instead of a modal (#74).
+  move; the same product thesis applied to the main surface instead of a
+  modal.
 - Declutter the header and status line (show deviations, not defaults; stop
   duplicating the selected row); collapsible side column with one-line disk
-  rows (#75, #76).
+  rows.
 - Two overlay patterns — full-screen selectable list views and a single
   detail drawer — replacing six modal types; top-files becomes a flat-view
-  toggle of the files pane (#77).
+  toggle of the files pane.
 
-Sequencing: #71 and #72 are quick wins; #73/#74 are the value core and ship
-sub-item by sub-item; #75-#77 follow. The correctness/safety burn-down (build
-order step 9) still takes precedence for destructive-action and
-state-integrity issues.
+Sequencing: denominator and help-strip fixes are quick wins; files-pane density
+and inline reclaim classification are the value core and ship sub-item by
+sub-item; header, side-column, and overlay cleanup follow. The
+correctness/safety burn-down still takes precedence for destructive-action and
+state-integrity work.
 
 ## Scriptability and Reports
 
@@ -144,14 +144,12 @@ state-integrity issues.
    `--diff`, and `--space`.
 8. Done: bring the intelligence into the TUI — reclaim pane, top-files modal,
    disk details, history diff header, file operations, size-share bars,
-   persistent size cache (audit findings #15-#20).
-9. Next: burn down the open correctness/safety issues in
-   [docs/ISSUES.md](docs/ISSUES.md) (state integrity, destructive-action
-   guardrails, accuracy) before adding new surfaces.
-10. Next: TUI density and declutter pass (issues #71-#77; see the section
-    above) — denominator fix and context-sensitive help first, then
-    files-pane density and inline reclaim classification, then side-column
-    collapse and overlay unification.
+   persistent size cache.
+9. Next: burn down the open correctness/safety work (state integrity,
+   destructive-action guardrails, accuracy) before adding new surfaces.
+10. Next: TUI density and declutter pass (see the section above) — denominator
+    fix and context-sensitive help first, then files-pane density and inline
+    reclaim classification, then side-column collapse and overlay unification.
 11. Next: stale-file finder (size combined with last-used metadata); pairs
-    with #73's age-dimming and #74's row chips.
+    with age-dimming and reclaim classification chips.
 12. Next: duplicate finder with APFS clone-based dedupe (`clonefile(2)`).
