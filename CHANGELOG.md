@@ -11,6 +11,15 @@ All notable changes to diskr are documented here. The format follows
 - `diskr --packages --json` now includes the canonical project root as `path`,
   matching the other JSON reports.
 
+### Changed
+
+- The footer help strip is now context-sensitive: it lists the keys for the
+  focused pane, truncates to fit narrow terminals, and always keeps `?` visible
+  instead of rendering one long static line. Destructive keys (`d`, `E`, `x`)
+  are highlighted in red in both the footer and the `?` overlay, and the README
+  key table now documents every binding and is checked against the keymap by a
+  test so the two cannot drift.
+
 ### Fixed
 
 - `--thin-snapshots` now validates its path the same way `--space` does (it

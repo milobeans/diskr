@@ -59,7 +59,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_packages(f, side[1], app);
 
     draw_status(f, root[2], app);
-    draw_help(f, root[3]);
+    draw_help(f, root[3], app.focus);
 
     if app.focus == Focus::Reclaim && !app.reclaim_paths_open() {
         draw_reclaim_panel(f, app);
@@ -1565,29 +1565,49 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
+fn draw_help(f: &mut Frame, area: Rect, focus: Focus) {
+    // Destructive keys (trash, empty trash, uninstall) get a red key cap so they
+    // read differently from navigation.
     let key = |k: &'static str| {
-        Span::styled(
-            k,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
+        let color = if keymap::is_destructive_key(k) {
+            Color::Red
+        } else {
+            Color::Yellow
+        };
+        Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
     };
     let label = |s: &'static str| Span::styled(s, Style::default().fg(Color::Gray));
     let sep = || Span::styled(" · ", Style::default().fg(Color::DarkGray));
 
+    let total = area.width as usize;
+    // Reserve room for the trailing "? help" so it always survives truncation.
+    let help_width = " · ? help".chars().count();
+    let budget = total.saturating_sub(help_width);
+
     let mut spans = Vec::new();
-    for binding in keymap::footer_bindings() {
+    let mut used = 0usize;
+    for binding in keymap::footer_bindings_for(focus) {
+        let piece = binding.key.chars().count() + 1 + binding.action.chars().count();
+        let sep_width = if spans.is_empty() { 0 } else { 3 };
+        if used + sep_width + piece > budget {
+            break;
+        }
         if !spans.is_empty() {
             spans.push(sep());
         }
         spans.push(key(binding.key));
         spans.push(label(" "));
         spans.push(label(binding.action));
+        used += sep_width + piece;
     }
-    let text = Line::from(spans);
-    f.render_widget(Paragraph::new(text), area);
+    if !spans.is_empty() {
+        spans.push(sep());
+    }
+    spans.push(key("?"));
+    spans.push(label(" "));
+    spans.push(label("help"));
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_help_overlay(f: &mut Frame) {
@@ -1635,13 +1655,16 @@ fn draw_help_column(f: &mut Frame, area: Rect, sections: &[KeySection]) {
                 .add_modifier(Modifier::BOLD),
         )));
         for binding in section.bindings {
+            let key_color = if keymap::is_destructive_key(binding.key) {
+                Color::Red
+            } else {
+                Color::Yellow
+            };
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
                     pad_key(binding.key, key_width),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(key_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(binding.action, Style::default().fg(Color::Gray)),

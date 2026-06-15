@@ -58,36 +58,49 @@ diskr --thin-snapshots 10G --yes ~ # execute it
 
 ## Keys
 
+This table mirrors the in-app `?` overlay and `diskr --help`; all three are
+driven from one keymap and a test fails the build if they drift. Destructive
+keys (`d`, `E`, `x`) are highlighted in red in the TUI.
+
 | Key | Action |
 | --- | --- |
 | ? | Show full keyboard help |
+| q | Quit |
+| Esc, Ctrl+C | Focus the Files pane, or close a modal and clear search/filter |
 | Up/Down, j/k | Move selection |
 | PageUp/PageDown | Move by a page |
 | Home/End | Jump to first or last item |
-| Enter | Open selected directory, disk, or package path |
-| i | Show details for the selected file, package, or disk |
-| p | Open packages pane or switch package view |
+| Enter | Open the selected directory, disk, package, or reclaim finding |
 | Backspace | Go to parent directory |
-| / | Search files in the current directory or filter packages; Enter keeps, Esc clears |
 | Left/Right, h/l | Switch pane or package view |
+| Tab, Shift+Tab | Cycle panes |
+| / | Search files in the current directory or filter packages; Enter keeps, Esc clears |
+| i | Show details for the selected file, package, or disk |
+| . | Toggle hidden files |
+| o | Cycle sort mode |
+| r | Refresh the current view and rescan all visible directory sizes |
+| S | Scan every missing or stale visible directory size without refreshing |
+| B | Save a history baseline for the current directory |
+| t | Open the top-files list for the selection |
+| c | Rename the selected file |
+| n | Create a directory |
+| v | Toggle a mark on the selected file |
+| a | Mark all visible files |
+| d | Move the selected item (or all marks) to Trash |
 | Space | Quick Look selected item |
 | f | Reveal selected item in Finder |
 | O | Open selected item with the default app |
 | y | Copy selected item path to clipboard |
 | s | Open selected item location in Terminal |
-| r | Refresh the current view and rescan all visible directory sizes |
-| S | Scan every missing or stale visible directory size without refreshing |
-| o | Cycle sort mode |
-| . | Toggle hidden files |
-| d | Move selected item to Trash |
+| p | Open packages pane or switch package view |
+| u | Toggle the dependency-leaf filter in the packages pane |
+| x | Uninstall the selected package |
+| R | Re-scan the Reclaim pane |
 | E | Empty Trash from the Reclaim pane, when the report lists a Trash finding |
-| Tab | Switch files/disks/packages pane |
-| q | Quit |
-| Esc / Ctrl+C | Focus Files pane / cancel modals and clear search/filter |
 
 ## How it works
 
-diskr is ~6,000 lines of Rust with no runtime beyond `ratatui`, `crossterm`, and `libc`. The core scanner calls `getattrlistbulk(2)` with a packed attribute list requesting name, object type, logical size, and allocated size. The kernel fills a buffer with dozens of entries per call, and diskr parses the packed binary layout directly -- no allocation per entry, no serde. A work-stealing thread pool fans out across subdirectories so sizing is parallelized across cores.
+diskr is ~17,000 lines of Rust. Its dependencies are `ratatui`, `crossterm`, `libc`, `anyhow`, and `serde_json`; the size cache and history baselines are persisted as JSON through `serde_json`. The core scanner calls `getattrlistbulk(2)` with a packed attribute list requesting name, object type, logical size, and allocated size. The kernel fills a buffer with dozens of entries per call, and diskr parses the packed binary layout directly without allocating per entry on the hot path. A custom work-stealing thread pool (no rayon) fans out across subdirectories so sizing is parallelized across cores. Sizes count regular-file content only -- symlink targets and directories' own metadata blocks are not added, so totals run slightly under `du`/Finder, and directories or entries that cannot be read are flagged as lower bounds rather than counted as zero.
 
 The reclaimable-space detector runs two passes: a fixed-location pass that checks well-known paths (`~/Library/Caches`, Xcode DerivedData, Homebrew, Docker, etc.) and a bounded recursive pass that finds repeated build-artifact directories (`node_modules`, `target`, `.venv`, `__pycache__`, `.next`, `.gradle`). Both use the same fast bulk scanner for sizing.
 

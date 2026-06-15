@@ -20,7 +20,7 @@ const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
 const SIZE_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 const AUTO_SCAN_LIMIT: usize = 4;
 const TOP_FILES_LIMIT: usize = 50;
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
     Files,
     Disks,
