@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -758,7 +758,14 @@ fn single_version_node_modules_root(base: &Path, suffix: &Path) -> Option<PathBu
 }
 
 fn scan_pip() -> (Vec<Package>, Option<String>) {
-    let result = run_pip_command(&["list", "--format=json"]);
+    // Resolve the pip interpreter once so the package list and the
+    // site-packages lookup come from the *same* Python. Deriving the list from
+    // pip3 but site-packages from a different python3 (the previous behavior)
+    // mismatched sizes on Homebrew/CLT/pyenv splits.
+    let Some(cmd) = pip_command() else {
+        return (Vec::new(), Some(String::from("pip: not found")));
+    };
+    let result = run_pip_command_with(cmd, &["list", "--format=json"]);
     let warning = cmd_warning(&result, "pip");
     if result.stdout.is_empty() {
         return (Vec::new(), warning);
@@ -770,7 +777,9 @@ fn scan_pip() -> (Vec<Package>, Option<String>) {
         return (Vec::new(), warning);
     };
 
-    let site_packages = find_pip_site_packages();
+    // Global and per-user site-packages for this interpreter; `--user`
+    // installs land in the user root and were previously never found.
+    let site_packages = find_pip_site_packages(cmd);
 
     let entries: Vec<_> = arr
         .iter()
@@ -786,11 +795,7 @@ fn scan_pip() -> (Vec<Package>, Option<String>) {
         .collect();
 
     let packages = pool::par_map(entries, |(name, version)| {
-        let (size, path) = if let Some(sp) = &site_packages {
-            find_pip_package_size_and_path(sp, &name)
-        } else {
-            (None, None)
-        };
+        let (size, path) = find_pip_package_size_and_path_in_roots(&site_packages, &name);
         Package {
             name,
             version,
@@ -1409,18 +1414,24 @@ fn terminate_command(child: &mut std::process::Child) {
 
 fn run_pip_command(args: &[&str]) -> CommandResult {
     match pip_command() {
-        Some(PipCommand::Pip3) => run_command("pip3", args),
-        Some(PipCommand::Python3Module) => {
-            let mut pip_args: Vec<&str> = vec!["-m", "pip"];
-            pip_args.extend_from_slice(args);
-            run_command("python3", &pip_args)
-        }
+        Some(cmd) => run_pip_command_with(cmd, args),
         None => CommandResult {
             stdout: String::new(),
             stderr: String::new(),
             success: false,
             timed_out: false,
         },
+    }
+}
+
+fn run_pip_command_with(cmd: PipCommand, args: &[&str]) -> CommandResult {
+    match cmd {
+        PipCommand::Pip3 => run_command("pip3", args),
+        PipCommand::Python3Module => {
+            let mut pip_args: Vec<&str> = vec!["-m", "pip"];
+            pip_args.extend_from_slice(args);
+            run_command("python3", &pip_args)
+        }
     }
 }
 
@@ -1442,6 +1453,26 @@ fn pip_command() -> Option<PipCommand> {
         return Some(PipCommand::Python3Module);
     }
     None
+}
+
+/// Search every resolved site-packages root (global plus per-user) for the
+/// package, returning the first root with a `RECORD`-sized dist-info. Falls
+/// back to the first inferred package directory if no root records a size.
+fn find_pip_package_size_and_path_in_roots(
+    roots: &[PathBuf],
+    package: &str,
+) -> (Option<SizeInfo>, Option<PathBuf>) {
+    let mut fallback_path = None;
+    for root in roots {
+        let (size, path) = find_pip_package_size_and_path(root, package);
+        if size.is_some() {
+            return (size, path);
+        }
+        if fallback_path.is_none() {
+            fallback_path = path;
+        }
+    }
+    (None, fallback_path)
 }
 
 fn find_pip_package_size_and_path(
@@ -1486,7 +1517,12 @@ fn find_pip_dist_info(site_packages: &Path, package: &str) -> Option<PathBuf> {
         let prefix = &name[..name.len() - ".dist-info".len()];
         let normalized = normalize_dist_name(prefix);
         let exact = normalized == needle;
-        let versioned = normalized.strip_prefix(&(needle.clone() + "-")).is_some();
+        // A versioned dist-info is `name-VERSION`, so the segment after the
+        // needle must begin with a version digit. Without this, `sentry`
+        // wrongly matched `sentry-sdk-2.0` (and `boto` matched `boto3`).
+        let versioned = normalized
+            .strip_prefix(&(needle.clone() + "-"))
+            .is_some_and(|rest| rest.starts_with(|ch: char| ch.is_ascii_digit()));
         if exact || versioned {
             return Some(entry.path());
         }
@@ -1611,21 +1647,89 @@ fn brew_prefix_from_env(prefix: Option<std::ffi::OsString>) -> PathBuf {
     }
 }
 
-fn find_pip_site_packages() -> Option<PathBuf> {
+/// Resolve every site-packages root (global plus per-user) for the same
+/// interpreter that produced the package list.
+fn find_pip_site_packages(cmd: PipCommand) -> Vec<PathBuf> {
+    match cmd {
+        PipCommand::Python3Module => python_site_packages_roots("python3"),
+        PipCommand::Pip3 => pip3_site_packages_roots(),
+    }
+}
+
+/// Ask a Python interpreter for its global and user site-packages directories.
+fn python_site_packages_roots(python: &str) -> Vec<PathBuf> {
     let result = run_command(
-        "python3",
-        &["-c", "import site; print(site.getsitepackages()[0])"],
+        python,
+        &[
+            "-c",
+            "import site; print('\\n'.join(list(site.getsitepackages()) + ([site.getusersitepackages()] if site.ENABLE_USER_SITE else [])))",
+        ],
     );
-    let path = result.stdout.trim();
-    if path.is_empty() {
+    existing_dirs(result.stdout.lines().map(|line| PathBuf::from(line.trim())))
+}
+
+/// `pip3` is not a Python interpreter, so derive its global site-packages from
+/// `pip3 -V` ("pip X from <site-packages>/pip (python A.B)") and construct the
+/// standard per-user roots from the reported Python version.
+fn pip3_site_packages_roots() -> Vec<PathBuf> {
+    let line = run_command("pip3", &["-V"]).stdout;
+    let line = line.trim();
+    let mut roots = Vec::new();
+    if let Some(global) = parse_pip_global_site_packages(line) {
+        roots.push(global);
+    }
+    if let (Some(version), Some(home)) = (
+        parse_pip_python_version(line),
+        std::env::var_os("HOME").map(PathBuf::from),
+    ) {
+        roots.extend(user_site_candidates(&version, &home));
+    }
+    existing_dirs(roots.into_iter())
+}
+
+/// Parse the global site-packages directory out of `pip -V` output.
+fn parse_pip_global_site_packages(pip_version_line: &str) -> Option<PathBuf> {
+    let from = pip_version_line.split(" from ").nth(1)?;
+    let pip_dir = from.split(" (python").next()?.trim();
+    if pip_dir.is_empty() {
         return None;
     }
-    let p = PathBuf::from(path);
-    if p.is_dir() {
-        Some(p)
-    } else {
+    // `pip_dir` ends in `/pip`; its parent is the site-packages directory.
+    PathBuf::from(pip_dir).parent().map(Path::to_path_buf)
+}
+
+/// Parse the `X.Y` Python version out of `pip -V` output.
+fn parse_pip_python_version(pip_version_line: &str) -> Option<String> {
+    let after = pip_version_line.split("(python").nth(1)?;
+    let version = after.trim().trim_end_matches(')').trim();
+    if version.is_empty() {
         None
+    } else {
+        Some(version.to_string())
     }
+}
+
+/// Standard per-user site-packages locations for a Python `X.Y` version.
+fn user_site_candidates(version: &str, home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(format!(".local/lib/python{version}/site-packages")),
+        home.join(format!("Library/Python/{version}/lib/python/site-packages")),
+    ]
+}
+
+/// Keep only existing directories, de-duplicated and order-preserving.
+fn existing_dirs(paths: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        if path.is_dir() && seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1758,6 +1862,67 @@ dev = ["pytest", "ruff"]
         );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn dist_info_match_requires_version_digit_after_name() {
+        let root = test_root("pip_dist_info_prefix");
+        std::fs::create_dir_all(root.join("sentry-2.0.dist-info")).unwrap();
+        std::fs::create_dir_all(root.join("sentry_sdk-2.0.dist-info")).unwrap();
+
+        // `sentry` must match its own dist-info, never the `sentry-sdk` family.
+        assert_eq!(
+            find_pip_dist_info(&root, "sentry"),
+            Some(root.join("sentry-2.0.dist-info"))
+        );
+        assert_eq!(
+            find_pip_dist_info(&root, "sentry-sdk"),
+            Some(root.join("sentry_sdk-2.0.dist-info"))
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn finds_package_size_across_multiple_site_packages_roots() {
+        let root = test_root("pip_multi_root");
+        let global = root.join("global");
+        let user = root.join("user");
+        let dist_info = user.join("flit-3.9.0.dist-info");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::create_dir_all(user.join("flit")).unwrap();
+        std::fs::write(user.join("flit").join("__init__.py"), b"x").unwrap();
+        std::fs::write(dist_info.join("RECORD"), "flit/__init__.py,sha256=abc,1\n").unwrap();
+
+        // Package is only in the user root; the global root is searched first
+        // but the size must still be found in the user root.
+        let (size, path) = find_pip_package_size_and_path_in_roots(&[global, user.clone()], "flit");
+        assert!(size.is_some());
+        assert_eq!(path, Some(user.join("flit")));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn parses_pip_version_line_for_site_packages_and_version() {
+        let line = "pip 23.3.1 from /opt/homebrew/lib/python3.11/site-packages/pip (python 3.11)";
+        assert_eq!(
+            parse_pip_global_site_packages(line),
+            Some(PathBuf::from("/opt/homebrew/lib/python3.11/site-packages"))
+        );
+        assert_eq!(parse_pip_python_version(line), Some(String::from("3.11")));
+
+        assert_eq!(parse_pip_global_site_packages("garbage"), None);
+        assert_eq!(parse_pip_python_version("garbage"), None);
+    }
+
+    #[test]
+    fn user_site_candidates_cover_local_and_framework_layouts() {
+        let home = Path::new("/Users/example");
+        let candidates = user_site_candidates("3.11", home);
+        assert!(candidates.contains(&home.join(".local/lib/python3.11/site-packages")));
+        assert!(candidates.contains(&home.join("Library/Python/3.11/lib/python/site-packages")));
     }
 
     #[test]

@@ -8,6 +8,12 @@ All notable changes to diskr are documented here. The format follows
 
 ### Fixed
 
+- pip package sizing now derives the package list and the site-packages
+  directories from the same Python interpreter and also searches the per-user
+  site-packages, so `pip install --user` packages are sized and Homebrew, CLT,
+  and pyenv interpreter splits no longer mismatch. dist-info matching now
+  requires a version digit after the package name, so `sentry` is no longer
+  mis-sized from `sentry-sdk`'s metadata.
 - Directory scans now flag more unreadable cases instead of silently
   undercounting: a subtree whose path grows past the platform length limit
   during the walk, and individual entries whose attributes the kernel cannot
