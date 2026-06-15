@@ -1215,7 +1215,7 @@ impl App {
                     }
                     self.status = if self.scan_skipped_mounts > 0 {
                         format!(
-                            "scan complete · skipped {} mounted volumes under /Volumes",
+                            "scan complete · skipped {} mounted volumes on other devices",
                             self.scan_skipped_mounts
                         )
                     } else {

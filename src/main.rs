@@ -369,7 +369,7 @@ fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
     }
     if scan.skipped_mounts > 0 {
         println!(
-            "Note: skipped {} mounted volumes under /Volumes.",
+            "Note: skipped {} mounted volumes on other devices.",
             scan.skipped_mounts
         );
     }
@@ -462,7 +462,7 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
     }
     if report.skipped_mounts > 0 {
         println!(
-            "Note: skipped {} mounted volumes under /Volumes.",
+            "Note: skipped {} mounted volumes on other devices.",
             report.skipped_mounts
         );
     }

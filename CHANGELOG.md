@@ -6,6 +6,19 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Directory scans now flag more unreadable cases instead of silently
+  undercounting: a subtree whose path grows past the platform length limit
+  during the walk, and individual entries whose attributes the kernel cannot
+  read, are counted toward the unreadable total so reported sizes stay honest
+  lower bounds.
+- Mount-boundary skipping now covers volumes outside `/Volumes`. Scanning `/`
+  no longer folds the APFS Preboot/VM/Update helper volumes into the system
+  total, and network or FUSE mounts at custom paths are skipped rather than
+  walked as local data; the firmlinked Data volume is still counted. Skipped
+  mounts are now described as "mounted volumes on other devices".
+
 ## [0.1.64] - 2026-06-15
 
 ### Fixed

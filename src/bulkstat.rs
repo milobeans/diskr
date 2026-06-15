@@ -48,7 +48,6 @@ const FSOPT_RETURN_REALDEV: u64 = 0x00000200;
 const ATTRIBUTE_SET_LEN: usize = 20;
 const ATTR_REFERENCE_LEN: usize = 8;
 const DATA_VOLUME_ROOT: &str = "/System/Volumes/Data";
-const VOLUMES_ROOT: &str = "/Volumes";
 
 // vnode types (sys/vnode.h)
 const VREG: u32 = 1;
@@ -81,10 +80,13 @@ pub struct LargeFile {
 pub struct DirScan {
     pub size: SizeInfo,
     pub largest_files: Vec<LargeFile>,
-    /// Directories that could not be opened due to permissions (EACCES/EPERM).
-    /// When non-zero the reported size is a lower bound.
+    /// Directories that could not be opened (EACCES/EPERM/ENAMETOOLONG) plus
+    /// individual entries whose attributes could not be read. When non-zero the
+    /// reported size is a lower bound.
     pub inaccessible: u32,
-    /// Mounted volumes skipped below /Volumes to avoid crossing filesystem boundaries.
+    /// Subdirectories skipped because they sit on a different volume than the
+    /// scan root (external/network/FUSE mounts and APFS helper volumes such as
+    /// Preboot/VM/Update), to avoid counting another filesystem's bytes.
     pub skipped_mounts: u32,
 }
 
@@ -123,7 +125,15 @@ struct Attrlist {
 }
 
 /// Recursive size and optional largest-file report for `root`.
-/// Symlinks are skipped. Permission errors yield zero contribution and are counted.
+///
+/// Counts regular-file logical and allocated sizes only. Symlinks, the
+/// directory inodes' own allocated blocks, and other special files contribute
+/// nothing, so the total is content-only and runs slightly under `du`/Finder
+/// on directory-heavy trees. Directories that cannot be opened
+/// (EACCES/EPERM/ENAMETOOLONG) and individual entries whose attributes cannot
+/// be read are counted in `inaccessible`; when it is non-zero the reported size
+/// is a lower bound. Subdirectories on a different volume than the scan root
+/// are skipped and counted in `skipped_mounts`.
 pub fn scan_dir(root: &Path, top_file_limit: usize) -> DirScan {
     scan_dir_with_cancellation(root, top_file_limit, &ScanCancellation::never()).unwrap_or_default()
 }
@@ -306,14 +316,28 @@ type FileIdentity = (u64, u64);
 #[derive(Clone, Copy)]
 struct ScanPolicy {
     root_dev: u64,
+    /// Device of the APFS Data volume (`/System/Volumes/Data`) when it resolves.
+    /// On modern macOS the root (System) volume and the Data volume are
+    /// firmlinked into a single logical `/`, so both devices belong to the
+    /// scanned filesystem and must be counted; any other device is a separate
+    /// mount.
+    data_dev: Option<u64>,
     skip_data_volume: bool,
 }
 
 impl ScanPolicy {
     fn new(root: &Path, root_dev: u64) -> Self {
+        let data_dev = std::fs::symlink_metadata(DATA_VOLUME_ROOT)
+            .ok()
+            .map(|meta| meta.dev());
+        Self::with_devices(root, root_dev, data_dev)
+    }
+
+    fn with_devices(root: &Path, root_dev: u64, data_dev: Option<u64>) -> Self {
         let data_root = Path::new(DATA_VOLUME_ROOT);
         Self {
             root_dev,
+            data_dev,
             skip_data_volume: data_root.starts_with(root) && root != data_root,
         }
     }
@@ -406,10 +430,16 @@ impl Drop for DirFd {
     }
 }
 
-/// EACCES/EPERM means real data was skipped (no Full Disk Access, ACLs);
-/// ENOENT is just a deletion race during the walk and stays silent.
+/// EACCES/EPERM means real data was skipped (no Full Disk Access, ACLs), and
+/// ENAMETOOLONG means a spawned sibling branch's absolute path grew past the
+/// platform limit so a whole subtree could not be reopened — both undercount
+/// and must be surfaced rather than silently dropped. ENOENT is just a deletion
+/// race during the walk and stays silent.
 fn inaccessible_from_errno(errno: Option<i32>) -> u32 {
-    u32::from(matches!(errno, Some(libc::EACCES) | Some(libc::EPERM)))
+    u32::from(matches!(
+        errno,
+        Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::ENAMETOOLONG)
+    ))
 }
 
 fn open_dir(dir: &Path) -> Result<DirFd, Option<i32>> {
@@ -582,7 +612,12 @@ fn scan_open_dir(
                 };
                 offset += length;
 
+                // A per-entry error means the kernel could not read this
+                // entry's attributes (transient race, ACL, or unsupported
+                // attribute). Count it so the total stays an honest lower bound
+                // instead of silently dropping the entry's bytes.
                 if err != 0 {
+                    partial.inaccessible = partial.inaccessible.saturating_add(1);
                     continue;
                 }
                 match objtype {
@@ -661,11 +696,21 @@ fn should_count_file(
         .insert(identity)
 }
 
+/// A subdirectory is skipped when it lives on a different volume than the scan
+/// root. The root volume's device and (on modern macOS) the firmlinked Data
+/// volume's device both belong to `/`, so both are counted; any other device
+/// is a separate mount — an external/network/FUSE volume under `/Volumes` or a
+/// custom path, or an APFS helper volume such as Preboot/VM/Update under
+/// `/System/Volumes`. Entries whose device is unknown are kept (counted) rather
+/// than guessed away.
 fn should_skip_subdir(path: &Path, devid: Option<u64>, policy: &ScanPolicy) -> bool {
     if policy.skip_data_volume && path == Path::new(DATA_VOLUME_ROOT) {
         return true;
     }
-    path.starts_with(VOLUMES_ROOT) && devid.is_some_and(|dev| dev != policy.root_dev)
+    match devid {
+        Some(dev) => dev != policy.root_dev && policy.data_dev != Some(dev),
+        None => false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -903,39 +948,79 @@ mod tests {
     }
 
     #[test]
+    fn enametoolong_counts_as_inaccessible() {
+        // A spawned sibling whose absolute path exceeds the platform limit
+        // fails to reopen with ENAMETOOLONG; it must be surfaced as
+        // inaccessible (a lower-bound flag), never silently dropped to zero.
+        assert_eq!(inaccessible_from_errno(Some(libc::ENAMETOOLONG)), 1);
+        assert_eq!(inaccessible_from_errno(Some(libc::EACCES)), 1);
+        assert_eq!(inaccessible_from_errno(Some(libc::EPERM)), 1);
+        assert_eq!(inaccessible_from_errno(Some(libc::ENOENT)), 0);
+        assert_eq!(inaccessible_from_errno(None), 0);
+    }
+
+    #[test]
     fn skip_policy_skips_data_volume_only_from_ancestor() {
-        let root_policy = ScanPolicy::new(Path::new("/"), 10);
+        let root_policy = ScanPolicy::with_devices(Path::new("/"), 10, Some(11));
         assert!(should_skip_subdir(
             Path::new(DATA_VOLUME_ROOT),
-            Some(10),
+            Some(11),
             &root_policy
         ));
 
-        let data_policy = ScanPolicy::new(Path::new(DATA_VOLUME_ROOT), 10);
+        let data_policy = ScanPolicy::with_devices(Path::new(DATA_VOLUME_ROOT), 11, Some(11));
         assert!(!should_skip_subdir(
             Path::new(DATA_VOLUME_ROOT),
-            Some(10),
+            Some(11),
             &data_policy
         ));
     }
 
     #[test]
-    fn skip_policy_skips_different_devices_under_volumes() {
-        let policy = ScanPolicy::new(Path::new("/"), 10);
+    fn skip_policy_allows_root_and_data_devices_skips_other_volumes() {
+        // Scanning `/`: root volume is dev 10, firmlinked Data volume is dev 11.
+        let policy = ScanPolicy::with_devices(Path::new("/"), 10, Some(11));
 
+        // Firmlinked Data-volume content (home dir) is on data_dev: counted.
+        assert!(!should_skip_subdir(
+            Path::new("/Users/example"),
+            Some(11),
+            &policy
+        ));
+        // Same device as the root volume: counted.
+        assert!(!should_skip_subdir(
+            Path::new("/System/Library"),
+            Some(10),
+            &policy
+        ));
+        // External volume on its own device: skipped.
         assert!(should_skip_subdir(
             Path::new("/Volumes/External"),
             Some(20),
             &policy
         ));
-        assert!(!should_skip_subdir(
-            Path::new("/Volumes/LocalDirectory"),
-            Some(10),
+        // APFS helper volumes are NOT under /Volumes but live on their own
+        // devices; the old /Volumes-only policy counted them into `/`.
+        assert!(should_skip_subdir(
+            Path::new("/System/Volumes/VM"),
+            Some(21),
             &policy
         ));
+        assert!(should_skip_subdir(
+            Path::new("/System/Volumes/Preboot"),
+            Some(22),
+            &policy
+        ));
+        // A network/FUSE mount at a custom path is skipped too.
+        assert!(should_skip_subdir(
+            Path::new("/Users/example/nfs"),
+            Some(23),
+            &policy
+        ));
+        // Unknown device: kept rather than guessed away.
         assert!(!should_skip_subdir(
-            Path::new("/Users/example"),
-            Some(20),
+            Path::new("/Users/example/unknown"),
+            None,
             &policy
         ));
     }
