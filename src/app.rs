@@ -437,6 +437,8 @@ pub struct App {
     active_history_request_id: u64,
     history_loading: bool,
     history_rx: Option<Receiver<HistoryMsg>>,
+    #[cfg(test)]
+    history_store_path: Option<PathBuf>,
 
     scan_rx: Receiver<ScanMsg>,
     scanner: Scanner,
@@ -616,6 +618,8 @@ impl App {
             active_history_request_id: 0,
             history_loading: false,
             history_rx: None,
+            #[cfg(test)]
+            history_store_path: None,
             scanner: Scanner::new(tx.clone()),
             scan_rx: rx,
             active_pkg_scan_id: 0,
@@ -1442,7 +1446,7 @@ impl App {
         self.history_rx = Some(rx);
         self.history_loading = true;
         thread::spawn(move || {
-            let result = history::save(&cwd).map_err(|err| err.to_string());
+            let result = history::scan_record(&cwd).map_err(|err| err.to_string());
             let _ = tx.send(HistoryMsg {
                 request_id,
                 cwd,
@@ -1473,6 +1477,10 @@ impl App {
                         true
                     }
                     HistoryResult::Save(Ok(record)) => {
+                        if let Err(err) = self.store_history_record(&record) {
+                            self.status = format!("baseline save failed: {err}");
+                            return true;
+                        }
                         self.history_records
                             .insert(record.path.clone(), record.clone());
                         history::prune_records(&mut self.history_records);
@@ -1497,6 +1505,14 @@ impl App {
                 true
             }
         }
+    }
+
+    fn store_history_record(&self, record: &history::ScanRecord) -> Result<()> {
+        #[cfg(test)]
+        if let Some(path) = &self.history_store_path {
+            return history::store_record_to_path(path, record);
+        }
+        history::store_record(record)
     }
 
     pub fn reclaim_item_count(&self) -> usize {
@@ -4445,8 +4461,10 @@ mod tests {
     fn history_save_result_prunes_cached_baselines() {
         let root = test_root("history_save_prune");
         fs::create_dir_all(&root).unwrap();
+        let history_path = test_root("history_save_prune_store").join("history.json");
 
         let mut app = App::new(root.clone()).unwrap();
+        app.history_store_path = Some(history_path.clone());
         for idx in 0..history::HISTORY_MAX_RECORDS {
             let path = PathBuf::from(format!("/tmp/history-{idx}"));
             app.history_records.insert(
@@ -4481,8 +4499,11 @@ mod tests {
         assert!(!app
             .history_records
             .contains_key(Path::new("/tmp/history-0")));
+        let saved = fs::read_to_string(&history_path).unwrap();
+        assert!(saved.contains(&canonical.to_string_lossy().into_owned()));
 
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(history_path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -4521,6 +4542,44 @@ mod tests {
         assert!(app.drain_history_results());
         assert!(app.history_diff.is_none());
         assert!(!app.history_loading);
+        assert!(app.status.contains("stale history"));
+
+        fs::remove_dir_all(root_a).unwrap();
+        fs::remove_dir_all(root_b).unwrap();
+    }
+
+    #[test]
+    fn stale_history_save_result_does_not_persist() {
+        let root_a = test_root("stale_history_save_a");
+        let root_b = test_root("stale_history_save_b");
+        let history_path = test_root("stale_history_save_store").join("history.json");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+
+        let mut app = App::new(root_a.clone()).unwrap();
+        app.history_store_path = Some(history_path.clone());
+        let canonical = root_a.canonicalize().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.active_history_request_id = 5;
+        app.history_rx = Some(rx);
+        app.history_loading = true;
+        app.cwd = root_b.clone();
+
+        tx.send(HistoryMsg {
+            request_id: 5,
+            cwd: root_a.clone(),
+            result: HistoryResult::Save(Ok(history::ScanRecord {
+                path: canonical.clone(),
+                timestamp: 100,
+                children: Vec::new(),
+            })),
+        })
+        .unwrap();
+
+        assert!(app.drain_history_results());
+        assert!(!app.history_records.contains_key(&canonical));
+        assert!(app.history_baseline.is_none());
+        assert!(!history_path.exists());
         assert!(app.status.contains("stale history"));
 
         fs::remove_dir_all(root_a).unwrap();

@@ -6,6 +6,12 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- TUI history baseline saves now persist only after the background scan result
+  is validated as current, so a stale save worker can no longer overwrite a
+  newer saved baseline on disk after the UI has discarded its result.
+
 ## [0.1.63] - 2026-06-13
 
 ### Changed

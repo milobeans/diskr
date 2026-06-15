@@ -181,7 +181,8 @@ fn validate_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn scan_record(path: &Path) -> Result<ScanRecord> {
+pub(crate) fn scan_record(path: &Path) -> Result<ScanRecord> {
+    validate_dir(path)?;
     let canonical = path
         .canonicalize()
         .with_context(|| format!("resolve {}", path.display()))?;
@@ -277,14 +278,21 @@ pub fn load_record_for_path(path: &Path) -> Result<Option<ScanRecord>> {
     Ok(history.get(&canonical).cloned())
 }
 
-fn store_record(record: &ScanRecord) -> Result<()> {
+pub(crate) fn store_record(record: &ScanRecord) -> Result<()> {
     let dir = state::state_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = history_file();
-    let mut records = load_records_from_path(&path)?;
+    store_record_to_path(&path, record)
+}
+
+pub(crate) fn store_record_to_path(path: &Path, record: &ScanRecord) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let mut records = load_records_from_path(path)?;
     records.insert(record.path.clone(), record.clone());
     prune_records(&mut records);
-    store_records_to_path(&path, &records)?;
+    store_records_to_path(path, &records)?;
     Ok(())
 }
 
