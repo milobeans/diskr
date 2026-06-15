@@ -8,6 +8,15 @@ All notable changes to diskr are documented here. The format follows
 
 ### Fixed
 
+- `size-cache.json` and `history.json` are now written atomically (a temp file
+  is fsynced and renamed over the target), so a crash or full disk during a
+  save leaves the previous file intact instead of a truncated one. A corrupt or
+  unreadable `history.json` now surfaces a startup status warning the way the
+  size cache already does, instead of silently presenting "no baselines".
+- `--save` and `--diff` now report unreadable directories: saved baselines
+  record an unreadable-directory count, and both the text and JSON output warn
+  when permission errors limited the scan, matching the TUI, `--top`, and
+  `--reclaim`. Baselines saved by older versions load unchanged.
 - pip package sizing now derives the package list and the site-packages
   directories from the same Python interpreter and also searches the per-user
   site-packages, so `pip install --user` packages are sized and Homebrew, CLT,

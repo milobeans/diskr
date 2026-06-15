@@ -516,6 +516,7 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
             "timestamp": record.timestamp,
             "total_logical": total.logical,
             "total_allocated": total.allocated,
+            "inaccessible": record.inaccessible(),
             "children": children,
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -529,6 +530,12 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
         human(total.logical),
         record.children.len()
     );
+    if record.inaccessible() > 0 {
+        println!(
+            "Warning: {} directories were unreadable; totals are lower bounds.",
+            record.inaccessible()
+        );
+    }
     println!(
         "Compare later with `diskr --diff {}`.",
         record.path.display()
@@ -564,6 +571,8 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
             "before_total_allocated": report.before_total.allocated,
             "after_total_logical": report.after_total.logical,
             "after_total_allocated": report.after_total.allocated,
+            "baseline_inaccessible": report.baseline_inaccessible,
+            "current_inaccessible": report.current_inaccessible,
             "total_delta_logical": report.total_delta_logical().to_string(),
             "total_delta_allocated": report.total_delta_allocated().to_string(),
             "changes": changes,
@@ -587,6 +596,12 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
         human(report.after_total.allocated),
         format_signed_bytes(report.total_delta_allocated())
     );
+    if report.baseline_inaccessible > 0 || report.current_inaccessible > 0 {
+        println!(
+            "Warning: unreadable directories (baseline {}, current {}); totals are lower bounds.",
+            report.baseline_inaccessible, report.current_inaccessible
+        );
+    }
     if report.changes.is_empty() {
         println!("No changes since the baseline.");
         return Ok(());

@@ -24,6 +24,9 @@ pub struct ChildSize {
     pub name: String,
     pub is_dir: bool,
     pub size: SizeInfo,
+    /// Directories under this child that could not be read while sizing it;
+    /// when non-zero the recorded size is a lower bound.
+    pub inaccessible: u32,
 }
 
 /// A saved scan of a directory's immediate children at a point in time.
@@ -43,6 +46,14 @@ impl ScanRecord {
             total.allocated = total.allocated.saturating_add(child.size.allocated);
         }
         total
+    }
+
+    /// Total directories that were unreadable across all children; non-zero
+    /// means the recorded sizes are lower bounds.
+    pub fn inaccessible(&self) -> u32 {
+        self.children
+            .iter()
+            .fold(0u32, |acc, child| acc.saturating_add(child.inaccessible))
     }
 }
 
@@ -74,6 +85,10 @@ pub struct DiffReport {
     pub current_timestamp: u64,
     pub before_total: SizeInfo,
     pub after_total: SizeInfo,
+    /// Unreadable-directory counts in the baseline and the current scan; either
+    /// being non-zero means the totals and deltas are lower bounds.
+    pub baseline_inaccessible: u32,
+    pub current_inaccessible: u32,
     /// Children whose size changed, plus additions and removals, sorted by the
     /// magnitude of the allocated-size delta (largest movers first).
     pub changes: Vec<ChildChange>,
@@ -167,6 +182,8 @@ pub fn diff_records(before: &ScanRecord, after: &ScanRecord) -> DiffReport {
         current_timestamp: after.timestamp,
         before_total: before.total(),
         after_total: after.total(),
+        baseline_inaccessible: before.inaccessible(),
+        current_inaccessible: after.inaccessible(),
         changes,
     }
 }
@@ -199,18 +216,25 @@ pub(crate) fn scan_record(path: &Path) -> Result<ScanRecord> {
         if file_type.is_symlink() {
             continue;
         }
-        let (is_dir, size) = if file_type.is_dir() {
-            (true, bulkstat::scan_dir(&entry.path(), 0).size)
+        let (is_dir, size, inaccessible) = if file_type.is_dir() {
+            let scan = bulkstat::scan_dir(&entry.path(), 0);
+            (true, scan.size, scan.inaccessible)
         } else if file_type.is_file() {
             use std::os::unix::fs::MetadataExt;
             (
                 false,
                 SizeInfo::new(meta.len(), meta.blocks().saturating_mul(512)),
+                0,
             )
         } else {
             continue;
         };
-        children.push(ChildSize { name, is_dir, size });
+        children.push(ChildSize {
+            name,
+            is_dir,
+            size,
+            inaccessible,
+        });
     }
     children.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -251,6 +275,17 @@ fn load_history_from_path(path: &Path) -> Result<serde_json::Map<String, serde_j
 
 pub fn load_records() -> Result<HashMap<PathBuf, ScanRecord>> {
     load_records_from_path(&history_file())
+}
+
+/// Like [`load_records`], but converts a load failure (a corrupt or
+/// unreadable `history.json`) into a user-facing warning string instead of
+/// silently presenting "no baselines", mirroring how the size cache surfaces
+/// its own load errors.
+pub fn load_records_with_warning() -> (HashMap<PathBuf, ScanRecord>, Option<String>) {
+    match load_records() {
+        Ok(records) => (records, None),
+        Err(err) => (HashMap::new(), Some(format!("history load failed: {err}"))),
+    }
 }
 
 fn load_records_from_path(path: &Path) -> Result<HashMap<PathBuf, ScanRecord>> {
@@ -323,8 +358,7 @@ fn store_records_to_path(path: &Path, records: &HashMap<PathBuf, ScanRecord>) ->
         history.insert(path.to_string_lossy().into_owned(), record_to_json(record));
     }
     let text = serde_json::to_string_pretty(&serde_json::Value::Object(history))?;
-    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    state::atomic_write(path, &text)
 }
 
 fn record_to_json(record: &ScanRecord) -> serde_json::Value {
@@ -337,6 +371,7 @@ fn record_to_json(record: &ScanRecord) -> serde_json::Value {
                 "is_dir": child.is_dir,
                 "logical": child.size.logical,
                 "allocated": child.size.allocated,
+                "inaccessible": child.inaccessible,
             })
         })
         .collect();
@@ -363,10 +398,18 @@ fn record_from_json(path: &Path, value: &serde_json::Value) -> ScanRecord {
                         .unwrap_or(false);
                     let logical = item.get("logical").and_then(|v| v.as_u64()).unwrap_or(0);
                     let allocated = item.get("allocated").and_then(|v| v.as_u64()).unwrap_or(0);
+                    // Missing in pre-0.1.x baselines; default to 0 so old files
+                    // load unchanged.
+                    let inaccessible = item
+                        .get("inaccessible")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|n| u32::try_from(n).ok())
+                        .unwrap_or(0);
                     Some(ChildSize {
                         name,
                         is_dir,
                         size: SizeInfo::new(logical, allocated),
+                        inaccessible,
                     })
                 })
                 .collect()
@@ -388,6 +431,7 @@ mod tests {
             name: name.to_string(),
             is_dir: true,
             size: SizeInfo::new(allocated, allocated),
+            inaccessible: 0,
         }
     }
 
@@ -447,11 +491,13 @@ mod tests {
                     name: "dir".to_string(),
                     is_dir: true,
                     size: SizeInfo::new(10, 20),
+                    inaccessible: 3,
                 },
                 ChildSize {
                     name: "file".to_string(),
                     is_dir: false,
                     size: SizeInfo::new(30, 40),
+                    inaccessible: 0,
                 },
             ],
         };
@@ -459,6 +505,49 @@ mod tests {
         let json = record_to_json(&original);
         let restored = record_from_json(&original.path, &json);
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn corrupt_history_file_surfaces_as_error() {
+        // load_records_with_warning relies on the load path returning Err so a
+        // corrupt history.json becomes a visible status instead of "no
+        // baselines".
+        let path = std::env::temp_dir().join(format!(
+            "diskr_history_corrupt_{}_{}.json",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::write(&path, "{ not valid json").unwrap();
+
+        assert!(load_records_from_path(&path).is_err());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn old_format_child_without_inaccessible_defaults_to_zero() {
+        let value = serde_json::json!({
+            "path": "/tmp/example",
+            "timestamp": 1,
+            "children": [
+                {"name": "dir", "is_dir": true, "logical": 10, "allocated": 20}
+            ],
+        });
+        let record = record_from_json(Path::new("/tmp/example"), &value);
+        assert_eq!(record.children[0].inaccessible, 0);
+        assert_eq!(record.inaccessible(), 0);
+    }
+
+    #[test]
+    fn diff_reports_inaccessible_totals() {
+        let mut before = record(vec![child("a", 100)]);
+        before.children[0].inaccessible = 2;
+        let mut after = record(vec![child("a", 150)]);
+        after.children[0].inaccessible = 0;
+
+        let diff = diff_records(&before, &after);
+        assert_eq!(diff.baseline_inaccessible, 2);
+        assert_eq!(diff.current_inaccessible, 0);
     }
 
     #[test]

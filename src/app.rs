@@ -502,7 +502,7 @@ impl App {
             HashSet::new(),
         );
         let mut size_cache_dirty = false;
-        let history_records = history::load_records().unwrap_or_default();
+        let (history_records, history_warning) = history::load_records_with_warning();
         let cache_warning = match state::load_size_cache() {
             Ok(mut entries) => {
                 if entries.len() > state::SIZE_CACHE_MAX_ENTRIES {
@@ -640,7 +640,11 @@ impl App {
         app.refresh_disks();
         app.reload()?;
         app.refresh_history_state();
-        if let Some(warning) = cache_warning {
+        let startup_warning = match (cache_warning, history_warning) {
+            (Some(cache), Some(history)) => Some(format!("{cache} · {history}")),
+            (cache, history) => cache.or(history),
+        };
+        if let Some(warning) = startup_warning {
             app.status = warning;
         }
         Ok(app)
@@ -4534,6 +4538,8 @@ mod tests {
                 current_timestamp: 200,
                 before_total: SizeInfo::default(),
                 after_total: SizeInfo::new(1, 1),
+                baseline_inaccessible: 0,
+                current_inaccessible: 0,
                 changes: Vec::new(),
             })),
         })
