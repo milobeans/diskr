@@ -2399,7 +2399,16 @@ fn side_panel_heights(side_height: u16, disk_count: usize, packages_visible: boo
         return (0, 0);
     }
     if side_height <= 8 {
-        return (side_height, 0);
+        if !packages_visible {
+            return (side_height, 0);
+        }
+        // Short side column with packages focused/loaded: split so the
+        // packages pane is never zero-height (Tab/p could otherwise focus an
+        // invisible pane). Reserve up to 5 rows for packages without starving
+        // disks below 3.
+        let package_height = side_height.saturating_sub(3).clamp(1, 5);
+        let disk_height = side_height.saturating_sub(package_height);
+        return (disk_height, package_height);
     }
 
     let desired_disk_height = if disk_count == 0 {
@@ -2854,6 +2863,18 @@ mod tests {
     #[test]
     fn side_panel_keeps_room_for_packages() {
         assert_eq!(side_panel_heights(21, 12, true), (14, 7));
+    }
+
+    #[test]
+    fn side_panel_gives_packages_rows_on_short_terminal_when_visible() {
+        // Packages not visible: the short side column is all disks.
+        assert_eq!(side_panel_heights(8, 2, false), (8, 0));
+        // Packages focused/loaded on the same short column: both panes get
+        // rows so a focused packages pane is never zero-height.
+        let (disk, pkg) = side_panel_heights(8, 2, true);
+        assert!(pkg > 0, "packages pane starved on short terminal");
+        assert!(disk > 0, "disks pane starved on short terminal");
+        assert_eq!(disk + pkg, 8);
     }
 
     #[test]

@@ -1614,20 +1614,24 @@ impl App {
     }
 
     pub fn selected_reclaim_path(&self) -> Option<(String, PathBuf)> {
-        self.reclaim_report.as_ref().and_then(|report| {
-            report
-                .findings
-                .get(self.reclaim_paths_finding)
-                .and_then(|finding| finding.paths.get(self.reclaim_paths_selected))
-                .map(|path| {
-                    let name = path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(|name| name.to_string())
-                        .unwrap_or_else(|| path.display().to_string());
-                    (name, path.clone())
-                })
-        })
+        // With the paths modal open, target its selected path; once it closes,
+        // the modal's finding/path indices are stale, so fall back to the
+        // currently highlighted finding's first path. Otherwise the status line
+        // and Space/f/O/y/s actions keep referencing a path from a
+        // previously-opened finding.
+        let (finding_index, path_index) = if self.reclaim_paths_open {
+            (self.reclaim_paths_finding, self.reclaim_paths_selected)
+        } else {
+            (self.selected_reclaim, 0)
+        };
+        let report = self.reclaim_report.as_ref()?;
+        let path = report.findings.get(finding_index)?.paths.get(path_index)?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        Some((name, path.clone()))
     }
 
     pub fn open_reclaim_for_focus(&mut self) {
@@ -2739,29 +2743,24 @@ impl App {
         if self.pkg_filter_active() {
             return self.pkg_search_matches.len();
         }
-        match &self.cached_pkg_visible_indices {
-            Some(indices) => indices.len(),
-            None => match self.pkg_view {
-                PkgView::SystemManagers => self.cached_flat_packages.len(),
-                PkgView::ProjectDeps => self.project_deps.len(),
-            },
-        }
+        // A `None` cache means "visibility not built yet", not "show
+        // everything". Treating it as empty (consistent with
+        // `pkg_visible_indices`) keeps a filtered/empty list from secretly
+        // exposing hidden packages to navigation and actions; the cache is
+        // rebuilt whenever package data changes.
+        self.cached_pkg_visible_indices
+            .as_ref()
+            .map_or(0, |indices| indices.len())
     }
 
     pub fn pkg_visible_index(&self, visible_index: usize) -> Option<usize> {
         if self.pkg_filter_active() {
             return self.pkg_search_matches.get(visible_index).copied();
         }
-        match &self.cached_pkg_visible_indices {
-            Some(indices) => indices.get(visible_index).copied(),
-            None => {
-                let total = match self.pkg_view {
-                    PkgView::SystemManagers => self.cached_flat_packages.len(),
-                    PkgView::ProjectDeps => self.project_deps.len(),
-                };
-                (visible_index < total).then_some(visible_index)
-            }
-        }
+        self.cached_pkg_visible_indices
+            .as_ref()?
+            .get(visible_index)
+            .copied()
     }
 
     pub fn pkg_visible_indices(&self) -> &[usize] {
@@ -3195,14 +3194,28 @@ impl App {
             self.status = String::from("nothing marked for deletion");
             return;
         }
-        let total_size: u64 = self
-            .marked
-            .iter()
-            .filter_map(|p| self.size_cache.get(p))
-            .map(|s| s.allocated)
-            .sum();
+        // Resolve each marked path through the current entries: marked FILES
+        // (the common case) carry their size on the Entry, while size_cache only
+        // holds directory scan results. A marked directory with no cached size
+        // makes the sum a lower bound, shown with a leading ≥.
+        let mut total_size: u64 = 0;
+        let mut lower_bound = false;
+        for path in &self.marked {
+            match self
+                .entry_index
+                .get(path)
+                .and_then(|&idx| self.entries.get(idx))
+                .and_then(|entry| entry.size)
+            {
+                Some(size) => total_size = total_size.saturating_add(size.allocated),
+                None => lower_bound = true,
+            }
+        }
         let size_str = if total_size > 0 {
-            format!(" ({})", human(total_size))
+            let prefix = if lower_bound { "≥" } else { "" };
+            format!(" ({prefix}{})", human(total_size))
+        } else if lower_bound {
+            String::from(" (size unknown)")
         } else {
             String::new()
         };
@@ -3757,6 +3770,99 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_action_target_follows_selection_after_paths_modal_closes() {
+        let root = test_root("reclaim_stale_target");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Reclaim;
+        app.reclaim_report = Some(reclaim::ReclaimReport {
+            root: root.clone(),
+            findings: vec![
+                reclaim::Finding {
+                    label: String::from("first"),
+                    class: reclaim::Reclaimability::Safe,
+                    note: String::new(),
+                    size: SizeInfo::new(1, 1),
+                    inaccessible: 0,
+                    skipped_mounts: 0,
+                    count: 1,
+                    paths: vec![root.join("first-path")],
+                    rollup: false,
+                },
+                reclaim::Finding {
+                    label: String::from("second"),
+                    class: reclaim::Reclaimability::Safe,
+                    note: String::new(),
+                    size: SizeInfo::new(1, 1),
+                    inaccessible: 0,
+                    skipped_mounts: 0,
+                    count: 1,
+                    paths: vec![root.join("second-path")],
+                    rollup: false,
+                },
+            ],
+            total: SizeInfo::new(2, 2),
+            inaccessible: 0,
+            skipped_mounts: 0,
+        });
+
+        // Open the paths modal on the second finding, then close it.
+        app.selected_reclaim = 1;
+        app.open_selected_reclaim_paths();
+        assert!(app.reclaim_paths_open);
+        app.close_reclaim_paths();
+
+        // Move selection back to the first finding. The action target must now
+        // follow the selection, not the stale modal finding.
+        app.selected_reclaim = 0;
+        let (_, path) = app.selected_reclaim_path().expect("a reclaim path");
+        assert_eq!(path, root.join("first-path"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_delete_size_counts_marked_files_and_flags_unsized_dirs() {
+        let root = test_root("batch_delete_size");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file.bin"), vec![0u8; 1024]).unwrap();
+        fs::create_dir_all(root.join("dir")).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        // Force the directory to be unsized so it makes the sum a lower bound.
+        for entry in app.entries.iter_mut() {
+            if entry.is_dir {
+                entry.size = None;
+            }
+        }
+
+        let file = root.join("file.bin");
+        let dir = root.join("dir");
+        app.selected = app.entries.iter().position(|e| e.path == file).unwrap();
+        app.toggle_mark();
+        app.selected = app.entries.iter().position(|e| e.path == dir).unwrap();
+        app.toggle_mark();
+
+        app.request_batch_delete();
+
+        assert!(app.confirming_delete);
+        assert!(matches!(app.pending_delete, Some(DeleteTarget::Batch)));
+        // The marked file's size is counted, and the unsized marked dir makes
+        // it a lower bound.
+        assert!(
+            app.status.contains('≥'),
+            "expected lower-bound marker in: {}",
+            app.status
+        );
+        assert!(app.status.contains("2 items"), "status: {}", app.status);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn marks_clear_when_changing_directory_or_visibility() {
         let root = test_root("marks_nav");
         let sub = root.join("sub");
@@ -3896,6 +4002,7 @@ mod tests {
             make_flat_package("delta"),
             make_flat_package("epsilon"),
         ];
+        app.rebuild_pkg_visible_indices();
         app.package_page_rows = 2;
         app.selected_pkg = 1;
         app.page_move(1);
@@ -4125,6 +4232,27 @@ mod tests {
 
         app.toggle_unused_filter();
 
+        assert_eq!(app.pkg_item_count(), 0);
+        assert_eq!(app.pkg_visible_index(0), None);
+        assert!(app.pkg_visible_indices().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unbuilt_visibility_cache_exposes_no_packages() {
+        // Before the visibility cache is built, the list renders empty, so
+        // navigation and actions must see zero rows rather than indexing
+        // straight into the full (hidden) package list.
+        let root = test_root("pkg_unbuilt_cache");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Packages;
+        app.pkg_view = PkgView::SystemManagers;
+        app.cached_flat_packages = vec![make_flat_package("hidden")];
+
+        assert!(app.cached_pkg_visible_indices.is_none());
         assert_eq!(app.pkg_item_count(), 0);
         assert_eq!(app.pkg_visible_index(0), None);
         assert!(app.pkg_visible_indices().is_empty());

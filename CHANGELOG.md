@@ -22,6 +22,19 @@ All notable changes to diskr are documented here. The format follows
 
 ### Fixed
 
+- The Reclaim pane's status line and the Space/f/O/y/s actions now target the
+  highlighted finding once the paths modal is closed, instead of a path from a
+  previously-opened finding.
+- The batch-delete confirmation now counts marked files, not just cached
+  directories, and shows the total as a lower bound (`≥`) when a marked
+  directory has no cached size, so the common "mark some files" case no longer
+  reads as zero bytes.
+- Package navigation and actions can no longer reach hidden packages through a
+  not-yet-built visibility cache: an empty or unbuilt package filter now
+  consistently exposes zero rows everywhere.
+- On short terminals the packages pane is given rows whenever it is focused or
+  loaded, so `Tab`/`p` can no longer move focus onto an invisible, zero-height
+  packages pane.
 - `--thin-snapshots` now validates its path the same way `--space` does (it
   must exist and be a directory, and is canonicalized) and resolves the owning
   volume before invoking `tmutil`, so it no longer accepts regular files,
