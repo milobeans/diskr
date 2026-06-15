@@ -6,6 +6,8 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.64] - 2026-06-15
+
 ### Fixed
 
 - TUI history baseline saves now persist only after the background scan result
