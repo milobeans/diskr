@@ -766,6 +766,7 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             })
             .collect();
         let value = serde_json::json!({
+            "path": path.to_string_lossy(),
             "system_packages": managers,
             "project_dependencies": projects,
         });
@@ -838,13 +839,15 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
 }
 
 fn thin_snapshots(path: PathBuf, bytes: u64, confirmed: bool) -> Result<()> {
-    if !path.exists() {
-        bail!("path does not exist: {}", path.display());
-    }
+    // Validate like `--space` (exists, is a directory, canonicalized) and
+    // resolve the owning volume, so `tmutil` is handed a real mount instead of
+    // a raw argument that could be a file, a relative path, or a symlink.
+    let path = canonical_dir(path)?;
+    let mount = space::report_for_path(&path)?.mount;
     if !confirmed {
         println!(
             "Would run: tmutil thinlocalsnapshots {} {} 4",
-            path.display(),
+            mount.display(),
             bytes
         );
         println!(
@@ -854,7 +857,7 @@ fn thin_snapshots(path: PathBuf, bytes: u64, confirmed: bool) -> Result<()> {
         return Ok(());
     }
 
-    let result = space::thin_local_snapshots(&path, bytes)?;
+    let result = space::thin_local_snapshots(&mount, bytes)?;
     println!(
         "Requested {} of local snapshot reclamation for {}.",
         human(result.requested_bytes),
@@ -2052,6 +2055,50 @@ mod tests {
     fn rejects_extra_args() {
         assert!(parse(&["/tmp", "/var"]).is_err());
         assert!(parse(&["--", "/tmp", "/var"]).is_err());
+    }
+
+    #[test]
+    fn canonical_dir_resolves_relative_and_dot_paths() {
+        let root = test_root("canonical_relative");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        // A `.`-suffixed path resolves to its absolute canonical form, so the
+        // TUI start path and report roots are never left relative (which broke
+        // Backspace navigation and HOME-relative reclaim categories).
+        let resolved = canonical_dir(nested.join(".")).unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, nested.canonicalize().unwrap());
+
+        // Nonexistent paths and files are rejected.
+        assert!(canonical_dir(root.join("missing")).is_err());
+        let file = root.join("file.txt");
+        fs::write(&file, b"x").unwrap();
+        assert!(canonical_dir(file).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn packages_report_rejects_nonexistent_path() {
+        // print_packages validates before scanning, so a bad root errors
+        // instead of exiting 0 with only global package info.
+        let missing = test_root("packages_missing");
+        assert!(print_packages(missing, false).is_err());
+    }
+
+    #[test]
+    fn thin_snapshots_rejects_nonexistent_and_file_paths() {
+        let root = test_root("thin_validate");
+        fs::create_dir_all(&root).unwrap();
+
+        // Both error inside canonical_dir, before tmutil is ever invoked.
+        assert!(thin_snapshots(root.join("missing"), 1024, false).is_err());
+        let file = root.join("snap.txt");
+        fs::write(&file, b"x").unwrap();
+        assert!(thin_snapshots(file, 1024, false).is_err());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn test_root(name: &str) -> PathBuf {

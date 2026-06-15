@@ -6,8 +6,17 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `diskr --packages --json` now includes the canonical project root as `path`,
+  matching the other JSON reports.
+
 ### Fixed
 
+- `--thin-snapshots` now validates its path the same way `--space` does (it
+  must exist and be a directory, and is canonicalized) and resolves the owning
+  volume before invoking `tmutil`, so it no longer accepts regular files,
+  relative paths, or symlinks, and the preview shows the resolved mount.
 - `size-cache.json` and `history.json` are now written atomically (a temp file
   is fsynced and renamed over the target), so a crash or full disk during a
   save leaves the previous file intact instead of a truncated one. A corrupt or
