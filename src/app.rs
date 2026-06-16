@@ -20,6 +20,9 @@ const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
 const SIZE_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 const AUTO_SCAN_LIMIT: usize = 4;
 const TOP_FILES_LIMIT: usize = 50;
+/// Cap on directories queued by cursor movement while a scan is in flight, so a
+/// long scroll through an unsized tree cannot grow the queue without bound.
+const SCAN_QUEUE_MAX: usize = 64;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
     Files,
@@ -399,6 +402,9 @@ pub struct App {
     active_scan_id: ScanId,
     min_valid_scan_id: ScanId,
     active_scan_paths: HashSet<PathBuf>,
+    /// Directories the cursor visited while a scan was in flight; scanned once
+    /// the active batch finishes so navigation never cancels it (issue #57).
+    pending_scan_dirs: Vec<PathBuf>,
 
     active_reclaim_scan_id: ScanId,
     reclaim_scan_rx: Option<Receiver<ReclaimMsg>>,
@@ -585,6 +591,7 @@ impl App {
             active_scan_id: 0,
             min_valid_scan_id: 0,
             active_scan_paths: HashSet::new(),
+            pending_scan_dirs: Vec::new(),
             active_reclaim_scan_id: 0,
             reclaim_scan_rx: None,
             reclaim_report: None,
@@ -733,6 +740,8 @@ impl App {
     fn rebuild_entries(&mut self) -> Result<()> {
         self.entries.clear();
         self.entry_index.clear();
+        // The scan queue holds paths from the directory being left behind.
+        self.pending_scan_dirs.clear();
         let read = match std::fs::read_dir(&self.cwd) {
             Ok(r) => r,
             Err(e) => {
@@ -1079,12 +1088,95 @@ impl App {
             .filter(|e| e.is_dir && e.size.is_none())
             .map(|e| e.path.clone())
             .collect();
-        if missing.is_empty() {
-            self.status = String::from("cache hit · all sizes known");
+        if !missing.is_empty() {
+            let dirs = self.scan_candidates(AUTO_SCAN_LIMIT, &missing);
+            let status = limited_scan_status("scanning", dirs.len(), missing.len());
+            self.start_scan(dirs, status);
             return;
         }
-        let dirs = self.scan_candidates(AUTO_SCAN_LIMIT, &missing);
-        let status = limited_scan_status("scanning", dirs.len(), missing.len());
+        // Nothing missing: stale-while-revalidate. The cache is trusted but
+        // every entry is marked stale at startup, so a fully-cached view would
+        // otherwise sit on values that may be weeks old. Quietly revalidate the
+        // oldest stale directories (bounded like the missing case) so the list
+        // is not a frozen snapshot, and tell the truth in the status line.
+        let stale = self.stale_revalidation_candidates(AUTO_SCAN_LIMIT);
+        if stale.is_empty() {
+            self.status = String::from("sizes from cache · all fresh");
+            return;
+        }
+        let oldest_age = stale
+            .iter()
+            .filter_map(|path| self.cache_age.get(path).copied())
+            .min()
+            .map(|scanned_at| now_secs().saturating_sub(scanned_at));
+        self.start_scan(stale.clone(), String::new());
+        self.status = match oldest_age {
+            Some(age) => format!(
+                "sizes from cache (oldest {}) · verifying {}",
+                format_elapsed(age),
+                stale.len()
+            ),
+            None => format!("sizes from cache · verifying {}", stale.len()),
+        };
+    }
+
+    /// Visible stale directories not already scanning, oldest `scanned_at`
+    /// first, capped at `limit`. A shallow mtime check is intentionally not
+    /// used to gate this: deep growth does not bubble a directory's mtime, so
+    /// gating on it would leave grown trees stale forever.
+    fn stale_revalidation_candidates(&self, limit: usize) -> Vec<PathBuf> {
+        let mut stale: Vec<(u64, PathBuf)> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_dir && e.size_stale && !e.scanning)
+            .map(|e| (e.cached_at.unwrap_or(0), e.path.clone()))
+            .collect();
+        stale.sort_by(|(a_age, a_path), (b_age, b_path)| {
+            a_age.cmp(b_age).then_with(|| a_path.cmp(b_path))
+        });
+        stale.truncate(limit);
+        stale.into_iter().map(|(_, path)| path).collect()
+    }
+
+    /// A file-pane scan is visibly in flight when any entry shows the scanning
+    /// spinner. Cursor movement onto an unsized directory enqueues rather than
+    /// starting a new scan (which would bump the cancellation generation and
+    /// kill the running batch).
+    fn scan_in_flight(&self) -> bool {
+        self.entries.iter().any(|entry| entry.scanning)
+    }
+
+    fn enqueue_scan_dir(&mut self, path: PathBuf) {
+        if self.active_scan_paths.contains(&path) || self.pending_scan_dirs.contains(&path) {
+            return;
+        }
+        if self.pending_scan_dirs.len() < SCAN_QUEUE_MAX {
+            self.pending_scan_dirs.push(path);
+        }
+    }
+
+    /// Start scanning the queued directories once no scan is in flight. Called
+    /// after a batch finishes so cursor-visited directories are picked up
+    /// without ever cancelling the batch that was running.
+    fn pump_scan_queue(&mut self) {
+        if self.pending_scan_dirs.is_empty() || self.scan_in_flight() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.pending_scan_dirs);
+        let dirs: Vec<PathBuf> = queued
+            .into_iter()
+            .filter(|path| {
+                self.entry_index
+                    .get(path)
+                    .and_then(|&idx| self.entries.get(idx))
+                    .map(entry_needs_scan)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if dirs.is_empty() {
+            return;
+        }
+        let status = limited_scan_status("scanning", dirs.len(), dirs.len());
         self.start_scan(dirs, status);
     }
 
@@ -1225,6 +1317,9 @@ impl App {
                     } else {
                         String::from("scan complete")
                     };
+                    // Pick up directories the cursor visited while this batch
+                    // ran (they were queued instead of cancelling the batch).
+                    self.pump_scan_queue();
                     changed = true;
                 }
                 _ => {}
@@ -2302,6 +2397,7 @@ impl App {
         self.min_valid_scan_id = self.min_valid_scan_id.max(next_valid_scan_id);
         self.active_scan_id = next_valid_scan_id;
         self.active_scan_paths.clear();
+        self.pending_scan_dirs.clear();
         self.scan_total = 0;
         self.scan_completed = 0;
         self.scan_skipped_mounts = 0;
@@ -2359,6 +2455,12 @@ impl App {
         }
         let name = entry.name.clone();
         let path = entry.path.clone();
+        // If a scan is already running, queue this directory instead of starting
+        // a new scan; starting one would cancel the in-flight batch mid-walk.
+        if self.scan_in_flight() {
+            self.enqueue_scan_dir(path);
+            return;
+        }
         self.start_scan(vec![path], format!("scanning selected directory: {name}"));
     }
 
@@ -4994,6 +5096,106 @@ mod tests {
         assert_eq!(stale.size, Some(SizeInfo::new(200, 256)));
         assert!(stale.size_stale);
         assert_eq!(app.status, "scanning selected directory: stale");
+
+        app.invalidate_pending_scan_results();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cursor_movement_queues_scan_during_active_batch() {
+        let root = test_root("scan_queue_cursor");
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..4 {
+            fs::create_dir_all(root.join(format!("dir-{i}"))).unwrap();
+        }
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        // Simulate an in-flight batch of just dir-0: it is scanning, and only
+        // it is in the active set; every dir is unsized.
+        for entry in app.entries.iter_mut() {
+            if entry.is_dir {
+                entry.size = None;
+                entry.scanning = entry.name == "dir-0";
+            }
+        }
+        app.active_scan_paths = HashSet::from([root.join("dir-0")]);
+        let target = root.join("dir-2");
+        app.selected = app.entries.iter().position(|e| e.path == target).unwrap();
+
+        app.scan_selected_missing_dir();
+
+        // The target is queued, not started, and the running batch is untouched.
+        assert!(app.pending_scan_dirs.contains(&target));
+        let dir0 = app
+            .entries
+            .iter()
+            .find(|e| e.path == root.join("dir-0"))
+            .unwrap();
+        assert!(dir0.scanning, "active batch must not be cancelled");
+        let target_entry = app.entries.iter().find(|e| e.path == target).unwrap();
+        assert!(
+            !target_entry.scanning,
+            "queued dir must not start scanning yet"
+        );
+
+        app.invalidate_pending_scan_results();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn queued_scan_starts_when_no_scan_in_flight() {
+        let root = test_root("scan_queue_pump");
+        let dir = root.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        for entry in app.entries.iter_mut() {
+            entry.size = None;
+            entry.scanning = false;
+        }
+        app.active_scan_paths.clear();
+        app.pending_scan_dirs = vec![dir.clone()];
+
+        app.pump_scan_queue();
+
+        assert!(app.pending_scan_dirs.is_empty(), "queue should drain");
+        let entry = app.entries.iter().find(|e| e.path == dir).unwrap();
+        assert!(entry.scanning, "queued dir should start scanning");
+
+        app.invalidate_pending_scan_results();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fully_cached_view_revalidates_oldest_stale_directories() {
+        let root = test_root("revalidate_stale");
+        let old_dir = root.join("old");
+        let newer_dir = root.join("newer");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&newer_dir).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        // Both cached and stale, with different ages (old has the smaller scanned_at).
+        app.record_cached_size(old_dir.clone(), SizeInfo::new(10, 16), 0, 100, true);
+        app.record_cached_size(newer_dir.clone(), SizeInfo::new(20, 32), 0, 500, true);
+        app.rebuild_entries().unwrap();
+        for entry in app.entries.iter_mut() {
+            entry.scanning = false;
+        }
+
+        app.auto_scan();
+
+        // Nothing is missing, so auto_scan revalidates the stale dirs and says so
+        // honestly instead of claiming a fresh "cache hit".
+        assert!(app.status.contains("cache"), "status: {}", app.status);
+        let old = app.entries.iter().find(|e| e.path == old_dir).unwrap();
+        assert!(old.scanning, "oldest stale dir should be revalidating");
+        // The cached value is preserved while revalidation runs.
+        assert_eq!(old.size, Some(SizeInfo::new(10, 16)));
+        assert!(old.size_stale);
 
         app.invalidate_pending_scan_results();
         fs::remove_dir_all(root).unwrap();

@@ -22,6 +22,15 @@ All notable changes to diskr are documented here. The format follows
 
 ### Fixed
 
+- Moving the cursor onto an unsized directory while a scan is running no longer
+  cancels the in-flight batch: such directories are queued and scanned once the
+  batch finishes, so spinners and progress are not wiped out by a premature
+  "scan complete".
+- A fully-cached directory view is no longer a frozen snapshot. When nothing is
+  missing, diskr now revalidates the oldest stale directories in the background
+  (bounded, oldest first) and reports honest status ("sizes from cache (oldest
+  …) · verifying N") instead of "cache hit · all sizes known", so a folder that
+  grew since the last scan stops sitting at its old rank.
 - The Reclaim pane's status line and the Space/f/O/y/s actions now target the
   highlighted finding once the paths modal is closed, instead of a path from a
   previously-opened finding.
