@@ -6,6 +6,8 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.68] - 2026-06-15
+
 ### Changed
 
 - The in-progress scanning indicator is now a four-cell braille "beam" that
