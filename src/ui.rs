@@ -684,43 +684,89 @@ fn finding_count_label(count: usize) -> String {
     }
 }
 
-fn draw_reclaim_paths(f: &mut Frame, app: &mut App) {
-    let area = centered_rect(68, 68, 72, 20, f.area());
+/// Shared footer hint for the selectable list modals so they read identically.
+const MODAL_LIST_HINT: &str = "f/enter: reveal  ·  O: open  ·  d: trash  ·  esc: close";
+
+/// Standard centered, bordered list-modal shell. Clears the area, draws the
+/// block, and returns the `(list_area, footer_area)` for the caller to fill, or
+/// `None` when there is no room. Shared by the top-files and reclaim-paths
+/// overlays so their placement and chrome stay identical (issue #77).
+fn modal_list_regions(f: &mut Frame, title: &str) -> Option<(Rect, Rect)> {
+    let area = centered_rect(70, 70, 74, 20, f.area());
     f.render_widget(Clear, area);
-
-    let item_count = app.reclaim_paths_count();
-    if item_count == 0 {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" reclaim paths ");
-        let body = Paragraph::new("no reclaim paths found")
-            .block(block)
-            .alignment(Alignment::Center);
-        f.render_widget(body, area);
-        return;
-    }
-
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" reclaim paths ")
+        .title(title.to_string())
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
-        return;
+        return None;
     }
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(2)])
         .split(inner);
-    let max_rows = chunks[0].height.max(1) as usize;
+    Some((chunks[0], chunks[1]))
+}
+
+/// Centered single-message overlay (empty/loading states) sharing the list
+/// modals' placement.
+fn draw_modal_message(f: &mut Frame, title: &str, lines: Vec<Line<'static>>) {
+    let area = centered_rect(70, 70, 74, 20, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string());
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
+/// Render a selectable list and its two-line footer into pre-computed regions
+/// with the modals' shared highlight style.
+fn render_modal_list(
+    f: &mut Frame,
+    list_area: Rect,
+    footer_area: Rect,
+    items: Vec<ListItem<'static>>,
+    selected_in_window: usize,
+    footer: Vec<Line<'static>>,
+) {
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = ListState::default();
+    state.select(Some(selected_in_window));
+    f.render_stateful_widget(list, list_area, &mut state);
+    f.render_widget(Paragraph::new(footer), footer_area);
+}
+
+fn draw_reclaim_paths(f: &mut Frame, app: &mut App) {
+    let item_count = app.reclaim_paths_count();
+    if item_count == 0 {
+        draw_modal_message(
+            f,
+            " reclaim paths ",
+            vec![Line::from("no reclaim paths found")],
+        );
+        return;
+    }
+    let Some((list_area, footer_area)) = modal_list_regions(f, " reclaim paths ") else {
+        return;
+    };
+    let max_rows = list_area.height.max(1) as usize;
     let (offset, end) = app.reclaim_paths_window_bounds(max_rows);
     let selected = app.reclaim_paths_selected();
-
-    let finding = match app.selected_reclaim_finding() {
-        Some(finding) => finding,
-        None => return,
+    let Some(finding) = app.selected_reclaim_finding() else {
+        return;
     };
     let items: Vec<ListItem> = finding
         .paths
@@ -737,7 +783,7 @@ fn draw_reclaim_paths(f: &mut Frame, app: &mut App) {
                 Span::styled(
                     truncate(
                         &path.display().to_string(),
-                        chunks[0].width.saturating_sub(8) as usize,
+                        list_area.width.saturating_sub(8) as usize,
                     ),
                     Style::default().fg(Color::White),
                 ),
@@ -751,19 +797,7 @@ fn draw_reclaim_paths(f: &mut Frame, app: &mut App) {
             ListItem::new(Line::from(spans))
         })
         .collect();
-
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
-    let mut state = ListState::default();
-    state.select(Some(selected.saturating_sub(offset)));
-    f.render_stateful_widget(list, chunks[0], &mut state);
-
-    let footer = Paragraph::new(vec![
+    let footer = vec![
         Line::from(vec![
             Span::styled(
                 format!(
@@ -779,17 +813,20 @@ fn draw_reclaim_paths(f: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
-        Line::from("f/enter: reveal  ·  O: open  ·  d: trash  ·  esc: close"),
-    ]);
-    f.render_widget(footer, chunks[1]);
+        Line::from(MODAL_LIST_HINT),
+    ];
+    render_modal_list(
+        f,
+        list_area,
+        footer_area,
+        items,
+        selected.saturating_sub(offset),
+        footer,
+    );
 }
 
 fn draw_top_files(f: &mut Frame, app: &mut App) {
-    let area = centered_rect(70, 70, 74, 20, f.area());
-    f.render_widget(Clear, area);
-
     if app.top_files_loading() {
-        let block = Block::default().borders(Borders::ALL).title(" top files ");
         let mut lines = vec![
             Line::from(""),
             Line::from(vec![
@@ -803,10 +840,7 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
         if let Some(path) = app.top_files_path() {
             lines.push(Line::from(format!("path: {}", path.display())));
         }
-        let body = Paragraph::new(lines)
-            .block(block)
-            .alignment(Alignment::Center);
-        f.render_widget(body, area);
+        draw_modal_message(f, " top files ", lines);
         return;
     }
 
@@ -817,11 +851,7 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
         } else {
             "no scan in progress"
         };
-        let block = Block::default().borders(Borders::ALL).title(" top files ");
-        let body = Paragraph::new(message)
-            .block(block)
-            .alignment(Alignment::Center);
-        f.render_widget(body, area);
+        draw_modal_message(f, " top files ", vec![Line::from(message)]);
         return;
     }
 
@@ -829,27 +859,14 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
         .top_files_path()
         .map(|path| format!(" top files · {} ", path.display()))
         .unwrap_or_else(|| String::from(" top files "));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    if inner.height == 0 || inner.width == 0 {
+    let Some((list_area, footer_area)) = modal_list_regions(f, &title) else {
         return;
-    }
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
-        .split(inner);
-    let max_rows = chunks[0].height.max(1) as usize;
+    };
+    let max_rows = list_area.height.max(1) as usize;
     let (offset, end) = app.top_files_window_bounds(max_rows);
     let selected = app.top_files_selected();
-
-    let scan = match app.top_files_scan() {
-        Some(scan) => scan,
-        None => return,
+    let Some(scan) = app.top_files_scan() else {
+        return;
     };
     let items: Vec<ListItem> = scan
         .largest_files
@@ -858,20 +875,6 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
         .skip(offset)
         .take(end.saturating_sub(offset))
         .map(|(idx, file)| {
-            let mut spans = vec![
-                Span::styled(
-                    format!("{:>2}. ", idx + 1),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    truncate(
-                        &file.path.display().to_string(),
-                        chunks[0].width.saturating_sub(34) as usize,
-                    ),
-                    Style::default().fg(Color::White),
-                ),
-            ];
-            spans.push(Span::raw("  "));
             let size = if file.size.allocated == file.size.logical {
                 human(file.size.allocated)
             } else {
@@ -881,25 +884,23 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
                     human(file.size.logical)
                 )
             };
-            spans.push(Span::styled(
-                format!("{size:>20}"),
-                Style::default().fg(Color::Green),
-            ));
-            ListItem::new(Line::from(spans))
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:>2}. ", idx + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    truncate(
+                        &file.path.display().to_string(),
+                        list_area.width.saturating_sub(34) as usize,
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+                Span::raw("  "),
+                Span::styled(format!("{size:>20}"), Style::default().fg(Color::Green)),
+            ]))
         })
         .collect();
-
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
-    let mut state = ListState::default();
-    state.select(Some(selected.saturating_sub(offset)));
-    f.render_stateful_widget(list, chunks[0], &mut state);
-
     let total = if scan.size.allocated == scan.size.logical {
         human(scan.size.allocated)
     } else {
@@ -917,9 +918,16 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
-        Line::from("f/enter: reveal  ·  O: open  ·  d: trash  ·  esc: close"),
+        Line::from(MODAL_LIST_HINT),
     ];
-    f.render_widget(Paragraph::new(footer), chunks[1]);
+    render_modal_list(
+        f,
+        list_area,
+        footer_area,
+        items,
+        selected.saturating_sub(offset),
+        footer,
+    );
 }
 
 fn draw_disk_info_modal(f: &mut Frame, app: &App) {

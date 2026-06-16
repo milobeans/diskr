@@ -20,6 +20,8 @@ All notable changes to diskr are documented here. The format follows
 
 ### Changed
 
+- The top-files and reclaim-paths overlays now share one list-modal component,
+  so they have identical placement, chrome, and footer conventions.
 - The side column now collapses to a compact one-line-per-disk summary while
   browsing files, giving the files pane the reclaimed width, and expands back to
   full disk gauges when the Disks or Packages pane is focused or packages load.
