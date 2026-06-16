@@ -6,6 +6,12 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The disk-info, file-info, package-detail, and project-deps detail modals now
+  share one centered placement and chrome, so they open at a consistent size
+  with consistent wrapping instead of four slightly different dimensions.
+
 ## [0.1.66] - 2026-06-15
 
 ### Added

@@ -930,34 +930,68 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
     );
 }
 
-fn draw_disk_info_modal(f: &mut Frame, app: &App) {
-    let area = centered_rect(65, 62, 60, 18, f.area());
+/// Standard centered placement for the record-like detail modals (disk, file,
+/// package, project-deps info). Clears a consistently-sized area and returns it,
+/// so the four modals share one placement instead of each rolling its own
+/// dimensions (issue #93).
+fn detail_modal_area(f: &mut Frame) -> Rect {
+    let area = centered_rect(78, 70, 64, 20, f.area());
     f.render_widget(Clear, area);
+    area
+}
+
+/// Render a record modal's bordered, wrapped detail block of `lines` into a
+/// [`detail_modal_area`] region with the shared chrome.
+fn render_detail_modal(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    border: Color,
+    lines: Vec<Line<'_>>,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string())
+        .border_style(Style::default().fg(border));
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_disk_info_modal(f: &mut Frame, app: &App) {
+    let area = detail_modal_area(f);
 
     if app.disk_info_loading() {
-        let block = Block::default().borders(Borders::ALL).title(" disk info ");
-        let body = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    format!("{} ", spinner_char()),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled("loading disk details…", Style::default().fg(Color::White)),
-            ]),
-        ])
-        .block(block)
-        .alignment(Alignment::Center);
-        f.render_widget(body, area);
+        render_detail_modal(
+            f,
+            area,
+            " disk info ",
+            Color::DarkGray,
+            vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        format!("{} ", spinner_char()),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled("loading disk details…", Style::default().fg(Color::White)),
+                ]),
+            ],
+        );
         return;
     }
 
     let Some(report) = app.disk_info_report.as_ref() else {
-        let block = Block::default().borders(Borders::ALL).title(" disk info ");
-        let body = Paragraph::new("no disk details available")
-            .block(block)
-            .alignment(Alignment::Center);
-        f.render_widget(body, area);
+        render_detail_modal(
+            f,
+            area,
+            " disk info ",
+            Color::DarkGray,
+            vec![Line::from("no disk details available")],
+        );
         return;
     };
 
@@ -1048,10 +1082,7 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from("esc closes this panel"));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" disk details ");
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    render_detail_modal(f, area, " disk details ", Color::DarkGray, lines);
 }
 
 fn draw_file_info(f: &mut Frame, app: &App) {
@@ -1059,8 +1090,7 @@ fn draw_file_info(f: &mut Frame, app: &App) {
         return;
     };
 
-    let area = centered_rect(78, 70, 64, 20, f.area());
-    f.render_widget(Clear, area);
+    let area = detail_modal_area(f);
 
     let mut lines = Vec::new();
     lines.push(Line::from(""));
@@ -1219,16 +1249,7 @@ fn draw_file_info(f: &mut Frame, app: &App) {
         Span::styled(" close", Style::default().fg(Color::Gray)),
     ]));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" file info ")
-        .border_style(Style::default().fg(Color::Cyan));
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    render_detail_modal(f, area, " file info ", Color::Cyan, lines);
 }
 
 fn info_path_line(
@@ -1879,8 +1900,7 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
         return;
     };
 
-    let area = centered_rect(75, 60, 50, 14, f.area());
-    f.render_widget(Clear, area);
+    let area = detail_modal_area(f);
 
     let mut lines = Vec::new();
     lines.push(Line::from(""));
@@ -2044,11 +2064,7 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
         Span::styled(" close", Style::default().fg(Color::Gray)),
     ]));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" package info ")
-        .border_style(Style::default().fg(Color::Cyan));
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    render_detail_modal(f, area, " package info ", Color::Cyan, lines);
 }
 
 fn draw_project_dep_detail(f: &mut Frame, app: &App) {
@@ -2056,8 +2072,7 @@ fn draw_project_dep_detail(f: &mut Frame, app: &App) {
         return;
     };
 
-    let area = centered_rect(75, 60, 50, 12, f.area());
-    f.render_widget(Clear, area);
+    let area = detail_modal_area(f);
 
     let mut lines = Vec::new();
     lines.push(Line::from(""));
@@ -2122,11 +2137,7 @@ fn draw_project_dep_detail(f: &mut Frame, app: &App) {
         Span::styled(" close", Style::default().fg(Color::Gray)),
     ]));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" project deps ")
-        .border_style(Style::default().fg(Color::Cyan));
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    render_detail_modal(f, area, " project deps ", Color::Cyan, lines);
 }
 
 fn centered_rect(px: u16, py: u16, min_width: u16, min_height: u16, area: Rect) -> Rect {
