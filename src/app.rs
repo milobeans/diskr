@@ -396,6 +396,9 @@ pub struct App {
     marked: HashSet<PathBuf>,
     size_cache: HashMap<PathBuf, SizeInfo>,
     inaccessible_cache: HashMap<PathBuf, u32>,
+    /// `$HOME`, captured once so the files pane can classify fixed-cache rows
+    /// (issue #74) without re-reading the environment per frame.
+    pub home: Option<PathBuf>,
     /// True when TCC blocks reads under ~/Library (no Full Disk Access);
     /// scans there will undercount, so the header shows a persistent hint.
     pub fda_limited: bool,
@@ -597,6 +600,7 @@ impl App {
             stale_size_cache,
             size_cache_dirty,
             last_size_cache_save: Instant::now(),
+            home: std::env::var_os("HOME").map(PathBuf::from),
             fda_limited: false,
             entry_index: HashMap::new(),
             cached_flat_packages: Vec::new(),

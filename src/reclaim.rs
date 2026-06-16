@@ -228,6 +228,33 @@ pub fn report(root: &Path) -> ReclaimReport {
     report_with_home(root, home.as_deref())
 }
 
+/// Classify a file-browser row purely by its name and path, reusing the same
+/// artifact-name and fixed-cache rules the reclaim report uses, so the engine's
+/// knowledge surfaces on the main surface and not only inside the Reclaim
+/// overlay. Name/path comparison only — no I/O on the render path. Returns the
+/// reclaimability class so the caller can render a colored chip.
+pub fn classify_by_name_path(
+    name: &str,
+    path: &Path,
+    home: Option<&Path>,
+) -> Option<Reclaimability> {
+    for (artifact, class, _note) in ARTIFACTS {
+        if name == *artifact {
+            return Some(*class);
+        }
+    }
+    if let Some(home) = home {
+        for category in FIXED_CATEGORIES {
+            for rel in category.paths {
+                if path == home.join(rel) {
+                    return Some(category.class);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Same as [`report`], but with an explicit home directory (used in tests).
 pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -437,6 +464,34 @@ fn should_descend(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn classify_matches_artifacts_and_fixed_caches() {
+        // Artifact directory names match by name regardless of path/home.
+        assert_eq!(
+            classify_by_name_path("node_modules", Path::new("/x/node_modules"), None),
+            Some(Reclaimability::Regenerable)
+        );
+        assert_eq!(
+            classify_by_name_path("__pycache__", Path::new("/x/__pycache__"), None),
+            Some(Reclaimability::Safe)
+        );
+        // A fixed cache only matches when the path equals a home-relative root.
+        let home = Path::new("/Users/example");
+        assert_eq!(
+            classify_by_name_path("Caches", &home.join("Library/Caches"), Some(home)),
+            Some(Reclaimability::Safe)
+        );
+        assert_eq!(
+            classify_by_name_path("Caches", Path::new("/elsewhere/Caches"), Some(home)),
+            None
+        );
+        // Ordinary directories are not classified.
+        assert_eq!(
+            classify_by_name_path("src", Path::new("/x/src"), Some(home)),
+            None
+        );
+    }
 
     fn class_for(report: &ReclaimReport, label: &str) -> Option<Reclaimability> {
         report

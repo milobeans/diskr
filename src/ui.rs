@@ -321,6 +321,18 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                     spans.push(Span::styled(badge, badge_style));
                 }
             }
+            // Reclaim class chip for rows the reclaim engine recognizes
+            // (node_modules, target, ~/Library/Caches, …) — name/path only,
+            // no I/O on the render path.
+            if let Some(class) =
+                crate::reclaim::classify_by_name_path(&e.name, &e.path, app.home.as_deref())
+            {
+                let (chip, chip_color) = reclaim_chip(class);
+                spans.push(Span::styled(
+                    format!(" [{chip}]"),
+                    Style::default().fg(chip_color),
+                ));
+            }
             let line = Line::from(spans);
             ListItem::new(line)
         })
@@ -2558,6 +2570,16 @@ fn files_pane_title(app: &App, visible_count: usize, total_size: u64, sized: usi
         }
     }
     title
+}
+
+/// Chip text and color for a reclaim classification: safe caches are green,
+/// regenerable build output amber, risky-to-delete red.
+fn reclaim_chip(class: Reclaimability) -> (&'static str, Color) {
+    match class {
+        Reclaimability::Safe => ("cache", Color::Green),
+        Reclaimability::Regenerable => ("build", Color::Yellow),
+        Reclaimability::Risky => ("keep", Color::Red),
+    }
 }
 
 /// Color sizes by magnitude so the eye lands on the big directories: dim for

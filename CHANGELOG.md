@@ -8,6 +8,10 @@ All notable changes to diskr are documented here. The format follows
 
 ### Added
 
+- The file browser now tags directories the reclaim engine recognizes
+  (`node_modules`, `target`, `.venv`, `__pycache__`, `~/Library/Caches`, …) with
+  a colored class chip (`cache`/`build`/`keep`), surfacing reclaim knowledge on
+  the main surface — name/path matching only, with no extra I/O while rendering.
 - A growth sort mode (in the `o` sort cycle) and a per-row `↑`/`↓` badge showing
   how much a directory changed since its previous scan, so revalidation surfaces
   what actually grew instead of the same familiar top-N.
