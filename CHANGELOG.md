@@ -22,6 +22,10 @@ All notable changes to diskr are documented here. The format follows
 
 ### Fixed
 
+- Background history-diff and top-files scans now stop early when they are
+  superseded or closed — navigating between baselined directories, or pressing
+  Esc on the top-files modal — instead of running a full directory walk to
+  completion only to discard the result, so redundant walks no longer pile up.
 - Moving the cursor onto an unsized directory while a scan is running no longer
   cancels the in-flight batch: such directories are queued and scanned once the
   batch finishes, so spinners and progress are not wiped out by a premature

@@ -7,7 +7,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -422,6 +424,9 @@ pub struct App {
     top_files_open: bool,
     top_files_loading: bool,
     top_files_scan_id: ScanId,
+    /// Cancellation generation for the background top-files walk; bumped when
+    /// the modal closes or a new scan supersedes the current one.
+    top_files_generation: Arc<AtomicU64>,
     top_files_scan_rx: Option<Receiver<TopFilesMsg>>,
     top_files_scan: Option<DirScan>,
     top_files_path: Option<PathBuf>,
@@ -442,6 +447,9 @@ pub struct App {
     history_records: HashMap<PathBuf, history::ScanRecord>,
     active_history_request_id: u64,
     history_loading: bool,
+    /// Cancellation generation for the background history-diff walk; bumped to
+    /// stop a walk for a directory the user has navigated away from.
+    history_generation: Arc<AtomicU64>,
     history_rx: Option<Receiver<HistoryMsg>>,
     #[cfg(test)]
     history_store_path: Option<PathBuf>,
@@ -606,6 +614,7 @@ impl App {
             top_files_open: false,
             top_files_loading: false,
             top_files_scan_id: 0,
+            top_files_generation: Arc::new(AtomicU64::new(0)),
             top_files_scan_rx: None,
             top_files_scan: None,
             top_files_path: None,
@@ -624,6 +633,7 @@ impl App {
             history_records,
             active_history_request_id: 0,
             history_loading: false,
+            history_generation: Arc::new(AtomicU64::new(0)),
             history_rx: None,
             #[cfg(test)]
             history_store_path: None,
@@ -667,6 +677,10 @@ impl App {
     }
 
     fn apply_history_baseline(&mut self, baseline: Option<history::ScanRecord>) {
+        // Stop any diff walk still running for the directory we are leaving, so
+        // navigating through baselined directories does not pile up workers.
+        self.history_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
         self.history_rx = None;
         self.history_loading = false;
         self.history_baseline = baseline;
@@ -1526,16 +1540,32 @@ impl App {
 
     fn start_history_diff_request(&mut self, cwd: PathBuf, baseline: history::ScanRecord) {
         let request_id = self.next_history_request_id();
+        let expected = self.history_generation.load(AtomicOrdering::Relaxed);
+        let cancellation =
+            bulkstat::ScanCancellation::new(Arc::clone(&self.history_generation), expected);
         let (tx, rx) = channel();
         self.history_rx = Some(rx);
         self.history_loading = true;
         thread::spawn(move || {
-            let result = history::diff_from_record(&baseline, &cwd).map_err(|err| err.to_string());
-            let _ = tx.send(HistoryMsg {
-                request_id,
-                cwd,
-                result: HistoryResult::Diff(result),
-            });
+            match history::diff_from_record_with_cancellation(&baseline, &cwd, &cancellation) {
+                // Cancelled mid-walk: a newer request now owns the loading state,
+                // so drop this result silently.
+                Ok(None) => {}
+                Ok(Some(diff)) => {
+                    let _ = tx.send(HistoryMsg {
+                        request_id,
+                        cwd,
+                        result: HistoryResult::Diff(Ok(diff)),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(HistoryMsg {
+                        request_id,
+                        cwd,
+                        result: HistoryResult::Diff(Err(err.to_string())),
+                    });
+                }
+            }
         });
     }
 
@@ -1837,6 +1867,9 @@ impl App {
     }
 
     pub fn close_top_files(&mut self) {
+        // Stop the background walk so it does not keep running after Esc.
+        self.top_files_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
         self.top_files_open = false;
         self.top_files_loading = false;
         self.top_files_scan = None;
@@ -1958,11 +1991,13 @@ impl App {
     }
 
     pub fn open_top_files_for_path(&mut self, path: PathBuf) {
-        if self.top_files_loading {
-            self.top_files_scan = None;
-            self.top_files_scan_rx = None;
-            self.top_files_loading = false;
-        }
+        // Cancel any walk still running for a previously-opened path, then take
+        // a fresh cancellation token for this one.
+        self.top_files_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        let expected = self.top_files_generation.load(AtomicOrdering::Relaxed);
+        let cancellation =
+            bulkstat::ScanCancellation::new(Arc::clone(&self.top_files_generation), expected);
         let scan_id = self.next_top_files_scan_id();
         let (tx, rx) = std::sync::mpsc::channel();
         self.top_files_path = Some(path.clone());
@@ -1975,12 +2010,15 @@ impl App {
         self.top_files_scan_rx = Some(rx);
 
         thread::spawn(move || {
-            let scan = bulkstat::scan_dir(&path, TOP_FILES_LIMIT);
-            let _ = tx.send(TopFilesMsg {
-                scan_id,
-                path,
-                scan,
-            });
+            if let Some(scan) =
+                bulkstat::scan_dir_with_cancellation(&path, TOP_FILES_LIMIT, &cancellation)
+            {
+                let _ = tx.send(TopFilesMsg {
+                    scan_id,
+                    path,
+                    scan,
+                });
+            }
         });
     }
 

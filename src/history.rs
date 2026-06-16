@@ -132,6 +132,22 @@ pub fn diff_from_record(baseline: &ScanRecord, path: &Path) -> Result<DiffReport
     Ok(diff_records(baseline, &current))
 }
 
+/// Like [`diff_from_record`], but the background scan aborts early when
+/// `cancellation` fires, returning `Ok(None)`. Used by the TUI so a diff worker
+/// for a directory the user already navigated away from stops walking instead
+/// of running to completion only to be discarded.
+pub fn diff_from_record_with_cancellation(
+    baseline: &ScanRecord,
+    path: &Path,
+    cancellation: &bulkstat::ScanCancellation,
+) -> Result<Option<DiffReport>> {
+    validate_dir(path)?;
+    let Some(current) = scan_record_with_cancellation(path, cancellation)? else {
+        return Ok(None);
+    };
+    Ok(Some(diff_records(baseline, &current)))
+}
+
 /// Pure diff of two scan records. `before`/`after` need not be sorted.
 pub fn diff_records(before: &ScanRecord, after: &ScanRecord) -> DiffReport {
     let mut changes: Vec<ChildChange> = Vec::new();
@@ -199,7 +215,25 @@ fn validate_dir(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn scan_record(path: &Path) -> Result<ScanRecord> {
+    let never = bulkstat::ScanCancellation::never();
+    // `never()` cannot fire, so the cancellable scan always yields `Some`.
+    Ok(
+        scan_record_with_cancellation(path, &never)?.unwrap_or_else(|| ScanRecord {
+            path: path.to_path_buf(),
+            timestamp: now_secs(),
+            children: Vec::new(),
+        }),
+    )
+}
+
+pub(crate) fn scan_record_with_cancellation(
+    path: &Path,
+    cancellation: &bulkstat::ScanCancellation,
+) -> Result<Option<ScanRecord>> {
     validate_dir(path)?;
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
     let canonical = path
         .canonicalize()
         .with_context(|| format!("resolve {}", path.display()))?;
@@ -207,6 +241,9 @@ pub(crate) fn scan_record(path: &Path) -> Result<ScanRecord> {
     let read =
         std::fs::read_dir(&canonical).with_context(|| format!("read {}", canonical.display()))?;
     for entry in read.flatten() {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let meta = match std::fs::symlink_metadata(entry.path()) {
             Ok(meta) => meta,
@@ -217,7 +254,10 @@ pub(crate) fn scan_record(path: &Path) -> Result<ScanRecord> {
             continue;
         }
         let (is_dir, size, inaccessible) = if file_type.is_dir() {
-            let scan = bulkstat::scan_dir(&entry.path(), 0);
+            let Some(scan) = bulkstat::scan_dir_with_cancellation(&entry.path(), 0, cancellation)
+            else {
+                return Ok(None);
+            };
             (true, scan.size, scan.inaccessible)
         } else if file_type.is_file() {
             use std::os::unix::fs::MetadataExt;
@@ -238,11 +278,11 @@ pub(crate) fn scan_record(path: &Path) -> Result<ScanRecord> {
     }
     children.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Ok(ScanRecord {
+    Ok(Some(ScanRecord {
         path: canonical,
         timestamp: now_secs(),
         children,
-    })
+    }))
 }
 
 fn now_secs() -> u64 {
@@ -505,6 +545,30 @@ mod tests {
         let json = record_to_json(&original);
         let restored = record_from_json(&original.path, &json);
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn cancelled_diff_returns_none_without_scanning() {
+        let dir = std::env::temp_dir().join(format!(
+            "diskr_history_cancel_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let baseline = ScanRecord {
+            path: dir.clone(),
+            timestamp: 0,
+            children: Vec::new(),
+        };
+        // A token whose generation has already moved past its expected value is
+        // cancelled, so the diff aborts without walking.
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+        let cancellation = bulkstat::ScanCancellation::new(generation, 1);
+
+        let result = diff_from_record_with_cancellation(&baseline, &dir, &cancellation).unwrap();
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
