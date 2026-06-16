@@ -36,13 +36,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_header(f, root[0], app);
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(root[1]);
-
     let packages_visible =
         app.focus == Focus::Packages || app.packages_loaded || app.packages_loading;
+    // Collapse the side column to a compact one-line-per-disk summary while
+    // browsing files, giving the files pane the reclaimed width. It expands
+    // back to full gauges when Disks/Packages is focused or packages load.
+    let side_expanded = app.focus == Focus::Disks || packages_visible;
+    let (files_pct, side_pct) = if side_expanded { (62, 38) } else { (74, 26) };
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(files_pct),
+            Constraint::Percentage(side_pct),
+        ])
+        .split(root[1]);
+
     let (disk_height, package_height) =
         side_panel_heights(body[1].height, app.disks.len(), packages_visible);
 
@@ -55,7 +63,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .split(body[1]);
 
     draw_files(f, body[0], app);
-    draw_disks(f, side[0], app);
+    draw_disks(f, side[0], app, side_expanded);
     draw_packages(f, side[1], app);
 
     draw_status(f, root[2], app);
@@ -377,7 +385,7 @@ fn file_window_bounds(
     (offset, end)
 }
 
-fn draw_disks(f: &mut Frame, area: Rect, app: &mut App) {
+fn draw_disks(f: &mut Frame, area: Rect, app: &mut App, expanded: bool) {
     app.disk_page_rows = 1;
     if area.height == 0 || area.width == 0 {
         return;
@@ -399,6 +407,23 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &mut App) {
             Paragraph::new("no disks detected").alignment(Alignment::Center),
             inner,
         );
+        return;
+    }
+    if !expanded {
+        // Collapsed: one compact line per disk so the side column stays out of
+        // the files pane's way while browsing.
+        let max_rows = inner.height.max(1) as usize;
+        app.disk_page_rows = max_rows;
+        let (offset, end) = disk_window_bounds(app.selected_disk, app.disks.len(), max_rows);
+        let lines: Vec<Line> = app.disks[offset..end]
+            .iter()
+            .enumerate()
+            .map(|(i, disk)| {
+                let selected = app.focus == Focus::Disks && offset + i == app.selected_disk;
+                compact_disk_line(disk, selected, inner.width as usize)
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
         return;
     }
     if inner.height < 4 {
@@ -2503,6 +2528,35 @@ fn disk_window_bounds(selected: usize, total_items: usize, max_rows: usize) -> (
     (offset, end)
 }
 
+/// One-line summary of a disk for the collapsed side column: volume, usage
+/// percent, and free space, colored by fullness and truncated to fit.
+fn compact_disk_line(disk: &crate::app::DiskInfo, selected: bool, width: usize) -> Line<'static> {
+    let used = disk.total.saturating_sub(disk.available);
+    let pct = if disk.total > 0 {
+        (used as f64 / disk.total as f64 * 100.0) as u16
+    } else {
+        0
+    };
+    let color = if pct > 90 {
+        Color::Red
+    } else if pct > 75 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    let marker = if selected { "▸ " } else { "  " };
+    let text = format!(
+        "{marker}{}  {pct}%  {} free",
+        volume_label(&disk.mount),
+        human(disk.available)
+    );
+    let mut style = Style::default().fg(color);
+    if selected {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    Line::from(Span::styled(truncate(&text, width), style))
+}
+
 fn disk_label(disk: &crate::app::DiskInfo) -> String {
     let volume = volume_label(&disk.mount);
     if disk.name.is_empty() {
@@ -3044,6 +3098,20 @@ mod tests {
         assert_eq!(disk_window_bounds(0, 12, 3), (0, 3));
         assert_eq!(disk_window_bounds(8, 12, 3), (7, 10));
         assert_eq!(disk_window_bounds(11, 12, 3), (9, 12));
+    }
+
+    #[test]
+    fn compact_disk_line_truncates_to_width() {
+        let disk = crate::app::DiskInfo {
+            name: String::new(),
+            mount: std::path::PathBuf::from("/Volumes/Data"),
+            total: 1000,
+            available: 280,
+        };
+        let line = compact_disk_line(&disk, false, 18);
+        assert!(line.width() <= 18, "compact disk line overflowed: {line:?}");
+        let selected = compact_disk_line(&disk, true, 40);
+        assert!(selected.width() <= 40);
     }
 
     #[test]

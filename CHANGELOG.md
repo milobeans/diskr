@@ -20,6 +20,9 @@ All notable changes to diskr are documented here. The format follows
 
 ### Changed
 
+- The side column now collapses to a compact one-line-per-disk summary while
+  browsing files, giving the files pane the reclaimed width, and expands back to
+  full disk gauges when the Disks or Packages pane is focused or packages load.
 - Files-pane density pass: the pane title now summarizes item count, total size,
   scan coverage, the active sort, and any marked-items total; sizes are colored
   by magnitude (dim sub-MiB, green MiB, bold amber GiB+); the modified column
