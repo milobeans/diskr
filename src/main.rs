@@ -1,6 +1,7 @@
 mod app;
 mod bulkstat;
 mod fs_ops;
+mod fsevents;
 mod history;
 mod keymap;
 mod packages;

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::bulkstat::{self, DirScan, SizeInfo};
 use crate::packages::{self, DepGraph, ManagerReport, ProjectDeps};
 use crate::scanner::{ScanId, ScanMsg, Scanner};
-use crate::{history, reclaim, space, state};
+use crate::{fsevents, history, reclaim, space, state};
 
 const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
 const SIZE_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
@@ -526,6 +526,15 @@ impl App {
         );
         let mut size_cache_dirty = false;
         let (history_records, history_warning) = history::load_records_with_warning();
+        // Ask FSEvents which directories actually changed since the last launch;
+        // unchanged trees keep their cached size fresh instead of all being
+        // revalidated by #82's age-based pass. Skipped under test, which must
+        // not touch the real FSEvents sidecar or depend on event history.
+        let freshness = if cfg!(test) {
+            fsevents::Freshness::All
+        } else {
+            fsevents::plan_freshness(&cwd)
+        };
         let cache_warning = match state::load_size_cache() {
             Ok(mut entries) => {
                 if entries.len() > state::SIZE_CACHE_MAX_ENTRIES {
@@ -542,7 +551,9 @@ impl App {
                         inaccessible_cache.insert(entry.path.clone(), entry.inaccessible);
                     }
                     cache_age.insert(entry.path.clone(), entry.scanned_at);
-                    stale_size_cache.insert(entry.path.clone());
+                    if freshness.is_stale(&entry.path) {
+                        stale_size_cache.insert(entry.path.clone());
+                    }
                     size_cache.insert(entry.path, entry.size);
                 }
                 None

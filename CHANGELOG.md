@@ -6,6 +6,15 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- On launch, diskr now consults macOS FSEvents to learn which directories
+  changed since the previous session and revalidates only those, so unchanged
+  directory trees keep their cached sizes with no rescan. The last event id and
+  volume UUID are persisted next to the size cache; the replay falls back to the
+  age-based revalidation on first run, a different or reformatted volume, or
+  dropped/coalesced events.
+
 ## [0.1.65] - 2026-06-15
 
 ### Added
