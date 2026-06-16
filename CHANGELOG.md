@@ -6,6 +6,8 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.66] - 2026-06-15
+
 ### Added
 
 - On launch, diskr now consults macOS FSEvents to learn which directories
