@@ -6,6 +6,8 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.65] - 2026-06-15
+
 ### Added
 
 - The file browser now tags directories the reclaim engine recognizes
