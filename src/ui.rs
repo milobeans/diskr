@@ -226,7 +226,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|e| {
             let (size_str, size_style) = match (e.is_dir, e.size, e.scanning) {
                 (true, _, true) => (
-                    format!("{} scanning…", spinner_char()),
+                    format!("{} scanning…", scan_frame()),
                     Style::default().fg(Color::Cyan),
                 ),
                 (true, Some(size), _) => (
@@ -500,7 +500,7 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
             Line::from(""),
             Line::from(vec![
                 Span::styled(
-                    format!("{} ", spinner_char()),
+                    format!("{} ", scan_frame()),
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::styled(
@@ -831,7 +831,7 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
             Line::from(""),
             Line::from(vec![
                 Span::styled(
-                    format!("{} ", spinner_char()),
+                    format!("{} ", scan_frame()),
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::styled("scanning top files…", Style::default().fg(Color::White)),
@@ -974,7 +974,7 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
                 Line::from(""),
                 Line::from(vec![
                     Span::styled(
-                        format!("{} ", spinner_char()),
+                        format!("{} ", scan_frame()),
                         Style::default().fg(Color::Cyan),
                     ),
                     Span::styled("loading disk details…", Style::default().fg(Color::White)),
@@ -1404,7 +1404,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 let message = Line::from(vec![
                     Span::styled(
-                        format!("{} ", spinner_char()),
+                        format!("{} ", scan_frame()),
                         Style::default().fg(Color::Cyan),
                     ),
                     Span::styled("scanning…", Style::default().fg(Color::White)),
@@ -2020,7 +2020,7 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
             if app.deps_loading {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("  {} ", spinner_char()),
+                        format!("  {} ", scan_frame()),
                         Style::default().fg(Color::Cyan),
                     ),
                     Span::styled(
@@ -2264,7 +2264,7 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
         Focus::Files => match app.visible_entry(app.selected) {
             Some(entry) if entry.is_dir && entry.scanning => {
                 spans.push(Span::styled(
-                    format!("{} ", spinner_char()),
+                    format!("{} ", scan_frame()),
                     Style::default().fg(Color::Cyan),
                 ));
                 spans.push(Span::styled("dir ", Style::default().fg(Color::DarkGray)));
@@ -2428,7 +2428,7 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
         Focus::Packages => {
             if app.packages_loading {
                 spans.push(Span::styled(
-                    format!("{} ", spinner_char()),
+                    format!("{} ", scan_frame()),
                     Style::default().fg(Color::Cyan),
                 ));
                 spans.push(Span::styled(
@@ -3005,6 +3005,26 @@ mod tests {
     }
 
     #[test]
+    fn scan_frame_holds_then_advances_and_wraps() {
+        // Each frame holds for one interval, advances at the boundary, and the
+        // ten-frame beam wraps back to the first frame.
+        assert_eq!(scan_frame_at(0), SCAN_FRAMES[0]);
+        assert_eq!(scan_frame_at(SCAN_FRAME_MS - 1), SCAN_FRAMES[0]);
+        assert_eq!(scan_frame_at(SCAN_FRAME_MS), SCAN_FRAMES[1]);
+        assert_eq!(scan_frame_at(SCAN_FRAME_MS * 9), SCAN_FRAMES[9]);
+        assert_eq!(scan_frame_at(SCAN_FRAME_MS * 10), SCAN_FRAMES[0]);
+    }
+
+    #[test]
+    fn scan_frames_are_four_columns_wide() {
+        // Every frame must be exactly four display columns so it can prefix a
+        // label (or fill the size cell) without shifting alignment.
+        for frame in SCAN_FRAMES {
+            assert_eq!(display_width(frame), 4, "frame {frame:?} is not 4 columns");
+        }
+    }
+
+    #[test]
     fn reclaim_panel_layout_keeps_detail_below_list() {
         let area = Rect::new(15, 4, 70, 28);
         let (list, detail) = reclaim_panel_layout(area);
@@ -3166,14 +3186,39 @@ fn rounded_percent(value: u64, total: u64) -> u64 {
         .min(100)
 }
 
-fn spinner_char() -> char {
-    let spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Frames of the "scan" spinner preset from the rattles spinner library
+/// (github.com/vyfor/rattles, dual MIT/Apache-2.0): a four-cell braille beam
+/// that sweeps left to right. Each frame is exactly four display columns wide
+/// (braille blanks, U+2800, are one column each), so a frame stands in for a
+/// short label prefix without disturbing column alignment.
+const SCAN_FRAMES: [&str; 10] = [
+    "⠀⠀⠀⠀",
+    "⡇⠀⠀⠀",
+    "⣿⠀⠀⠀",
+    "⢸⡇⠀⠀",
+    "⠀⣿⠀⠀",
+    "⠀⢸⡇⠀",
+    "⠀⠀⣿⠀",
+    "⠀⠀⢸⡇",
+    "⠀⠀⠀⣿",
+    "⠀⠀⠀⢸",
+];
+
+/// Milliseconds per scan-spinner frame, matching the rattles "scan" preset.
+const SCAN_FRAME_MS: u128 = 70;
+
+/// Pick the scan-spinner frame for an elapsed-millisecond clock value. Kept
+/// pure so the cadence and frame order can be tested without the wall clock.
+fn scan_frame_at(ms: u128) -> &'static str {
+    SCAN_FRAMES[((ms / SCAN_FRAME_MS) % SCAN_FRAMES.len() as u128) as usize]
+}
+
+fn scan_frame() -> &'static str {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let index = ((ms / 60) % spinners.len() as u128) as usize;
-    spinners[index]
+    scan_frame_at(ms)
 }
 
 fn big_spinner_char() -> char {

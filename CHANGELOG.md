@@ -6,6 +6,15 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The in-progress scanning indicator is now a four-cell braille "beam" that
+  sweeps left to right (the "scan" preset from the rattles spinner library) in
+  place of the single spinning braille dot. It appears wherever a scan or load
+  is running: the files-pane size cell, the reclaim, top-files, disk-info,
+  package, and dependency loading labels, and the per-selection status line. The
+  larger centered package-data splash spinner is unchanged.
+
 ## [0.1.67] - 2026-06-15
 
 ### Changed
