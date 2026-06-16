@@ -6,6 +6,8 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.69] - 2026-06-15
+
 ### Removed
 
 - Removed the `Space` / Quick Look preview action, which added little over
