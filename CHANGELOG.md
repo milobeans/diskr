@@ -6,6 +6,8 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.67] - 2026-06-15
+
 ### Changed
 
 - The disk-info, file-info, package-detail, and project-deps detail modals now
