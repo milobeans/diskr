@@ -571,7 +571,7 @@ impl App {
             sort: SortMode::SizeDesc,
             focus: Focus::Files,
             disks: Vec::new(),
-            status: String::from("i info · Space preview · f Finder · O open"),
+            status: String::from("i info · f Finder · O open"),
             show_help: false,
             confirming_delete: false,
             pkg_reports: Vec::new(),
@@ -1777,7 +1777,7 @@ impl App {
         // With the paths modal open, target its selected path; once it closes,
         // the modal's finding/path indices are stale, so fall back to the
         // currently highlighted finding's first path. Otherwise the status line
-        // and Space/f/O/y/s actions keep referencing a path from a
+        // and the f/O/y/s actions keep referencing a path from a
         // previously-opened finding.
         let (finding_index, path_index) = if self.reclaim_paths_open {
             (self.reclaim_paths_finding, self.reclaim_paths_selected)

@@ -6,6 +6,12 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the `Space` / Quick Look preview action, which added little over
+  revealing the file. Reveal in Finder (`f`) — now also shown in the footer —
+  Open (`O`), copy path (`y`), and open in Terminal (`s`) are unchanged.
+
 ## [0.1.68] - 2026-06-15
 
 ### Changed

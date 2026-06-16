@@ -182,17 +182,12 @@ const FILES: &[KeyBinding] = &[
 
 const EXTERNAL_ACTIONS: &[KeyBinding] = &[
     KeyBinding {
-        key: "Space",
-        action: "Quick Look selected item",
-        footer: Some(FooterBinding {
-            key: "Space",
-            action: "preview",
-        }),
-    },
-    KeyBinding {
         key: "f",
         action: "Reveal selected item in Finder",
-        footer: None,
+        footer: Some(FooterBinding {
+            key: "f",
+            action: "finder",
+        }),
     },
     KeyBinding {
         key: "O",

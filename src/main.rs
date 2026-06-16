@@ -875,7 +875,6 @@ fn thin_snapshots(path: PathBuf, bytes: u64, confirmed: bool) -> Result<()> {
 
 #[derive(Clone, Copy)]
 enum ExternalAction {
-    QuickLook,
     RevealInFinder,
     Open,
 }
@@ -883,7 +882,6 @@ enum ExternalAction {
 impl ExternalAction {
     fn status_label(self) -> &'static str {
         match self {
-            ExternalAction::QuickLook => "quick look",
             ExternalAction::RevealInFinder => "reveal in Finder",
             ExternalAction::Open => "open",
         }
@@ -897,7 +895,6 @@ fn launch_external_action(app: &mut App, action: ExternalAction) {
     };
 
     let result = match action {
-        ExternalAction::QuickLook => spawn_quick_look(&path),
         ExternalAction::RevealInFinder => spawn_reveal_in_finder(&path),
         ExternalAction::Open => spawn_open(&path),
     };
@@ -945,12 +942,6 @@ fn selected_action_target(app: &App) -> Option<(PathBuf, String)> {
         }
         Focus::Reclaim => app.selected_reclaim_path().map(|(name, path)| (path, name)),
     }
-}
-
-fn spawn_quick_look(path: &Path) -> Result<()> {
-    let mut command = Command::new("qlmanage");
-    command.arg("-p").arg(path);
-    spawn_detached(&mut command)
 }
 
 fn spawn_reveal_in_finder(path: &Path) -> Result<()> {
@@ -1282,11 +1273,6 @@ where
                                 app.close_file_info();
                                 true
                             }
-                            KeyCode::Char(' ') => {
-                                app.close_file_info();
-                                launch_external_action(app, ExternalAction::QuickLook);
-                                true
-                            }
                             KeyCode::Char('f') => {
                                 app.close_file_info();
                                 launch_external_action(app, ExternalAction::RevealInFinder);
@@ -1441,10 +1427,6 @@ where
                         }
                         KeyCode::Backspace => {
                             app.go_up()?;
-                            true
-                        }
-                        KeyCode::Char(' ') => {
-                            launch_external_action(app, ExternalAction::QuickLook);
                             true
                         }
                         KeyCode::Char('f') => {

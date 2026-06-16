@@ -1209,15 +1209,7 @@ fn draw_file_info(f: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled(
-            "  Space",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" Quick Look", Style::default().fg(Color::Gray)),
-        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "f",
+            "  f",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
