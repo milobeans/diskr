@@ -115,21 +115,20 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         &app.cwd.display().to_string(),
         area.width.saturating_sub(30) as usize,
     );
+    // Only surface non-default state in the header (the sort mode lives in the
+    // files-pane title, and "hidden off" is the default). This keeps the line
+    // about the location, not about settings that rarely change.
     let mut spans = vec![
         Span::styled("diskr", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" · "),
         Span::styled(path, Style::default().fg(Color::Cyan)),
-        Span::raw(" · "),
-        Span::styled(
-            format!("sort {}", app.sort.label()),
-            Style::default().fg(Color::Gray),
-        ),
-        Span::raw(" · "),
-        Span::styled(
-            format!("hidden {}", if app.show_hidden { "on" } else { "off" }),
-            Style::default().fg(Color::Gray),
-        ),
     ];
+    if app.show_hidden {
+        spans.push(Span::styled(
+            " · hidden on",
+            Style::default().fg(Color::Gray),
+        ));
+    }
     if let Some(baseline) = app.history_baseline_status() {
         spans.push(Span::styled(
             format!(" · {baseline}"),
@@ -159,29 +158,29 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Color::DarkGray
     };
-    let show_modified = app.sort == SortMode::Modified;
+    // Show the modified column when sorting by mtime, or whenever the pane is
+    // wide enough to spare the room.
+    const MODIFIED_AUTO_WIDTH: u16 = 100;
+    let show_modified = app.sort == SortMode::Modified || area.width >= MODIFIED_AUTO_WIDTH;
     let (name_width, size_width, modified_width, bar_width) =
         file_columns(area.width.saturating_sub(2), show_modified);
     let visible_count = app.visible_entry_count();
-    let title = if app.search_filter_active() {
-        format!("files ({visible_count}/{})", app.entries.len())
-    } else {
-        format!("files ({})", app.entries.len())
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(border_color));
     if visible_count == 0 {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("files · 0 items")
+            .border_style(Style::default().fg(border_color));
         let message = if app.entries.is_empty() {
             "empty directory"
         } else {
             "no matching entries"
         };
-        let empty = Paragraph::new(message)
-            .block(block)
-            .alignment(Alignment::Center);
-        f.render_widget(empty, area);
+        f.render_widget(
+            Paragraph::new(message)
+                .block(block)
+                .alignment(Alignment::Center),
+            area,
+        );
         return;
     }
     let max_rows = area.height.saturating_sub(2).max(1) as usize;
@@ -197,6 +196,19 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
         .filter_map(|i| app.visible_entry(i))
         .filter_map(|entry| entry.size.map(size_sort_key))
         .sum();
+    let sized_count = (0..visible_count)
+        .filter_map(|i| app.visible_entry(i))
+        .filter(|entry| entry.size.is_some())
+        .count();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(files_pane_title(
+            app,
+            visible_count,
+            total_visible_size,
+            sized_count,
+        ))
+        .border_style(Style::default().fg(border_color));
     let visible_entries: Vec<&crate::app::Entry> = (offset..end)
         .filter_map(|visible_index| app.visible_entry(visible_index))
         .collect();
@@ -219,31 +231,45 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                     if e.size_stale {
                         Style::default().fg(Color::DarkGray)
                     } else {
-                        Style::default().fg(Color::Green)
+                        size_magnitude_style(size_sort_key(size))
                     },
                 ),
                 (true, None, _) => (String::from("—"), Style::default().fg(Color::DarkGray)),
                 (false, Some(size), _) if e.is_symlink => (
                     human(size_sort_key(size)),
-                    Style::default().fg(Color::Green),
+                    size_magnitude_style(size_sort_key(size)),
                 ),
                 (false, None, _) if e.is_symlink => {
                     (String::from("link"), Style::default().fg(Color::DarkGray))
                 }
                 (false, Some(size), _) => (
                     human(size_sort_key(size)),
-                    Style::default().fg(Color::Green),
+                    size_magnitude_style(size_sort_key(size)),
                 ),
                 (false, None, _) => (String::from("?"), Style::default().fg(Color::DarkGray)),
             };
-            let icon = if app.is_marked(&e.path) {
-                "✓ "
+            // Marked rows keep their type glyph next to the check so the icon
+            // column still tells files from directories.
+            let marked = app.is_marked(&e.path);
+            let icon = if marked {
+                if e.is_dir {
+                    "✓▸"
+                } else if e.is_symlink {
+                    "✓↪"
+                } else {
+                    "✓ "
+                }
             } else if e.is_dir {
                 "▸ "
             } else if e.is_symlink {
                 "↪ "
             } else {
                 "  "
+            };
+            let icon_style = if marked {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
             };
             let name_style = if e.is_dir {
                 Style::default()
@@ -253,7 +279,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default()
             };
             let mut spans = vec![
-                Span::styled(icon, Style::default().fg(Color::DarkGray)),
+                Span::styled(icon, icon_style),
                 Span::styled(pad_truncated(&e.name, name_width), name_style),
             ];
             let (bar_text, bar_percent, bar_style) = file_size_bar(
@@ -288,6 +314,12 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                     format!("{modified:>modified_width$}"),
                     Style::default().fg(Color::DarkGray),
                 ));
+            }
+            // Growth badge for directories that changed since their last scan.
+            if !e.scanning {
+                if let Some((badge, badge_style)) = e.size_delta.and_then(growth_badge) {
+                    spans.push(Span::styled(badge, badge_style));
+                }
             }
             let line = Line::from(spans);
             ListItem::new(line)
@@ -1621,17 +1653,40 @@ fn draw_help_overlay(f: &mut Frame) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if inner.width >= 76 {
+    // Reserve the bottom row for the size-marker legend, which is otherwise
+    // undiscoverable.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let sections_area = chunks[0];
+
+    if sections_area.width >= 76 {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(inner);
+            .split(sections_area);
         let split = keymap::HELP_SECTIONS.len().div_ceil(2);
         draw_help_column(f, columns[0], &keymap::HELP_SECTIONS[..split]);
         draw_help_column(f, columns[1], &keymap::HELP_SECTIONS[split..]);
     } else {
-        draw_help_column(f, inner, keymap::HELP_SECTIONS);
+        draw_help_column(f, sections_area, keymap::HELP_SECTIONS);
     }
+
+    let marker = |m: &'static str| Span::styled(m, Style::default().fg(Color::Yellow));
+    let note = |s: &'static str| Span::styled(s, Style::default().fg(Color::Gray));
+    let legend = Line::from(vec![
+        Span::styled("markers  ", Style::default().fg(Color::DarkGray)),
+        marker("~"),
+        note(" cached  "),
+        marker("≥"),
+        note(" lower bound  "),
+        marker("*"),
+        note(" mounts skipped  "),
+        Span::styled("↑↓", Style::default().fg(Color::Green)),
+        note(" grew/shrank"),
+    ]);
+    f.render_widget(Paragraph::new(legend), chunks[1]);
 }
 
 fn draw_help_column(f: &mut Frame, area: Rect, sections: &[KeySection]) {
@@ -2474,6 +2529,73 @@ fn size_detail_with_cache_marker(size: SizeInfo, stale: bool) -> String {
     }
 }
 
+/// Compact summary for the files-pane border title: item count, total size,
+/// scan coverage, the active sort mode, and any marked-items total. Replaces
+/// the old `files (N)` title and the sort/hidden text that used to clutter the
+/// app header.
+fn files_pane_title(app: &App, visible_count: usize, total_size: u64, sized: usize) -> String {
+    let mut title = if app.search_filter_active() {
+        format!("files · {visible_count}/{} items", app.entries.len())
+    } else {
+        format!("files · {visible_count} items")
+    };
+    if total_size > 0 {
+        title.push_str(&format!(" · {}", human(total_size)));
+    }
+    if sized < visible_count {
+        title.push_str(&format!(" · {sized}/{visible_count} sized"));
+    }
+    title.push_str(&format!(" · sort {}", app.sort.label()));
+    if let Some((count, marked_total, lower_bound)) = app.marked_summary() {
+        if marked_total > 0 {
+            let prefix = if lower_bound { "≥" } else { "" };
+            title.push_str(&format!(
+                " · {count} marked {prefix}{}",
+                human(marked_total)
+            ));
+        } else {
+            title.push_str(&format!(" · {count} marked"));
+        }
+    }
+    title
+}
+
+/// Color sizes by magnitude so the eye lands on the big directories: dim for
+/// sub-MiB, default green for the MiB range, bold amber for GiB and up.
+fn size_magnitude_style(bytes: u64) -> Style {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if bytes >= MIB {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// A trailing "↑/↓ size" badge for a directory whose size changed since the
+/// last scan, so the eye goes to what grew rather than the familiar top-N.
+fn growth_badge(delta: i64) -> Option<(String, Style)> {
+    if delta == 0 {
+        return None;
+    }
+    let magnitude = delta.unsigned_abs();
+    if delta > 0 {
+        Some((
+            format!(" ↑{}", human(magnitude)),
+            Style::default().fg(Color::Green),
+        ))
+    } else {
+        Some((
+            format!(" ↓{}", human(magnitude)),
+            Style::default().fg(Color::Blue),
+        ))
+    }
+}
+
 fn size_with_markers(bytes: u64, inaccessible: u32, skipped_mounts: u32, stale: bool) -> String {
     let mut label = String::new();
     if stale {
@@ -2858,6 +2980,24 @@ mod tests {
     #[test]
     fn package_columns_hide_size_when_narrow() {
         assert_eq!(package_columns(12), (12, 0));
+    }
+
+    #[test]
+    fn growth_badge_shows_direction_and_skips_zero() {
+        let (up, _) = growth_badge(4096).unwrap();
+        assert!(up.contains('↑'));
+        let (down, _) = growth_badge(-4096).unwrap();
+        assert!(down.contains('↓'));
+        assert!(growth_badge(0).is_none());
+    }
+
+    #[test]
+    fn size_magnitude_style_grades_by_size() {
+        let kb = size_magnitude_style(500);
+        let mb = size_magnitude_style(5 * 1024 * 1024);
+        let gb = size_magnitude_style(5 * 1024 * 1024 * 1024);
+        assert_ne!(kb, mb);
+        assert_ne!(mb, gb);
     }
 
     #[test]

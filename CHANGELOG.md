@@ -8,10 +8,20 @@ All notable changes to diskr are documented here. The format follows
 
 ### Added
 
+- A growth sort mode (in the `o` sort cycle) and a per-row `↑`/`↓` badge showing
+  how much a directory changed since its previous scan, so revalidation surfaces
+  what actually grew instead of the same familiar top-N.
 - `diskr --packages --json` now includes the canonical project root as `path`,
   matching the other JSON reports.
 
 ### Changed
+
+- Files-pane density pass: the pane title now summarizes item count, total size,
+  scan coverage, the active sort, and any marked-items total; sizes are colored
+  by magnitude (dim sub-MiB, green MiB, bold amber GiB+); the modified column
+  shows whenever the pane is wide enough; marked rows keep their type glyph next
+  to the check; the app header drops the always-on "sort/hidden off" defaults;
+  and the `?` overlay gained a size-marker legend.
 
 - The footer help strip is now context-sensitive: it lists the keys for the
   focused pane, truncates to fit narrow terminals, and always keeps `?` visible

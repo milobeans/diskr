@@ -38,6 +38,7 @@ pub enum SortMode {
     Name,
     SizeDesc,
     Modified,
+    Growth,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,7 @@ impl SortMode {
             SortMode::Name => "name",
             SortMode::SizeDesc => "size ↓",
             SortMode::Modified => "mtime",
+            SortMode::Growth => "growth",
         }
     }
 }
@@ -77,6 +79,10 @@ pub struct Entry {
     pub skipped_mounts: u32,
     pub modified: Option<SystemTime>,
     pub scanning: bool,
+    /// Allocated-size change since this directory's previous scan, recorded when
+    /// a fresh scan lands and a prior cached value was in hand (issue #84).
+    /// `None` means there was no prior value to diff against.
+    pub size_delta: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -814,6 +820,7 @@ impl App {
                 skipped_mounts: 0,
                 modified,
                 scanning: false,
+                size_delta: None,
             });
         }
         self.apply_sort();
@@ -838,6 +845,11 @@ impl App {
                 .entries
                 .sort_by_key(|e| Reverse(e.size.map(size_sort_key).unwrap_or(0))),
             SortMode::Modified => self.entries.sort_by_key(|e| Reverse(e.modified)),
+            // Largest growers first; directories with no measured delta sort
+            // to the bottom.
+            SortMode::Growth => self
+                .entries
+                .sort_by_key(|e| Reverse(e.size_delta.unwrap_or(i64::MIN))),
         }
         // Sorting reorders entries, so path→index lookups (used to route
         // late-arriving scan results) must be rebuilt with the new positions.
@@ -877,7 +889,8 @@ impl App {
         self.sort = match self.sort {
             SortMode::Name => SortMode::SizeDesc,
             SortMode::SizeDesc => SortMode::Modified,
-            SortMode::Modified => SortMode::Name,
+            SortMode::Modified => SortMode::Growth,
+            SortMode::Growth => SortMode::Name,
         };
         self.apply_sort_preserving_selection();
         self.status = format!("sort: {}", self.sort.label());
@@ -1283,6 +1296,10 @@ impl App {
                     let is_active_scan = scan_id == self.active_scan_id;
                     let keep_scanning = !is_active_scan && self.active_scan_paths.contains(&path);
                     let scanned_at = now_secs();
+                    // The cached value (if any) is the directory's previous
+                    // size; capture it before record_cached_size overwrites it
+                    // so we can show how much it grew/shrank.
+                    let previous = self.size_cache.get(&path).copied();
                     self.record_cached_size(path.clone(), size, inaccessible, scanned_at, false);
                     if let Some(&idx) = self.entry_index.get(&path) {
                         if let Some(e) = self.entries.get_mut(idx) {
@@ -1291,6 +1308,9 @@ impl App {
                             e.cached_at = Some(scanned_at);
                             e.inaccessible = inaccessible;
                             e.skipped_mounts = skipped_mounts;
+                            e.size_delta = previous
+                                .map(|prev| size.allocated as i64 - prev.allocated as i64)
+                                .filter(|delta| *delta != 0);
                             if !keep_scanning {
                                 e.scanning = false;
                             }
@@ -3278,6 +3298,36 @@ impl App {
         self.marked.contains(path)
     }
 
+    /// Allocated-size total of all marked items, plus whether it is a lower
+    /// bound because a marked directory has no cached size. Resolves each path
+    /// through the current entries so marked files count too.
+    fn marked_size_summary(&self) -> (u64, bool) {
+        let mut total = 0u64;
+        let mut lower_bound = false;
+        for path in &self.marked {
+            match self
+                .entry_index
+                .get(path)
+                .and_then(|&idx| self.entries.get(idx))
+                .and_then(|entry| entry.size)
+            {
+                Some(size) => total = total.saturating_add(size.allocated),
+                None => lower_bound = true,
+            }
+        }
+        (total, lower_bound)
+    }
+
+    /// `(count, allocated total, lower-bound)` for the marked set, or `None`
+    /// when nothing is marked. Drives the files-pane mark summary.
+    pub fn marked_summary(&self) -> Option<(usize, u64, bool)> {
+        if self.marked.is_empty() {
+            return None;
+        }
+        let (total, lower_bound) = self.marked_size_summary();
+        Some((self.marked.len(), total, lower_bound))
+    }
+
     /// Count plus first few names for the batch-delete confirm modal, so stale
     /// or unexpected marks are visible before the user confirms.
     pub fn pending_batch_summary(&self) -> Option<String> {
@@ -3334,23 +3384,10 @@ impl App {
             self.status = String::from("nothing marked for deletion");
             return;
         }
-        // Resolve each marked path through the current entries: marked FILES
-        // (the common case) carry their size on the Entry, while size_cache only
-        // holds directory scan results. A marked directory with no cached size
-        // makes the sum a lower bound, shown with a leading ≥.
-        let mut total_size: u64 = 0;
-        let mut lower_bound = false;
-        for path in &self.marked {
-            match self
-                .entry_index
-                .get(path)
-                .and_then(|&idx| self.entries.get(idx))
-                .and_then(|entry| entry.size)
-            {
-                Some(size) => total_size = total_size.saturating_add(size.allocated),
-                None => lower_bound = true,
-            }
-        }
+        // Marked FILES (the common case) carry their size on the Entry, while
+        // size_cache only holds directory scan results. A marked directory with
+        // no cached size makes the sum a lower bound, shown with a leading ≥.
+        let (total_size, lower_bound) = self.marked_size_summary();
         let size_str = if total_size > 0 {
             let prefix = if lower_bound { "≥" } else { "" };
             format!(" ({prefix}{})", human(total_size))
@@ -5240,6 +5277,71 @@ mod tests {
     }
 
     #[test]
+    fn growth_sort_orders_by_delta_with_unmeasured_last() {
+        let root = test_root("growth_sort");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["a", "b", "c"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        for entry in app.entries.iter_mut() {
+            entry.size_delta = match entry.name.as_str() {
+                "a" => Some(100),
+                "b" => Some(500),
+                _ => None,
+            };
+        }
+
+        app.sort = SortMode::Growth;
+        app.apply_sort();
+
+        let order: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(order, ["b", "a", "c"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_result_records_growth_delta_from_previous_cached_size() {
+        let root = test_root("growth_delta");
+        let dir = root.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(root.clone()).unwrap();
+        // Seed a previous cached value, then deliver a larger fresh scan result.
+        app.size_cache.insert(dir.clone(), SizeInfo::new(100, 1000));
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.scan_rx = rx;
+        app.active_scan_id = 9;
+        app.scan_total = 1;
+        app.active_scan_paths = HashSet::from([dir.clone()]);
+        for entry in app.entries.iter_mut() {
+            if entry.path == dir {
+                entry.scanning = true;
+            }
+        }
+
+        tx.send(ScanMsg::DirSize {
+            scan_id: 9,
+            path: dir.clone(),
+            size: SizeInfo::new(300, 5000),
+            inaccessible: 0,
+            skipped_mounts: 0,
+        })
+        .unwrap();
+        app.drain_scan_results();
+
+        let entry = app.entries.iter().find(|e| e.path == dir).unwrap();
+        assert_eq!(entry.size_delta, Some(4000));
+
+        app.invalidate_pending_scan_results();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn go_up_reselects_previous_directory_in_parent() {
         let root = test_root("go_up_selection");
         let child = root.join("child");
@@ -5635,6 +5737,7 @@ mod tests {
                 skipped_mounts: 0,
                 modified: None,
                 scanning: false,
+                size_delta: None,
             },
             Entry {
                 name: String::from("dir_b"),
@@ -5649,6 +5752,7 @@ mod tests {
                 skipped_mounts: 0,
                 modified: None,
                 scanning: false,
+                size_delta: None,
             },
             Entry {
                 name: String::from("todo.py"),
@@ -5663,6 +5767,7 @@ mod tests {
                 skipped_mounts: 0,
                 modified: None,
                 scanning: false,
+                size_delta: None,
             },
         ];
         app.entry_index =
