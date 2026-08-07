@@ -6,6 +6,50 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.70] - 2026-08-06
+
+### Added
+
+- The keyboard-help overlay now scrolls on short terminals, balances sections
+  across wide columns by rendered height, and shows the visible line range.
+- Package-report JSON now includes `project_inaccessible`, and file, history,
+  reclaim, and project-dependency reports surface enumeration failures instead
+  of silently presenting partial results as complete.
+
+### Changed
+
+- Filenames, paths, and external-command diagnostics are now escaped before
+  human terminal rendering, while JSON continues to preserve machine-readable
+  values.
+- File-info collection and every move-to-Trash operation now run on guarded
+  background workers; package uninstall also has a five-minute process-group
+  timeout, keeping the TUI responsive on slow volumes and package managers.
+- Persistent history and size-cache writers now coordinate across processes,
+  merge updates and invalidations under a lock, create state files with
+  owner-only permissions, and sync the containing directory after atomic
+  replacement.
+- File-only and Reclaim-only keys now act only in the pane where their help is
+  shown. Unicode layout and truncation are grapheme-aware, including combining
+  characters and emoji.
+- Updated compatible dependencies, including crossterm 0.29, anyhow 1.0.104,
+  ratatui-core 0.1.2, and ratatui-widgets 0.3.2.
+
+### Fixed
+
+- Reclaim totals now aggregate the union of finding paths: nested categories
+  are counted once without dropping unrelated bytes from a parent category.
+- FSEvents `MustScanSubDirs` replays now fall back to full cache revalidation,
+  so cached descendants cannot remain falsely fresh after a recursive event.
+- Snapshot-thinning sizes are parsed with checked decimal arithmetic, rejecting
+  values above `u64::MAX` instead of rounding and clamping through `f64`.
+- Scanner syscall, malformed-record, open, and directory-entry failures now
+  make totals explicit lower bounds instead of being treated as successful EOF.
+- Filesystems that do not support the native bulk-attribute syscall now fall
+  back to compatible directory enumeration instead of returning an empty scan.
+- Package warning truncation no longer splits UTF-8 and aborts release builds.
+- Repeated baseline saves and overlapping Trash operations are coalesced or
+  rejected without discarding marks, and disconnected workers report failure.
+
 ## [0.1.69] - 2026-06-15
 
 ### Removed

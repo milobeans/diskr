@@ -58,8 +58,8 @@ diskr --thin-snapshots 10G --yes ~ # execute it
 
 ## Keys
 
-This table mirrors the in-app `?` overlay and `diskr --help`; all three are
-driven from one keymap and a test fails the build if they drift. Destructive
+This table mirrors the in-app `?` overlay and `diskr --help`; an exact-key test
+fails the build if the documented and runtime bindings drift. Destructive
 keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 
 | Key | Action |
@@ -67,8 +67,8 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | ? | Show full keyboard help |
 | q | Quit |
 | Esc, Ctrl+C | Focus the Files pane, or close a modal and clear search/filter |
-| Up/Down, j/k | Move selection |
-| PageUp/PageDown | Move by a page |
+| Up/Down, j/k | Move selection, or scroll the keyboard-help overlay |
+| PageUp/PageDown | Move by a page, including in keyboard help |
 | Home/End | Jump to first or last item |
 | Enter | Open the selected directory, disk, package, or reclaim finding |
 | Backspace | Go to parent directory |
@@ -76,11 +76,11 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | Tab, Shift+Tab | Cycle panes |
 | / | Search files in the current directory or filter packages; Enter keeps, Esc clears |
 | i | Show details for the selected file, package, or disk |
-| . | Toggle hidden files |
-| o | Cycle sort mode |
+| . | Toggle hidden files in the Files pane |
+| o | Cycle sort mode in the Files pane |
 | r | Refresh the current view and rescan all visible directory sizes |
-| S | Scan every missing or stale visible directory size without refreshing |
-| B | Save a history baseline for the current directory |
+| S | Scan every missing or stale visible directory size in the Files pane |
+| B | Save a history baseline for the current Files directory |
 | t | Open the top-files list for the selection |
 | c | Rename the selected file |
 | n | Create a directory |
@@ -99,7 +99,19 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 
 ## How it works
 
-diskr is ~17,000 lines of Rust. Its dependencies are `ratatui`, `crossterm`, `libc`, `anyhow`, and `serde_json`; the size cache and history baselines are persisted as JSON through `serde_json`. The core scanner calls `getattrlistbulk(2)` with a packed attribute list requesting name, object type, logical size, and allocated size. The kernel fills a buffer with dozens of entries per call, and diskr parses the packed binary layout directly without allocating per entry on the hot path. A custom work-stealing thread pool (no rayon) fans out across subdirectories so sizing is parallelized across cores. Sizes count regular-file content only -- symlink targets and directories' own metadata blocks are not added, so totals run slightly under `du`/Finder, and directories or entries that cannot be read are flagged as lower bounds rather than counted as zero.
+diskr uses `ratatui`, `crossterm`, `libc`, `anyhow`, `serde_json`, and the
+Unicode segmentation/width crates. The size cache and history baselines are
+persisted as JSON through `serde_json`. The core scanner calls
+`getattrlistbulk(2)` with a packed attribute list requesting name, object type,
+logical size, and allocated size. The kernel fills a buffer with dozens of
+entries per call, and diskr parses the packed binary layout directly without
+allocating per entry on the hot path. A custom work-stealing thread pool (no
+rayon) fans out across subdirectories so sizing is parallelized across cores.
+Sizes count regular-file content only -- symlink targets and directories' own
+metadata blocks are not added, so totals run slightly under `du`/Finder, and
+directories or entries that cannot be read are flagged as lower bounds rather
+than counted as zero. Human terminal output escapes control characters from
+filenames and external tools; JSON retains normal structured escaping.
 
 The reclaimable-space detector runs two passes: a fixed-location pass that checks well-known paths (`~/Library/Caches`, Xcode DerivedData, Homebrew, Docker, etc.) and a bounded recursive pass that finds repeated build-artifact directories (`node_modules`, `target`, `.venv`, `__pycache__`, `.next`, `.gradle`). Both use the same fast bulk scanner for sizing.
 
@@ -122,6 +134,7 @@ cargo check --locked
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
 cargo package --locked
+cargo audit
 ```
 
 ## Releases

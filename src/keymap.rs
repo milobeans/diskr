@@ -294,6 +294,15 @@ pub fn is_destructive_key(key: &str) -> bool {
     matches!(key, "d" | "E" | "x")
 }
 
+pub fn is_available_in_focus(focus: Focus, key: &str) -> bool {
+    match key {
+        "S" | "o" | "B" | "." => focus == Focus::Files,
+        "R" | "E" => focus == Focus::Reclaim,
+        "u" | "x" => focus == Focus::Packages,
+        _ => true,
+    }
+}
+
 /// Footer hints relevant to the focused pane, most-relevant first and
 /// de-duplicated. The caller renders as many as fit and always advertises `?`,
 /// so the strip stays short and on-topic instead of listing every binding.
@@ -402,16 +411,39 @@ mod tests {
     #[test]
     fn readme_documents_every_keymap_key() {
         let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
-        for binding in HELP_SECTIONS
+        let documented: HashSet<&str> = readme
+            .lines()
+            .skip_while(|line| *line != "| Key | Action |")
+            .skip(2)
+            .take_while(|line| line.starts_with('|'))
+            .filter_map(|line| line.split('|').nth(1).map(str::trim))
+            .collect();
+        let mapped: HashSet<&str> = HELP_SECTIONS
             .iter()
             .flat_map(|section| section.bindings.iter())
-        {
+            .map(|binding| binding.key)
+            .collect();
+        for key in &mapped {
             assert!(
-                readme.contains(binding.key),
+                documented.contains(key),
                 "README key table is missing keymap binding `{}`",
-                binding.key
+                key
             );
         }
+        for key in &documented {
+            assert!(mapped.contains(key), "README documents unknown key `{key}`");
+        }
+    }
+
+    #[test]
+    fn pane_specific_actions_match_their_focus() {
+        for key in ["S", "o", "B", "."] {
+            assert!(is_available_in_focus(Focus::Files, key));
+            assert!(!is_available_in_focus(Focus::Packages, key));
+            assert!(!is_available_in_focus(Focus::Reclaim, key));
+        }
+        assert!(is_available_in_focus(Focus::Reclaim, "R"));
+        assert!(!is_available_in_focus(Focus::Files, "R"));
     }
 
     #[test]

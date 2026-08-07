@@ -113,27 +113,45 @@ pub fn parse_byte_size(input: &str) -> Result<u64> {
         bail!("invalid size: {input}");
     }
 
-    let value = number
-        .parse::<f64>()
-        .with_context(|| format!("invalid size: {input}"))?;
-    if !value.is_finite() || value <= 0.0 {
-        bail!("size must be greater than zero");
-    }
-
-    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1.0,
-        "k" | "kb" | "kib" => 1024.0,
-        "m" | "mb" | "mib" => 1024.0 * 1024.0,
-        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
-        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        "p" | "pb" | "pib" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
+    let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" => 1024_u64.pow(4),
+        "p" | "pb" | "pib" => 1024_u64.pow(5),
         _ => bail!("unknown size unit: {unit}"),
     };
-    let bytes = value * multiplier;
-    if bytes > u64::MAX as f64 {
-        bail!("size is too large");
+
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    let whole = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u64>()
+            .with_context(|| format!("invalid size: {input}"))?
+    };
+    if fraction.len() > 18 {
+        bail!("size has more than 18 fractional digits");
     }
-    Ok(bytes.round() as u64)
+    let whole_bytes = whole.checked_mul(multiplier).context("size is too large")?;
+    let fractional_bytes = if fraction.is_empty() {
+        0
+    } else {
+        let numerator = fraction
+            .parse::<u64>()
+            .with_context(|| format!("invalid size: {input}"))?;
+        let denominator = 10_u128.pow(fraction.len() as u32);
+        let scaled = u128::from(numerator) * u128::from(multiplier);
+        ((scaled + denominator / 2) / denominator) as u64
+    };
+    let bytes = whole_bytes
+        .checked_add(fractional_bytes)
+        .context("size is too large")?;
+    if bytes == 0 {
+        bail!("size must be at least one byte");
+    }
+    Ok(bytes)
 }
 
 struct StatfsInfo {
@@ -292,6 +310,22 @@ mod tests {
         assert!(parse_byte_size("0").is_err());
         assert!(parse_byte_size("12XB").is_err());
         assert!(parse_byte_size("..1G").is_err());
+    }
+
+    #[test]
+    fn parse_byte_size_is_exact_at_u64_boundary() {
+        assert_eq!(parse_byte_size("18446744073709551615").unwrap(), u64::MAX);
+        assert!(parse_byte_size("18446744073709551616").is_err());
+        assert!(parse_byte_size("18014398509481984KiB").is_err());
+    }
+
+    #[test]
+    fn parse_byte_size_rounds_fractions_without_floating_point() {
+        assert_eq!(parse_byte_size("0.5B").unwrap(), 1);
+        assert_eq!(parse_byte_size("1.5KiB").unwrap(), 1536);
+        assert_eq!(parse_byte_size("0.0009765625KiB").unwrap(), 1);
+        assert!(parse_byte_size("0.1B").is_err());
+        assert!(parse_byte_size("1.1234567890123456789KiB").is_err());
     }
 
     #[test]

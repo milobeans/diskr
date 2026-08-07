@@ -15,6 +15,8 @@ use ratatui_core::{
     style::{Color, Modifier},
 };
 
+use crate::terminal_text;
+
 pub struct CrosstermBackend<W: Write> {
     writer: W,
 }
@@ -67,7 +69,10 @@ impl<W: Write> Backend for CrosstermBackend<W> {
                 queue!(self.writer, SetBackgroundColor(to_term_color(cell.bg)))?;
                 bg = cell.bg;
             }
-            queue!(self.writer, Print(cell.symbol()))?;
+            queue!(
+                self.writer,
+                Print(terminal_text::sanitize_cell(cell.symbol()))
+            )?;
         }
 
         queue!(

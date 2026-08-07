@@ -3,11 +3,13 @@ use std::io::Read as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::bulkstat::{self, SizeInfo};
 use crate::pool;
+use crate::terminal_text;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Package {
@@ -193,6 +195,7 @@ pub struct ManagerReport {
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(10);
 const CMD_TIMEOUT_SLOW: Duration = Duration::from_secs(30);
+const UNINSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 struct CommandResult {
     stdout: String,
@@ -209,6 +212,11 @@ pub struct ProjectDeps {
     pub dep_count: usize,
     pub deps_size: Option<SizeInfo>,
     pub deps_dir: Option<PathBuf>,
+}
+
+pub struct ProjectDepsReport {
+    pub projects: Vec<ProjectDeps>,
+    pub inaccessible: u32,
 }
 
 pub fn scan_managers() -> Vec<ManagerReport> {
@@ -405,21 +413,17 @@ fn parse_pip_show_output(output: &str) -> HashMap<String, DepInfo> {
 pub fn run_uninstall(manager: Manager, name: &str) -> Result<String, String> {
     let (cmd, args) = manager.uninstall_args(name);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let output = Command::new(cmd)
-        .args(&arg_refs)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("failed to run {cmd}: {e}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let result = run_command_with_timeout(cmd, &arg_refs, UNINSTALL_TIMEOUT);
+    if result.timed_out {
+        Err(format!("{cmd} timed out after 5 minutes"))
+    } else if result.success {
+        Ok(result.stdout.trim().to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = result.stderr.trim();
         Err(if stderr.is_empty() {
-            format!("{cmd} exited with {}", output.status)
+            format!("{cmd} exited with an error")
         } else {
-            stderr
+            stderr.to_string()
         })
     }
 }
@@ -475,11 +479,7 @@ fn cmd_warning(result: &CommandResult, manager_label: &str) -> Option<String> {
         if detail.is_empty() {
             return Some(format!("{manager_label}: exited with error"));
         }
-        let truncated = if detail.len() > 120 {
-            format!("{}...", &detail[..120])
-        } else {
-            detail.to_string()
-        };
+        let truncated = terminal_text::truncate_end(detail, 120);
         return Some(format!("{manager_label}: {truncated}"));
     }
     None
@@ -966,10 +966,16 @@ fn scan_bun_global() -> (Vec<Package>, Option<String>) {
     (packages, warning)
 }
 
+#[cfg(test)]
 pub fn find_project_deps(root: &Path, max_depth: usize) -> Vec<ProjectDeps> {
+    scan_project_deps(root, max_depth).projects
+}
+
+pub fn scan_project_deps(root: &Path, max_depth: usize) -> ProjectDepsReport {
     let results = std::sync::Mutex::new(Vec::new());
+    let inaccessible = AtomicU32::new(0);
     pool::par_drain(vec![(root.to_path_buf(), 0usize)], |(dir, depth), queue| {
-        scan_project_dir(&dir, depth, max_depth, &results, queue);
+        scan_project_dir(&dir, depth, max_depth, &results, &inaccessible, queue);
     });
     let mut results = results.into_inner().unwrap_or_default();
     results.sort_by(|a, b| {
@@ -980,7 +986,10 @@ pub fn find_project_deps(root: &Path, max_depth: usize) -> Vec<ProjectDeps> {
             .then(a.path.cmp(&b.path))
             .then(a.manifest.cmp(&b.manifest))
     });
-    results
+    ProjectDepsReport {
+        projects: results,
+        inaccessible: inaccessible.load(Ordering::Relaxed),
+    }
 }
 
 const PROJECT_MANIFESTS: &[(&str, &str, &str)] = &[
@@ -1026,18 +1035,37 @@ fn scan_project_dir(
     depth: usize,
     max_depth: usize,
     results: &std::sync::Mutex<Vec<ProjectDeps>>,
+    inaccessible: &AtomicU32,
     queue: &pool::WorkQueue<(PathBuf, usize)>,
 ) {
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return;
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            inaccessible.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
     };
 
     let mut children = Vec::new();
     let mut found_manifests: Vec<(usize, &str, &str, &str)> = Vec::new();
 
-    for entry in read.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+    for entry in read {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                inaccessible.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                inaccessible.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         };
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
@@ -2267,8 +2295,21 @@ dev = ["pytest", "ruff"]
             timed_out: false,
         };
         let w = cmd_warning(&result, "npm").unwrap();
-        assert!(w.ends_with("..."));
+        assert!(w.ends_with('…'));
         assert!(w.len() < 140);
+    }
+
+    #[test]
+    fn cmd_warning_never_splits_utf8() {
+        let result = CommandResult {
+            stdout: String::new(),
+            stderr: format!("{}é🙂", "x".repeat(119)),
+            success: false,
+            timed_out: false,
+        };
+        let warning = cmd_warning(&result, "pip").unwrap();
+        assert!(warning.ends_with('…'));
+        assert!(terminal_text::display_width(&warning) <= 125);
     }
 
     #[test]

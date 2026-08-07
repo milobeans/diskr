@@ -80,9 +80,8 @@ pub struct LargeFile {
 pub struct DirScan {
     pub size: SizeInfo,
     pub largest_files: Vec<LargeFile>,
-    /// Directories that could not be opened (EACCES/EPERM/ENAMETOOLONG) plus
-    /// individual entries whose attributes could not be read. When non-zero the
-    /// reported size is a lower bound.
+    /// Directories or entries that could not be traversed or read. When
+    /// non-zero the reported size is a lower bound.
     pub inaccessible: u32,
     /// Subdirectories skipped because they sit on a different volume than the
     /// scan root (external/network/FUSE mounts and APFS helper volumes such as
@@ -130,9 +129,9 @@ struct Attrlist {
 /// directory inodes' own allocated blocks, and other special files contribute
 /// nothing, so the total is content-only and runs slightly under `du`/Finder
 /// on directory-heavy trees. Directories that cannot be opened
-/// (EACCES/EPERM/ENAMETOOLONG) and individual entries whose attributes cannot
-/// be read are counted in `inaccessible`; when it is non-zero the reported size
-/// is a lower bound. Subdirectories on a different volume than the scan root
+/// and individual entries whose attributes cannot be read are counted in
+/// `inaccessible`; when it is non-zero the reported size is a lower bound.
+/// Subdirectories on a different volume than the scan root
 /// are skipped and counted in `skipped_mounts`.
 pub fn scan_dir(root: &Path, top_file_limit: usize) -> DirScan {
     scan_dir_with_cancellation(root, top_file_limit, &ScanCancellation::never()).unwrap_or_default()
@@ -146,8 +145,17 @@ pub fn scan_dir_with_cancellation(
     if cancellation.is_cancelled() {
         return None;
     }
-    let Ok(meta) = std::fs::symlink_metadata(root) else {
-        return Some(DirScan::default());
+    let meta = match std::fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Some(DirScan::default());
+        }
+        Err(_) => {
+            return Some(DirScan {
+                inaccessible: 1,
+                ..DirScan::default()
+            });
+        }
     };
     if !meta.file_type().is_dir() {
         return Some(DirScan::default());
@@ -201,8 +209,21 @@ pub fn scan_dir_async(
             return;
         }
         on_start();
-        let Ok(meta) = std::fs::symlink_metadata(&root) else {
-            return;
+        let meta = match std::fs::symlink_metadata(&root) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => {
+                let state = Arc::new(WalkState::new(
+                    ScanPolicy::new(&root, 0),
+                    top_file_limit,
+                    cancellation.clone(),
+                ));
+                state.inaccessible.store(1, Ordering::Relaxed);
+                *result_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state);
+                return;
+            }
         };
         if !meta.file_type().is_dir() {
             return;
@@ -430,16 +451,10 @@ impl Drop for DirFd {
     }
 }
 
-/// EACCES/EPERM means real data was skipped (no Full Disk Access, ACLs), and
-/// ENAMETOOLONG means a spawned sibling branch's absolute path grew past the
-/// platform limit so a whole subtree could not be reopened — both undercount
-/// and must be surfaced rather than silently dropped. ENOENT is just a deletion
-/// race during the walk and stays silent.
+/// Every open/traversal error except ENOENT means data may have been skipped and
+/// must make the result a lower bound. ENOENT is a benign deletion race.
 fn inaccessible_from_errno(errno: Option<i32>) -> u32 {
-    u32::from(matches!(
-        errno,
-        Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::ENAMETOOLONG)
-    ))
+    u32::from(!matches!(errno, Some(libc::ENOENT)))
 }
 
 fn open_dir(dir: &Path) -> Result<DirFd, Option<i32>> {
@@ -497,6 +512,8 @@ fn scan_open_dir(
             std::cell::RefCell::new(vec![0u8; 64 * 1024]);
     }
     let mut partial = DirectoryScan::default();
+    let mut use_fallback = false;
+    let mut saw_bulk_entries = false;
 
     SCAN_BUF.with(|cell| {
         let mut buf_ref = cell.borrow_mut();
@@ -512,34 +529,55 @@ fn scan_open_dir(
                     FSOPT_PACK_INVAL_ATTRS | FSOPT_RETURN_REALDEV,
                 )
             };
-            if n <= 0 {
+            if n == 0 {
                 break;
             }
+            if n < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if errno == Some(libc::EINTR) {
+                    continue;
+                }
+                if !saw_bulk_entries && matches!(errno, Some(libc::ENOTSUP) | Some(libc::EINVAL)) {
+                    use_fallback = true;
+                    break;
+                }
+                partial.inaccessible = partial
+                    .inaccessible
+                    .saturating_add(inaccessible_from_errno(errno));
+                break;
+            }
+            saw_bulk_entries = true;
 
             let mut offset: usize = 0;
             for _ in 0..n {
+                macro_rules! malformed_entry {
+                    () => {{
+                        partial.inaccessible = partial.inaccessible.saturating_add(1);
+                        break;
+                    }};
+                }
                 let entry_start = offset;
                 if entry_start + 4 + ATTRIBUTE_SET_LEN > buf.len() {
-                    break;
+                    malformed_entry!();
                 }
                 let Some(length) = read_u32(buf, buf.len(), entry_start).map(|n| n as usize) else {
-                    break;
+                    malformed_entry!();
                 };
                 if length == 0 || entry_start + length > buf.len() {
-                    break;
+                    malformed_entry!();
                 }
                 let entry_end = entry_start + length;
                 let Some(returned_common) = read_u32(buf, entry_end, entry_start + 4) else {
-                    break;
+                    malformed_entry!();
                 };
                 let Some(returned_file) = read_u32(buf, entry_end, entry_start + 16) else {
-                    break;
+                    malformed_entry!();
                 };
                 let mut field = entry_start + 4 + ATTRIBUTE_SET_LEN;
 
                 let err = if returned_common & ATTR_CMN_ERROR != 0 {
                     let Some(err) = read_u32(buf, entry_end, field) else {
-                        break;
+                        malformed_entry!();
                     };
                     field += 4;
                     err
@@ -550,11 +588,11 @@ fn scan_open_dir(
                 let name_ref = if returned_common & ATTR_CMN_NAME != 0 {
                     let attr_ref_start = field;
                     let Some(name_off) = read_i32(buf, entry_end, field).map(|n| n as isize) else {
-                        break;
+                        malformed_entry!();
                     };
                     let Some(name_len) = read_u32(buf, entry_end, field + 4).map(|n| n as usize)
                     else {
-                        break;
+                        malformed_entry!();
                     };
                     field += ATTR_REFERENCE_LEN;
                     Some((attr_ref_start, name_off, name_len))
@@ -564,7 +602,7 @@ fn scan_open_dir(
 
                 let devid = if returned_common & ATTR_CMN_DEVID != 0 {
                     let Some(devid) = read_i32(buf, entry_end, field) else {
-                        break;
+                        malformed_entry!();
                     };
                     field += 4;
                     Some(devid as u32 as u64)
@@ -574,7 +612,7 @@ fn scan_open_dir(
 
                 let objtype = if returned_common & ATTR_CMN_OBJTYPE != 0 {
                     let Some(objtype) = read_u32(buf, entry_end, field) else {
-                        break;
+                        malformed_entry!();
                     };
                     field += 4;
                     objtype
@@ -591,7 +629,7 @@ fn scan_open_dir(
 
                 let linkcount = if returned_file & ATTR_FILE_LINKCOUNT != 0 {
                     let Some(value) = read_u32(buf, entry_end, field) else {
-                        break;
+                        malformed_entry!();
                     };
                     field += 4;
                     value
@@ -599,14 +637,19 @@ fn scan_open_dir(
                     1
                 };
                 let totalsize = if returned_file & ATTR_FILE_TOTALSIZE != 0 {
-                    let value = read_u64(buf, entry_end, field).unwrap_or(0);
+                    let Some(value) = read_u64(buf, entry_end, field) else {
+                        malformed_entry!();
+                    };
                     field += 8;
                     value
                 } else {
                     0
                 };
                 let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
-                    read_u64(buf, entry_end, field).unwrap_or(0)
+                    let Some(value) = read_u64(buf, entry_end, field) else {
+                        malformed_entry!();
+                    };
+                    value
                 } else {
                     0
                 };
@@ -638,6 +681,7 @@ fn scan_open_dir(
                                 name_off,
                                 name_len,
                             ) else {
+                                partial.inaccessible = partial.inaccessible.saturating_add(1);
                                 continue;
                             };
                             push_largest_file(
@@ -655,6 +699,7 @@ fn scan_open_dir(
                         let Some(name_bytes) =
                             read_attr_reference(buf, entry_end, attr_ref_start, name_off, name_len)
                         else {
+                            partial.inaccessible = partial.inaccessible.saturating_add(1);
                             continue;
                         };
                         if matches!(name_bytes, b"." | b"..") {
@@ -672,6 +717,78 @@ fn scan_open_dir(
             }
         }
     });
+
+    if use_fallback {
+        scan_open_dir_fallback(dir, top_file_limit, context, cancellation)
+    } else {
+        partial
+    }
+}
+
+/// Compatibility path for filesystems that do not implement
+/// `getattrlistbulk(2)`. This is intentionally selected only when the first
+/// bulk call returns ENOTSUP/EINVAL, before any entries could be counted.
+fn scan_open_dir_fallback(
+    dir: &Path,
+    top_file_limit: usize,
+    context: &ScanContext,
+    cancellation: &ScanCancellation,
+) -> DirectoryScan {
+    let mut partial = DirectoryScan::default();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            partial.inaccessible = inaccessible_from_errno(err.raw_os_error());
+            return partial;
+        }
+    };
+
+    for entry in entries {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                partial.inaccessible = partial
+                    .inaccessible
+                    .saturating_add(inaccessible_from_errno(err.raw_os_error()));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                partial.inaccessible = partial
+                    .inaccessible
+                    .saturating_add(inaccessible_from_errno(err.raw_os_error()));
+                continue;
+            }
+        };
+
+        if metadata.is_file() {
+            if !should_count_file(
+                Some(metadata.dev()),
+                Some(metadata.ino()),
+                metadata.nlink() as u32,
+                context,
+            ) {
+                continue;
+            }
+            let size = SizeInfo::new(metadata.len(), metadata.blocks().saturating_mul(512));
+            partial.size.add_file(size);
+            if top_file_limit > 0 {
+                push_largest_file(&mut partial.largest_files, top_file_limit, path, size);
+            }
+        } else if metadata.is_dir() {
+            if should_skip_subdir(&path, Some(metadata.dev()), &context.policy) {
+                partial.skipped_mounts = partial.skipped_mounts.saturating_add(1);
+            } else {
+                partial.subdirs.push(path);
+            }
+        }
+    }
 
     partial
 }
@@ -929,6 +1046,27 @@ mod tests {
     }
 
     #[test]
+    fn fallback_scanner_preserves_sizes_subdirs_and_hard_link_deduplication() {
+        let root = test_root("bulkstat_fallback");
+        fs::create_dir_all(root.join("child")).unwrap();
+        fs::write(root.join("data.bin"), vec![1u8; 4096]).unwrap();
+        fs::hard_link(root.join("data.bin"), root.join("data-link.bin")).unwrap();
+        let metadata = fs::metadata(&root).unwrap();
+        let context = ScanContext {
+            policy: ScanPolicy::with_devices(&root, metadata.dev(), None),
+            seen_hard_links: Mutex::new(HashSet::new()),
+        };
+
+        let scan = scan_open_dir_fallback(&root, 10, &context, &ScanCancellation::never());
+
+        assert_eq!(scan.size.logical, 4096);
+        assert_eq!(scan.largest_files.len(), 1);
+        assert_eq!(scan.subdirs, vec![root.join("child")]);
+        assert_eq!(scan.inaccessible, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn missing_directory_counts_as_zero() {
         let root = test_root("missing");
         assert_eq!(scan_dir(&root, 0).size.logical, 0);
@@ -955,8 +1093,38 @@ mod tests {
         assert_eq!(inaccessible_from_errno(Some(libc::ENAMETOOLONG)), 1);
         assert_eq!(inaccessible_from_errno(Some(libc::EACCES)), 1);
         assert_eq!(inaccessible_from_errno(Some(libc::EPERM)), 1);
+        assert_eq!(inaccessible_from_errno(Some(libc::EIO)), 1);
+        assert_eq!(inaccessible_from_errno(Some(libc::EMFILE)), 1);
         assert_eq!(inaccessible_from_errno(Some(libc::ENOENT)), 0);
-        assert_eq!(inaccessible_from_errno(None), 0);
+        assert_eq!(inaccessible_from_errno(None), 1);
+    }
+
+    #[test]
+    fn packed_attribute_readers_reject_arbitrary_out_of_bounds_ranges() {
+        let mut seed = 0x9e37_79b9_u64;
+        for len in 0..256usize {
+            let mut bytes = vec![0u8; len];
+            for byte in &mut bytes {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *byte = (seed >> 32) as u8;
+            }
+            for _ in 0..32 {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let limit = (seed as usize) % 320;
+                let offset = ((seed >> 16) as usize) % 320;
+                let data_len = ((seed >> 32) as usize) % 320;
+                let signed_offset = ((seed >> 48) as i16) as isize;
+                let _ = read_u32(&bytes, limit, offset);
+                let _ = read_u64(&bytes, limit, offset);
+                if let Some(slice) =
+                    read_attr_reference(&bytes, limit, offset, signed_offset, data_len)
+                {
+                    assert!(slice.as_ptr() >= bytes.as_ptr());
+                    assert!(slice.as_ptr_range().end <= bytes.as_ptr_range().end);
+                    assert!(!slice.is_empty());
+                }
+            }
+        }
     }
 
     #[test]

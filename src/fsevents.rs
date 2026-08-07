@@ -1,6 +1,6 @@
-//! FSEvents-backed cache freshness (audit finding 19, Phase 2).
+//! FSEvents-backed cache freshness.
 //!
-//! The persistent size cache marks every directory stale at startup; #82's
+//! The persistent size cache marks every directory stale at startup; its
 //! stale-while-revalidate then rescans the oldest stale directories. That is
 //! correct but does redundant work on directories that did not change. This
 //! module replays the volume's filesystem events since the last launch and
@@ -14,7 +14,7 @@
 //! untrustworthy — first run, a different/reformatted volume, dropped or
 //! coalesced events (`MustScanSubDirs`/`UserDropped`/`KernelDropped`), a wrapped
 //! id, a mount/unmount/root change, or a timeout — falls back to treating
-//! everything as stale (i.e. #82's age-based revalidation).
+//! everything as stale so the age-based revalidation can take over.
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
@@ -35,7 +35,7 @@ const STATE_VERSION: u64 = 1;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Freshness {
     /// FSEvents could not be trusted; every cached directory is stale and falls
-    /// through to #82's age-based revalidation.
+    /// through to age-based revalidation.
     All,
     /// FSEvents replayed cleanly: only directories whose subtree contains a
     /// changed path (and anything outside the watched root) are stale.
@@ -87,6 +87,12 @@ pub fn plan_freshness(root: &Path) -> Freshness {
                 && saved.last_event_id < now_id =>
         {
             replay_into_freshness(&root, saved.last_event_id)
+        }
+        Some(saved) if saved.volume_uuid == uuid && saved.last_event_id == now_id => {
+            Freshness::Touched {
+                watched_root: root.clone(),
+                changed: Vec::new(),
+            }
         }
         // First run on this volume, a different volume, or a non-advancing id:
         // nothing to replay from.
@@ -172,6 +178,7 @@ const FS_FLAG_UNMOUNT: u32 = 0x0000_0080;
 /// Flags that mean we may have missed changes, so "unchanged ⇒ fresh" no longer
 /// holds and the whole replay must be discarded.
 const FS_FLAGS_UNRELIABLE: u32 = FS_FLAG_USER_DROPPED
+    | FS_FLAG_MUST_SCAN_SUBDIRS
     | FS_FLAG_KERNEL_DROPPED
     | FS_FLAG_EVENT_IDS_WRAPPED
     | FS_FLAG_MOUNT
@@ -426,12 +433,9 @@ extern "C" fn fsevents_callback(
             state.history_done = true;
             continue;
         }
-        if flags & FS_FLAGS_UNRELIABLE != 0 {
+        if !flags_are_reliable(flags) {
             state.reliable = false;
         }
-        // MustScanSubDirs marks that subtree as needing a full rescan; recording
-        // the path keeps it (and its ancestors) stale, which is what we want.
-        let _ = FS_FLAG_MUST_SCAN_SUBDIRS;
         let raw = unsafe { *paths.add(i) };
         if raw.is_null() {
             continue;
@@ -445,6 +449,10 @@ extern "C" fn fsevents_callback(
             ));
         }
     }
+}
+
+fn flags_are_reliable(flags: u32) -> bool {
+    flags & FS_FLAGS_UNRELIABLE == 0
 }
 
 fn make_cfstring(bytes: &[u8]) -> Option<*const c_void> {
@@ -515,6 +523,14 @@ mod tests {
         assert!(!f.is_stale(Path::new("/root/x")));
         // Anything outside the watched root is unknown, hence stale.
         assert!(f.is_stale(Path::new("/elsewhere")));
+    }
+
+    #[test]
+    fn recursive_or_dropped_events_invalidate_the_replay() {
+        assert!(!flags_are_reliable(FS_FLAG_MUST_SCAN_SUBDIRS));
+        assert!(!flags_are_reliable(FS_FLAG_USER_DROPPED));
+        assert!(flags_are_reliable(0));
+        assert!(flags_are_reliable(FS_FLAG_HISTORY_DONE));
     }
 
     #[test]

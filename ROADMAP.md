@@ -59,8 +59,8 @@ published in this repository.
 
 ## Navigation and Action Improvements
 
-- Quick Look integration: preview the selected file from the TUI with `qlmanage
-  -p`. Implemented with the `Space` shortcut.
+- Quick Look was removed after proving redundant with the more useful Finder and
+  default-app actions; the TUI keeps the smaller action set below.
 - Reveal in Finder: open Finder with the selected path highlighted via `open
   -R`. Implemented with the `f` shortcut.
 - Open selected item: launch the selected file or directory with the default
@@ -125,7 +125,7 @@ state-integrity work.
   show what will happen, how much space it should reclaim, and what the user may
   lose.
 - Stay macOS-specific where it creates leverage. APFS, Time Machine snapshots,
-  Quick Look, Finder, and clone files are where `diskr` can beat generic tools.
+  FSEvents, Finder, and clone files are where `diskr` can beat generic tools.
 - Keep automation useful. Every major insight in the TUI should eventually have
   a scriptable equivalent.
 - Chrome must earn its pixels. Prefer densifying the files pane over adding
@@ -136,7 +136,8 @@ state-integrity work.
 
 1. Done: add logical-vs-physical size to the scanner and UI.
 2. Done: add global top-N largest files for the current subtree.
-3. Done: add Quick Look, reveal in Finder, and open-with-default-app shortcuts.
+3. Done: add reveal-in-Finder and open-with-default-app shortcuts; remove the
+   redundant Quick Look action after use showed it added little value.
 4. Done: add APFS snapshot and purgeable-space reporting.
 5. Done: add persisted scan snapshots and diff mode (`--save`/`--diff`).
 6. Done: add developer-cache detection and reclaimability scoring (`--reclaim`).
@@ -145,11 +146,12 @@ state-integrity work.
 8. Done: bring the intelligence into the TUI — reclaim pane, top-files modal,
    disk details, history diff header, file operations, size-share bars,
    persistent size cache.
-9. Next: burn down the open correctness/safety work (state integrity,
-   destructive-action guardrails, accuracy) before adding new surfaces.
-10. Next: TUI density and declutter pass (see the section above) — denominator
-    fix and context-sensitive help first, then files-pane density and inline
-    reclaim classification, then side-column collapse and overlay unification.
+9. Done: correctness/safety burn-down covering state integrity,
+   destructive-action responsiveness, traversal accuracy, terminal safety, and
+   recursive cache invalidation.
+10. Done: TUI density and declutter pass — corrected denominators,
+    context-sensitive and scrollable help, files-pane density and inline reclaim
+    classification, side-column collapse, and shared overlay primitives.
 11. Next: stale-file finder (size combined with last-used metadata); pairs
     with age-dimming and reclaim classification chips.
 12. Next: duplicate finder with APFS clone-based dedupe (`clonefile(2)`).

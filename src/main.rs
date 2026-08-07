@@ -11,6 +11,7 @@ mod scanner;
 mod space;
 mod state;
 mod terminal_backend;
+mod terminal_text;
 mod ui;
 
 use anyhow::{bail, Context, Result};
@@ -30,8 +31,16 @@ use std::{
 
 use app::{format_elapsed, human, App, Focus};
 use terminal_backend::CrosstermBackend;
+use terminal_text::SafePath;
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = run_main() {
+        eprintln!("error: {}", terminal_text::sanitize(&format!("{err:#}")));
+        std::process::exit(1);
+    }
+}
+
+fn run_main() -> Result<()> {
     match parse_args(std::env::args_os().skip(1))? {
         CliAction::Help => {
             print_help();
@@ -355,7 +364,7 @@ fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
     println!(
         "Top {} files by allocated size under {}",
         limit,
-        path.display()
+        SafePath(&path)
     );
     println!(
         "Total: {} disk / {} apparent",
@@ -383,7 +392,7 @@ fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
             "{:>2}. {:>22}  {}",
             index + 1,
             top_size_label(file.size),
-            file.path.display()
+            SafePath(&file.path)
         );
     }
     Ok(())
@@ -449,7 +458,7 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("Reclaimable space under {}", report.root.display());
+    println!("Reclaimable space under {}", SafePath(&report.root));
     println!(
         "Total: {} disk / {} apparent",
         human(report.total.allocated),
@@ -524,7 +533,7 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("Saved baseline for {}", record.path.display());
+    println!("Saved baseline for {}", SafePath(&record.path));
     println!(
         "Total: {} disk / {} apparent across {} entries",
         human(total.allocated),
@@ -539,7 +548,7 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
     }
     println!(
         "Compare later with `diskr --diff {}`.",
-        record.path.display()
+        SafePath(&record.path)
     );
     Ok(())
 }
@@ -582,7 +591,7 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("Diff for {}", report.path.display());
+    println!("Diff for {}", SafePath(&report.path));
     println!(
         "Baseline captured {}",
         format_elapsed(
@@ -612,7 +621,7 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
             "{:>12}  {:<9}  {}",
             format_signed_bytes(change.delta_allocated()),
             change_status(change),
-            change.name
+            terminal_text::sanitize(&change.name)
         );
     }
     Ok(())
@@ -672,12 +681,12 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("Space report for {}", report.path.display());
+    println!("Space report for {}", SafePath(&report.path));
     println!(
         "Mount: {} ({}, {})",
-        report.mount.display(),
-        report.fs_type,
-        report.device
+        SafePath(&report.mount),
+        terminal_text::sanitize(&report.fs_type),
+        terminal_text::sanitize(&report.device)
     );
     println!("Total: {}", human(report.total));
     println!("Used: {}", human(report.used));
@@ -690,14 +699,17 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
     if let Some(container) = &report.apfs_container {
         println!(
             "APFS container {}: {} total / {} free",
-            container.reference,
+            terminal_text::sanitize(&container.reference),
             human(container.size),
             human(container.free)
         );
     }
     match &report.local_snapshots.error {
         Some(error) if !error.is_empty() => {
-            println!("Local snapshots: unavailable ({error})");
+            println!(
+                "Local snapshots: unavailable ({})",
+                terminal_text::sanitize(error)
+            );
         }
         _ if report.local_snapshots.names.is_empty() => {
             println!("Local snapshots: none reported by tmutil");
@@ -705,11 +717,11 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
         _ => {
             println!("Local snapshots: {}", report.local_snapshots.names.len());
             for name in &report.local_snapshots.names {
-                println!("  {name}");
+                println!("  {}", terminal_text::sanitize(name));
             }
             println!(
                 "Snapshot sizes are not reported by tmutil. To request reclamation, first preview with `diskr --thin-snapshots 10G {}`.",
-                report.path.display()
+                SafePath(&report.path)
             );
         }
     }
@@ -719,7 +731,8 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
 fn print_packages(path: PathBuf, json: bool) -> Result<()> {
     let path = canonical_dir(path)?;
     let reports = packages::scan_managers();
-    let project_deps = packages::find_project_deps(&path, 5);
+    let project_scan = packages::scan_project_deps(&path, 5);
+    let project_deps = &project_scan.projects;
 
     if json {
         let managers: Vec<_> = reports
@@ -768,6 +781,7 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             .collect();
         let value = serde_json::json!({
             "path": path.to_string_lossy(),
+            "project_inaccessible": project_scan.inaccessible,
             "system_packages": managers,
             "project_dependencies": projects,
         });
@@ -785,7 +799,7 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
         }
         any_manager = true;
         if let Some(w) = &report.warning {
-            println!("{}: {w}", report.manager.label());
+            println!("{}: {}", report.manager.label(), terminal_text::sanitize(w));
             println!();
             continue;
         }
@@ -806,7 +820,12 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
                 .size
                 .map(|s| human(s.allocated))
                 .unwrap_or_else(|| String::from("?"));
-            println!("  {:>10}  {} {}", size_str, pkg.name, pkg.version);
+            println!(
+                "  {:>10}  {} {}",
+                size_str,
+                terminal_text::sanitize(&pkg.name),
+                terminal_text::sanitize(&pkg.version)
+            );
         }
         if report.packages.len() > 10 {
             println!("  … and {} more", report.packages.len() - 10);
@@ -820,8 +839,8 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
     }
 
     if !project_deps.is_empty() {
-        println!("Project dependencies under {}", path.display());
-        for dep in &project_deps {
+        println!("Project dependencies under {}", SafePath(&path));
+        for dep in project_deps {
             let size_str = dep
                 .deps_size
                 .map(|s| human(s.allocated))
@@ -829,11 +848,17 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             println!(
                 "  {:>10}  {} ({}, {} deps)",
                 size_str,
-                dep.path.display(),
+                SafePath(&dep.path),
                 dep.manager_label,
                 dep.dep_count
             );
         }
+    }
+    if project_scan.inaccessible > 0 {
+        println!(
+            "Warning: {} project paths were unreadable; dependency results are incomplete.",
+            project_scan.inaccessible
+        );
     }
 
     Ok(())
@@ -848,7 +873,7 @@ fn thin_snapshots(path: PathBuf, bytes: u64, confirmed: bool) -> Result<()> {
     if !confirmed {
         println!(
             "Would run: tmutil thinlocalsnapshots {} {} 4",
-            mount.display(),
+            SafePath(&mount),
             bytes
         );
         println!(
@@ -862,13 +887,13 @@ fn thin_snapshots(path: PathBuf, bytes: u64, confirmed: bool) -> Result<()> {
     println!(
         "Requested {} of local snapshot reclamation for {}.",
         human(result.requested_bytes),
-        result.path.display()
+        SafePath(&result.path)
     );
     if !result.stdout.is_empty() {
-        println!("{}", result.stdout);
+        println!("{}", terminal_text::sanitize(&result.stdout));
     }
     if !result.stderr.is_empty() {
-        eprintln!("{}", result.stderr);
+        eprintln!("{}", terminal_text::sanitize(&result.stderr));
     }
     Ok(())
 }
@@ -1047,6 +1072,30 @@ where
                         let handled = match key.code {
                             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
                                 app.close_help();
+                                true
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.scroll_help(1);
+                                true
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.scroll_help(-1);
+                                true
+                            }
+                            KeyCode::PageDown => {
+                                app.scroll_help(10);
+                                true
+                            }
+                            KeyCode::PageUp => {
+                                app.scroll_help(-10);
+                                true
+                            }
+                            KeyCode::Home => {
+                                app.help_scroll = 0;
+                                true
+                            }
+                            KeyCode::End => {
+                                app.help_scroll = usize::MAX;
                                 true
                             }
                             _ => false,
@@ -1457,7 +1506,7 @@ where
                             }
                             true
                         }
-                        KeyCode::Char('S') => {
+                        KeyCode::Char('S') if keymap::is_available_in_focus(app.focus, "S") => {
                             app.scan_all_missing_visible();
                             true
                         }
@@ -1505,11 +1554,11 @@ where
                                 false
                             }
                         }
-                        KeyCode::Char('R') => {
+                        KeyCode::Char('R') if keymap::is_available_in_focus(app.focus, "R") => {
                             app.request_reclaim_scan();
                             true
                         }
-                        KeyCode::Char('o') => {
+                        KeyCode::Char('o') if keymap::is_available_in_focus(app.focus, "o") => {
                             app.cycle_sort();
                             true
                         }
@@ -1555,7 +1604,7 @@ where
                             app.request_disk_info_for_selected_disk();
                             true
                         }
-                        KeyCode::Char('B') => {
+                        KeyCode::Char('B') if keymap::is_available_in_focus(app.focus, "B") => {
                             app.save_history_baseline();
                             true
                         }
@@ -1593,7 +1642,7 @@ where
                                 true
                             }
                         }
-                        KeyCode::Char('.') => {
+                        KeyCode::Char('.') if keymap::is_available_in_focus(app.focus, ".") => {
                             app.toggle_hidden()?;
                             true
                         }

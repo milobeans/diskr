@@ -208,8 +208,8 @@ pub struct Finding {
     pub count: usize,
     pub paths: Vec<PathBuf>,
     /// True when this finding's paths are ancestors of one or more other findings'
-    /// paths, meaning its bytes are already counted inside those child findings.
-    /// Roll-up findings are shown for context but excluded from `report.total`.
+    /// paths. Roll-up findings are shown as contextual subtotals; `report.total`
+    /// is independently calculated from the union of every finding path.
     pub rollup: bool,
 }
 
@@ -220,6 +220,19 @@ pub struct ReclaimReport {
     pub total: SizeInfo,
     pub inaccessible: u32,
     pub skipped_mounts: u32,
+}
+
+struct FindingBuild {
+    finding: Finding,
+    contributions: Vec<PathContribution>,
+}
+
+#[derive(Clone)]
+struct PathContribution {
+    path: PathBuf,
+    size: SizeInfo,
+    inaccessible: u32,
+    skipped_mounts: u32,
 }
 
 /// Scan for reclaimable space under `root`, resolving fixed caches against `$HOME`.
@@ -259,14 +272,20 @@ pub fn classify_by_name_path(
 pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let home = home.map(|home| home.canonicalize().unwrap_or_else(|_| home.to_path_buf()));
-    let mut findings = Vec::new();
+    let mut builds = Vec::new();
 
     if let Some(home) = home.as_deref() {
-        findings.extend(fixed_findings(&root, home));
+        builds.extend(fixed_findings(&root, home));
     }
-    findings.extend(artifact_findings(&root));
+    let (artifact_builds, artifact_search_errors) = artifact_findings(&root);
+    builds.extend(artifact_builds);
 
-    findings.retain(|finding| finding.size.allocated > 0 || finding.size.logical > 0);
+    builds.retain(|build| build.finding.size.allocated > 0 || build.finding.size.logical > 0);
+    let (total, mut inaccessible, skipped_mounts) =
+        union_totals(builds.iter().flat_map(|build| build.contributions.iter()));
+    inaccessible = inaccessible.saturating_add(artifact_search_errors);
+    let mut findings: Vec<Finding> = builds.into_iter().map(|build| build.finding).collect();
+
     findings.sort_by(|a, b| {
         b.size
             .allocated
@@ -281,20 +300,6 @@ pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
     // are active — no hardcoding required.
     mark_rollups(&mut findings);
 
-    let mut total = SizeInfo::default();
-    let mut inaccessible = 0u32;
-    let mut skipped_mounts = 0u32;
-    for finding in &findings {
-        if finding.rollup {
-            // Bytes already counted inside child findings; exclude from total.
-            continue;
-        }
-        total.logical = total.logical.saturating_add(finding.size.logical);
-        total.allocated = total.allocated.saturating_add(finding.size.allocated);
-        inaccessible = inaccessible.saturating_add(finding.inaccessible);
-        skipped_mounts = skipped_mounts.saturating_add(finding.skipped_mounts);
-    }
-
     ReclaimReport {
         root,
         findings,
@@ -304,9 +309,41 @@ pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
     }
 }
 
+/// Sum the minimal set of non-overlapping roots. Per-path contributions retain
+/// bytes that belong to a multi-path category outside an overlapping parent,
+/// while ancestors cover their descendants exactly once.
+fn union_totals<'a>(
+    contributions: impl Iterator<Item = &'a PathContribution>,
+) -> (SizeInfo, u32, u32) {
+    let mut ordered: Vec<PathContribution> = contributions.cloned().collect();
+    ordered.sort_by(|a, b| {
+        a.path
+            .components()
+            .count()
+            .cmp(&b.path.components().count())
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut total = SizeInfo::default();
+    let mut inaccessible = 0u32;
+    let mut skipped_mounts = 0u32;
+    for contribution in ordered {
+        if roots.iter().any(|root| contribution.path.starts_with(root)) {
+            continue;
+        }
+        total.logical = total.logical.saturating_add(contribution.size.logical);
+        total.allocated = total.allocated.saturating_add(contribution.size.allocated);
+        inaccessible = inaccessible.saturating_add(contribution.inaccessible);
+        skipped_mounts = skipped_mounts.saturating_add(contribution.skipped_mounts);
+        roots.push(contribution.path);
+    }
+    (total, inaccessible, skipped_mounts)
+}
+
 /// For every finding whose paths are a strict prefix of another finding's
-/// paths, set `rollup = true`.  A roll-up's bytes are already counted inside
-/// its child findings, so the total must exclude it to avoid double-counting.
+/// paths, set `rollup = true`. Roll-ups remain visible as category subtotals;
+/// report totals are calculated separately from the union of their paths.
 ///
 /// Detection is purely structural: path A is a parent of path B when B starts
 /// with A as a complete component prefix (i.e. `B.starts_with(A)` and `A != B`
@@ -342,7 +379,7 @@ fn is_strict_prefix(ancestor: &Path, descendant: &Path) -> bool {
     descendant.starts_with(ancestor)
 }
 
-fn fixed_findings(root: &Path, home: &Path) -> Vec<Finding> {
+fn fixed_findings(root: &Path, home: &Path) -> Vec<FindingBuild> {
     FIXED_CATEGORIES
         .iter()
         .filter_map(|category| {
@@ -350,6 +387,7 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<Finding> {
             let mut inaccessible = 0u32;
             let mut skipped_mounts = 0u32;
             let mut paths = Vec::new();
+            let mut contributions = Vec::new();
             for rel in category.paths {
                 let candidate = home.join(rel);
                 if !candidate.starts_with(root) || !candidate.is_dir() {
@@ -360,77 +398,121 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<Finding> {
                 size.allocated = size.allocated.saturating_add(scanned.size.allocated);
                 inaccessible = inaccessible.saturating_add(scanned.inaccessible);
                 skipped_mounts = skipped_mounts.saturating_add(scanned.skipped_mounts);
-                paths.push(candidate);
+                paths.push(candidate.clone());
+                contributions.push(PathContribution {
+                    path: candidate,
+                    size: scanned.size,
+                    inaccessible: scanned.inaccessible,
+                    skipped_mounts: scanned.skipped_mounts,
+                });
             }
             if paths.is_empty() {
                 return None;
             }
-            Some(Finding {
-                label: category.label.to_string(),
-                class: category.class,
-                note: category.note.to_string(),
-                size,
-                inaccessible,
-                skipped_mounts,
-                count: paths.len(),
-                paths,
-                rollup: false,
+            Some(FindingBuild {
+                finding: Finding {
+                    label: category.label.to_string(),
+                    class: category.class,
+                    note: category.note.to_string(),
+                    size,
+                    inaccessible,
+                    skipped_mounts,
+                    count: paths.len(),
+                    paths,
+                    rollup: false,
+                },
+                contributions,
             })
         })
         .collect()
 }
 
-fn artifact_findings(root: &Path) -> Vec<Finding> {
-    let hits = find_artifacts(root);
+fn artifact_findings(root: &Path) -> (Vec<FindingBuild>, u32) {
+    let search = find_artifacts(root);
     // Preserve the declared ARTIFACTS order so output is stable before sorting.
-    ARTIFACTS
+    let findings = ARTIFACTS
         .iter()
         .filter_map(|(name, class, note)| {
             let mut size = SizeInfo::default();
             let mut inaccessible = 0u32;
             let mut skipped_mounts = 0u32;
             let mut paths = Vec::new();
-            for path in hits.iter().filter(|(hit_name, _)| hit_name == name) {
+            let mut contributions = Vec::new();
+            for path in search.hits.iter().filter(|(hit_name, _)| hit_name == name) {
                 let scanned = bulkstat::scan_dir(&path.1, 0);
                 size.logical = size.logical.saturating_add(scanned.size.logical);
                 size.allocated = size.allocated.saturating_add(scanned.size.allocated);
                 inaccessible = inaccessible.saturating_add(scanned.inaccessible);
                 skipped_mounts = skipped_mounts.saturating_add(scanned.skipped_mounts);
                 paths.push(path.1.clone());
+                contributions.push(PathContribution {
+                    path: path.1.clone(),
+                    size: scanned.size,
+                    inaccessible: scanned.inaccessible,
+                    skipped_mounts: scanned.skipped_mounts,
+                });
             }
             if paths.is_empty() {
                 return None;
             }
-            Some(Finding {
-                label: (*name).to_string(),
-                class: *class,
-                note: (*note).to_string(),
-                size,
-                inaccessible,
-                skipped_mounts,
-                count: paths.len(),
-                paths,
-                rollup: false,
+            Some(FindingBuild {
+                finding: Finding {
+                    label: (*name).to_string(),
+                    class: *class,
+                    note: (*note).to_string(),
+                    size,
+                    inaccessible,
+                    skipped_mounts,
+                    count: paths.len(),
+                    paths,
+                    rollup: false,
+                },
+                contributions,
             })
         })
-        .collect()
+        .collect();
+    (findings, search.inaccessible)
+}
+
+struct ArtifactSearch {
+    hits: Vec<(&'static str, PathBuf)>,
+    inaccessible: u32,
 }
 
 /// Walk `root` for artifact directories by name. Matched directories are recorded
 /// but not descended into, symlinks are never followed, and the `Library` tree and
 /// unrelated hidden directories are skipped to keep the walk fast and focused on
 /// project trees.
-fn find_artifacts(root: &Path) -> Vec<(&'static str, PathBuf)> {
+fn find_artifacts(root: &Path) -> ArtifactSearch {
     let mut hits = Vec::new();
+    let mut inaccessible = 0u32;
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
     while let Some((dir, depth)) = stack.pop() {
-        let Ok(read) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in read.flatten() {
-            let Ok(file_type) = entry.file_type() else {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                inaccessible = inaccessible.saturating_add(1);
                 continue;
+            }
+        };
+        for entry in read {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    inaccessible = inaccessible.saturating_add(1);
+                    continue;
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    inaccessible = inaccessible.saturating_add(1);
+                    continue;
+                }
             };
             if !file_type.is_dir() {
                 continue;
@@ -448,7 +530,7 @@ fn find_artifacts(root: &Path) -> Vec<(&'static str, PathBuf)> {
             }
         }
     }
-    hits
+    ArtifactSearch { hits, inaccessible }
 }
 
 /// Skip the `Library` tree (its caches are covered by fixed categories) and any
@@ -548,8 +630,9 @@ mod tests {
         )
         .unwrap();
 
-        let hits = find_artifacts(&root);
-        let node_hits = hits
+        let search = find_artifacts(&root);
+        let node_hits = search
+            .hits
             .iter()
             .filter(|(name, _)| *name == "node_modules")
             .count();
@@ -567,9 +650,9 @@ mod tests {
         fs::create_dir_all(root.join("Library/weird/node_modules")).unwrap();
         fs::write(root.join("Library/weird/node_modules/x.js"), vec![0u8; 512]).unwrap();
 
-        let hits = find_artifacts(&root);
+        let search = find_artifacts(&root);
         assert!(
-            hits.is_empty(),
+            search.hits.is_empty(),
             "recursive pass should not walk into the Library tree"
         );
         fs::remove_dir_all(root).unwrap();
@@ -612,8 +695,8 @@ mod tests {
 
     // --- rollup / double-counting tests ---
 
-    /// Parent + child both present: the parent is marked rollup, and the
-    /// total equals only the child's bytes, not parent + child.
+    /// Parent + child both present: the parent is marked rollup, while the
+    /// path union keeps parent-only residual bytes and counts the child once.
     #[test]
     fn parent_child_overlap_counts_bytes_once() {
         let root = test_root("reclaim_overlap");
@@ -625,6 +708,12 @@ mod tests {
         fs::write(
             root.join("Library/Caches/Homebrew/bottle.bin"),
             vec![0u8; 8192],
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("Library/Caches/OtherApp")).unwrap();
+        fs::write(
+            root.join("Library/Caches/OtherApp/cache.bin"),
+            vec![0u8; 4096],
         )
         .unwrap();
 
@@ -644,13 +733,13 @@ mod tests {
         assert!(user_caches.rollup, "User caches should be marked rollup");
         assert!(!homebrew.rollup, "Homebrew cache should NOT be rollup");
 
-        // The total must not exceed the child's size (it shouldn't count the
-        // parent's overlapping bytes on top).
+        assert_eq!(
+            report.total.logical, user_caches.size.logical,
+            "the union should equal the parent subtree without adding the child twice"
+        );
         assert!(
-            report.total.logical <= homebrew.size.logical,
-            "total ({}) must not exceed the disjoint child size ({})",
-            report.total.logical,
-            homebrew.size.logical,
+            report.total.logical > homebrew.size.logical,
+            "parent-only residual bytes must remain in the total"
         );
 
         fs::remove_dir_all(root).unwrap();

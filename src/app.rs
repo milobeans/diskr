@@ -80,7 +80,7 @@ pub struct Entry {
     pub modified: Option<SystemTime>,
     pub scanning: bool,
     /// Allocated-size change since this directory's previous scan, recorded when
-    /// a fresh scan lands and a prior cached value was in hand (issue #84).
+    /// a fresh scan lands and a prior cached value was in hand.
     /// `None` means there was no prior value to diff against.
     pub size_delta: Option<i64>,
 }
@@ -147,6 +147,7 @@ pub struct FileInfo {
     pub path: PathBuf,
     pub kind: &'static str,
     pub direct_items: Option<usize>,
+    pub direct_item_errors: u32,
     pub size: Option<SizeInfo>,
     pub size_stale: bool,
     pub inaccessible: u32,
@@ -175,12 +176,24 @@ fn collect_file_info(entry: &Entry) -> Result<FileInfo> {
     } else {
         "special"
     };
-    let direct_items = if file_type.is_dir() {
-        std::fs::read_dir(&entry.path)
-            .ok()
-            .map(|read| read.flatten().count())
+    let (direct_items, direct_item_errors) = if file_type.is_dir() {
+        match std::fs::read_dir(&entry.path) {
+            Ok(read) => {
+                let mut count = 0usize;
+                let mut errors = 0u32;
+                for child in read {
+                    match child {
+                        Ok(_) => count = count.saturating_add(1),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => errors = errors.saturating_add(1),
+                    }
+                }
+                (Some(count), errors)
+            }
+            Err(_) => (None, 1),
+        }
     } else {
-        None
+        (None, 0)
     };
     let size = if entry.is_dir {
         entry.size
@@ -196,6 +209,7 @@ fn collect_file_info(entry: &Entry) -> Result<FileInfo> {
         path: entry.path.clone(),
         kind,
         direct_items,
+        direct_item_errors,
         size,
         size_stale: entry.size_stale,
         inaccessible: entry.inaccessible,
@@ -354,11 +368,14 @@ pub struct App {
     pub focus: Focus,
     pub disks: Vec<DiskInfo>,
     pub status: String,
+    pub cwd_enumeration_errors: u32,
     pub show_help: bool,
+    pub help_scroll: usize,
     pub confirming_delete: bool,
 
     pub pkg_reports: Vec<ManagerReport>,
     pub project_deps: Vec<ProjectDeps>,
+    pub project_dep_errors: u32,
     project_deps_cwd: Option<PathBuf>,
     pub pkg_view: PkgView,
     pub packages_loaded: bool,
@@ -397,13 +414,14 @@ pub struct App {
     size_cache: HashMap<PathBuf, SizeInfo>,
     inaccessible_cache: HashMap<PathBuf, u32>,
     /// `$HOME`, captured once so the files pane can classify fixed-cache rows
-    /// (issue #74) without re-reading the environment per frame.
+    /// without re-reading the environment per frame.
     pub home: Option<PathBuf>,
     /// True when TCC blocks reads under ~/Library (no Full Disk Access);
     /// scans there will undercount, so the header shows a persistent hint.
     pub fda_limited: bool,
     cache_age: HashMap<PathBuf, u64>,
     stale_size_cache: HashSet<PathBuf>,
+    cache_invalidations: HashMap<PathBuf, u64>,
     size_cache_dirty: bool,
     last_size_cache_save: Instant,
     entry_index: HashMap<PathBuf, usize>,
@@ -414,7 +432,7 @@ pub struct App {
     min_valid_scan_id: ScanId,
     active_scan_paths: HashSet<PathBuf>,
     /// Directories the cursor visited while a scan was in flight; scanned once
-    /// the active batch finishes so navigation never cancels it (issue #57).
+    /// the active batch finishes so navigation never cancels it.
     pending_scan_dirs: Vec<PathBuf>,
 
     active_reclaim_scan_id: ScanId,
@@ -450,12 +468,14 @@ pub struct App {
     pub disk_info_report: Option<space::SpaceReport>,
     pub file_info: Option<FileInfo>,
     pub file_info_open: bool,
+    file_info_rx: Option<Receiver<Result<FileInfo, String>>>,
 
     pub history_baseline: Option<history::ScanRecord>,
     pub history_diff: Option<history::DiffReport>,
     history_records: HashMap<PathBuf, history::ScanRecord>,
     active_history_request_id: u64,
     history_loading: bool,
+    history_saving: bool,
     /// Cancellation generation for the background history-diff walk; bumped to
     /// stop a walk for a directory the user has navigated away from.
     history_generation: Arc<AtomicU64>,
@@ -479,7 +499,7 @@ pub struct App {
     uninstall_rx: Option<Receiver<UninstallResult>>,
     pub confirming_empty_trash: bool,
     empty_trash_rx: Option<Receiver<Result<(), String>>>,
-    batch_delete_rx: Option<Receiver<BatchDeleteMsg>>,
+    batch_delete_rx: Option<Receiver<DeleteJobMsg>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -493,6 +513,7 @@ struct PkgScanMsg {
     cwd: PathBuf,
     reports: Vec<ManagerReport>,
     project_deps: Vec<ProjectDeps>,
+    project_dep_errors: u32,
     include_managers: bool,
 }
 
@@ -511,7 +532,8 @@ struct UninstallResult {
     result: Result<String, String>,
 }
 
-struct BatchDeleteMsg {
+struct DeleteJobMsg {
+    target: DeleteTarget,
     deleted: Vec<PathBuf>,
     failures: Vec<(PathBuf, String)>,
 }
@@ -528,7 +550,7 @@ impl App {
         let (history_records, history_warning) = history::load_records_with_warning();
         // Ask FSEvents which directories actually changed since the last launch;
         // unchanged trees keep their cached size fresh instead of all being
-        // revalidated by #82's age-based pass. Skipped under test, which must
+        // revalidated by the age-based pass. Skipped under test, which must
         // not touch the real FSEvents sidecar or depend on event history.
         let freshness = if cfg!(test) {
             fsevents::Freshness::All
@@ -572,10 +594,13 @@ impl App {
             focus: Focus::Files,
             disks: Vec::new(),
             status: String::from("i info · f Finder · O open"),
+            cwd_enumeration_errors: 0,
             show_help: false,
+            help_scroll: 0,
             confirming_delete: false,
             pkg_reports: Vec::new(),
             project_deps: Vec::new(),
+            project_dep_errors: 0,
             project_deps_cwd: None,
             pkg_view: PkgView::SystemManagers,
             packages_loaded: false,
@@ -609,6 +634,7 @@ impl App {
             inaccessible_cache,
             cache_age,
             stale_size_cache,
+            cache_invalidations: HashMap::new(),
             size_cache_dirty,
             last_size_cache_save: Instant::now(),
             home: std::env::var_os("HOME").map(PathBuf::from),
@@ -649,11 +675,13 @@ impl App {
             disk_info_report: None,
             file_info: None,
             file_info_open: false,
+            file_info_rx: None,
             history_baseline: None,
             history_diff: None,
             history_records,
             active_history_request_id: 0,
             history_loading: false,
+            history_saving: false,
             history_generation: Arc::new(AtomicU64::new(0)),
             history_rx: None,
             #[cfg(test)]
@@ -704,6 +732,7 @@ impl App {
             .fetch_add(1, AtomicOrdering::Relaxed);
         self.history_rx = None;
         self.history_loading = false;
+        self.history_saving = false;
         self.history_baseline = baseline;
         self.history_diff = None;
         let Some(baseline) = self.history_baseline.clone() else {
@@ -775,6 +804,7 @@ impl App {
     fn rebuild_entries(&mut self) -> Result<()> {
         self.entries.clear();
         self.entry_index.clear();
+        self.cwd_enumeration_errors = 0;
         // The scan queue holds paths from the directory being left behind.
         self.pending_scan_dirs.clear();
         let read = match std::fs::read_dir(&self.cwd) {
@@ -784,13 +814,28 @@ impl App {
                 return Ok(());
             }
         };
-        for dirent in read.flatten() {
+        for dirent in read {
+            let dirent = match dirent {
+                Ok(dirent) => dirent,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    self.cwd_enumeration_errors = self.cwd_enumeration_errors.saturating_add(1);
+                    continue;
+                }
+            };
             let name = dirent.file_name().to_string_lossy().into_owned();
             if !self.show_hidden && name.starts_with('.') {
                 continue;
             }
             let path = dirent.path();
-            let meta = std::fs::symlink_metadata(&path).ok();
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => Some(meta),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    self.cwd_enumeration_errors = self.cwd_enumeration_errors.saturating_add(1);
+                    None
+                }
+            };
             let file_type = meta.as_ref().map(|m| m.file_type());
             let is_dir = file_type
                 .as_ref()
@@ -1393,6 +1438,7 @@ impl App {
         changed |= self.drain_reclaim_results();
         changed |= self.drain_top_files_results();
         changed |= self.drain_disk_info_results();
+        changed |= self.drain_file_info_results();
         changed |= self.drain_history_results();
         changed |= self.drain_empty_trash_results();
         changed |= self.drain_batch_delete_results();
@@ -1400,6 +1446,14 @@ impl App {
     }
 
     pub fn save_history_baseline(&mut self) {
+        if self.history_saving {
+            self.status = String::from("baseline save already in progress");
+            return;
+        }
+        self.history_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.history_rx = None;
+        self.history_loading = false;
         self.start_history_save_request(self.cwd.clone());
         self.history_diff = None;
         self.status = String::from("saving baseline...");
@@ -1419,10 +1473,16 @@ impl App {
 
     pub fn open_help(&mut self) {
         self.show_help = true;
+        self.help_scroll = 0;
     }
 
     pub fn close_help(&mut self) {
         self.show_help = false;
+        self.help_scroll = 0;
+    }
+
+    pub fn scroll_help(&mut self, delta: isize) {
+        self.help_scroll = self.help_scroll.saturating_add_signed(delta);
     }
 
     pub fn top_files_loading(&self) -> bool {
@@ -1581,6 +1641,7 @@ impl App {
         let (tx, rx) = channel();
         self.history_rx = Some(rx);
         self.history_loading = true;
+        self.history_saving = false;
         thread::spawn(move || {
             match history::diff_from_record_with_cancellation(&baseline, &cwd, &cancellation) {
                 // Cancelled mid-walk: a newer request now owns the loading state,
@@ -1609,6 +1670,7 @@ impl App {
         let (tx, rx) = channel();
         self.history_rx = Some(rx);
         self.history_loading = true;
+        self.history_saving = true;
         thread::spawn(move || {
             let result = history::scan_record(&cwd).map_err(|err| err.to_string());
             let _ = tx.send(HistoryMsg {
@@ -1626,6 +1688,7 @@ impl App {
         match rx.try_recv() {
             Ok(msg) => {
                 self.history_loading = false;
+                self.history_saving = false;
                 if msg.request_id != self.active_history_request_id || msg.cwd != self.cwd {
                     self.status = String::from("discarded stale history result");
                     return true;
@@ -1665,6 +1728,7 @@ impl App {
             }
             Err(TryRecvError::Disconnected) => {
                 self.history_loading = false;
+                self.history_saving = false;
                 self.status = String::from("history worker failed");
                 true
             }
@@ -1927,23 +1991,53 @@ impl App {
     }
 
     pub fn open_file_info(&mut self) {
+        if self.file_info_rx.is_some() {
+            self.status = String::from("file info is already loading");
+            return;
+        }
         let Some(entry) = self.visible_entry(self.selected).cloned() else {
             self.status = String::from("no file selected");
             return;
         };
-        match collect_file_info(&entry) {
-            Ok(info) => {
-                self.file_info = Some(info);
-                self.file_info_open = true;
-            }
-            Err(err) => {
-                self.status = format!("file info failed: {err}");
-            }
-        }
+        let (tx, rx) = channel();
+        self.file_info = None;
+        self.file_info_rx = Some(rx);
+        self.status = String::from("loading file info…");
+        thread::spawn(move || {
+            let result = collect_file_info(&entry).map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        });
     }
 
     pub fn close_file_info(&mut self) {
         self.file_info_open = false;
+    }
+
+    fn drain_file_info_results(&mut self) -> bool {
+        let recv = match self.file_info_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+        match recv {
+            Ok(Ok(info)) => {
+                self.file_info_rx = None;
+                self.file_info = Some(info);
+                self.file_info_open = true;
+                self.status.clear();
+                true
+            }
+            Ok(Err(err)) => {
+                self.file_info_rx = None;
+                self.status = format!("file info failed: {err}");
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.file_info_rx = None;
+                self.status = String::from("file info worker failed");
+                true
+            }
+        }
     }
 
     /// Explain-first guardrail: emptying the Trash is permanent, so `E` only
@@ -2084,6 +2178,7 @@ impl App {
             || self.top_files_loading
             || self.reclaim_loading
             || self.disk_info_loading
+            || self.file_info_rx.is_some()
             || self.history_loading
             || self.packages_loading
             || self.deps_loading
@@ -2094,6 +2189,10 @@ impl App {
 
     pub fn request_delete(&mut self) {
         if self.confirming_delete {
+            return;
+        }
+        if self.batch_delete_rx.is_some() {
+            self.status = String::from("another Trash operation is already in progress");
             return;
         }
         if self.focus == Focus::Files && !self.marked.is_empty() {
@@ -2184,98 +2283,51 @@ impl App {
     }
 
     pub fn confirm_delete(&mut self) -> Result<()> {
+        if self.batch_delete_rx.is_some() {
+            self.status = String::from("another Trash operation is already in progress");
+            return Ok(());
+        }
         self.confirming_delete = false;
         if let Some(target) = self.pending_delete.take() {
-            let top_files_path = self.top_files_path.clone();
-            let _reclaim_finding = self.reclaim_paths_finding;
-            match target {
-                DeleteTarget::FileEntry(entry) => {
-                    match crate::fs_ops::delete_to_trash(&entry.path) {
-                        Ok(()) => {
-                            self.status = format!("moved to trash: {}", entry.name);
-                            self.invalidate_cache_for(&entry.path);
-                            self.refresh_disks();
-                            let status = self.status.clone();
-                            self.reload()?;
-                            self.status = status;
-                            self.refresh_history_state();
-                        }
-                        Err(e) => self.status = format!("delete failed: {e}"),
-                    }
-                }
-                DeleteTarget::TopFile { name, path } => match crate::fs_ops::delete_to_trash(&path)
-                {
-                    Ok(()) => {
-                        self.status = format!("moved to trash: {name}");
-                        self.invalidate_cache_for(&path);
-                        self.refresh_disks();
-                        if let Some(path) = top_files_path {
-                            self.open_top_files_for_path(path);
-                        }
-                        self.refresh_history_state();
-                    }
-                    Err(e) => self.status = format!("delete failed: {e}"),
-                },
-                DeleteTarget::ReclaimPath {
-                    finding_index,
-                    name,
-                    path,
-                } => match crate::fs_ops::delete_to_trash(&path) {
-                    Ok(()) => {
-                        self.status = format!("moved to trash: {name}");
-                        self.invalidate_cache_for(&path);
-                        self.refresh_disks();
-                        self.rescan_reclaim_finding(finding_index);
-                        self.selected_reclaim =
-                            finding_index.min(self.reclaim_item_count().saturating_sub(1));
-                        self.refresh_history_state();
-                    }
-                    Err(e) => {
-                        self.status = format!("delete failed: {e}");
-                    }
-                },
-                DeleteTarget::Package {
-                    name,
-                    path,
-                    is_project_dep,
-                } => match crate::fs_ops::delete_to_trash(&path) {
-                    Ok(()) => {
-                        self.status = format!("moved to trash: {name}");
-                        self.invalidate_cache_for(&path);
-                        self.refresh_disks();
-                        if is_project_dep {
-                            self.reload_project_deps();
-                        } else {
-                            self.refresh_packages();
-                        }
-                        self.refresh_history_state();
-                    }
-                    Err(e) => self.status = format!("delete failed: {e}"),
-                },
-                DeleteTarget::Batch => {
-                    let marked: Vec<PathBuf> = self.marked.iter().cloned().collect();
-                    self.marked.clear();
-                    self.start_batch_delete_with(marked, crate::fs_ops::delete_to_trash);
-                }
+            let paths = match &target {
+                DeleteTarget::FileEntry(entry) => vec![entry.path.clone()],
+                DeleteTarget::TopFile { path, .. }
+                | DeleteTarget::ReclaimPath { path, .. }
+                | DeleteTarget::Package { path, .. } => vec![path.clone()],
+                DeleteTarget::Batch => self.marked.iter().cloned().collect(),
+            };
+            if self.start_delete_with(target.clone(), paths, crate::fs_ops::delete_to_trash)
+                && matches!(target, DeleteTarget::Batch)
+            {
+                self.marked.clear();
             }
         }
         Ok(())
     }
 
-    fn start_batch_delete_with(&mut self, paths: Vec<PathBuf>, delete: fn(&Path) -> Result<()>) {
+    fn start_delete_with(
+        &mut self,
+        target: DeleteTarget,
+        paths: Vec<PathBuf>,
+        delete: fn(&Path) -> Result<()>,
+    ) -> bool {
         if paths.is_empty() {
             self.status = String::from("nothing marked for deletion");
-            return;
+            return false;
         }
         if self.batch_delete_rx.is_some() {
-            self.status = String::from("batch delete already in progress");
-            return;
+            self.status = String::from("another Trash operation is already in progress");
+            return false;
         }
 
         let total = paths.len();
         let (tx, rx) = std::sync::mpsc::channel();
         self.batch_delete_rx = Some(rx);
-        self.status = format!("moving {total} marked {} to Trash...", item_noun(total));
+        self.status = if matches!(target, DeleteTarget::Batch) {
+            format!("moving {total} marked {} to Trash...", item_noun(total))
+        } else {
+            String::from("moving item to Trash…")
+        };
 
         thread::spawn(move || {
             let mut deleted = Vec::new();
@@ -2286,8 +2338,13 @@ impl App {
                     Err(err) => failures.push((path, err.to_string())),
                 }
             }
-            let _ = tx.send(BatchDeleteMsg { deleted, failures });
+            let _ = tx.send(DeleteJobMsg {
+                target,
+                deleted,
+                failures,
+            });
         });
+        true
     }
 
     fn drain_batch_delete_results(&mut self) -> bool {
@@ -2302,17 +2359,19 @@ impl App {
                 for path in &msg.deleted {
                     self.invalidate_cache_for(path);
                 }
-                self.refresh_disks();
-                let reload_result = self.reload();
-                self.refresh_history_state();
+                if !msg.deleted.is_empty() {
+                    self.refresh_disks();
+                    self.refresh_history_state();
+                }
 
-                let deleted_count = msg.deleted.len();
-                let delete_status = if msg.failures.is_empty() {
-                    format!(
-                        "moved {deleted_count} marked {} to trash",
-                        item_noun(deleted_count)
-                    )
-                } else {
+                if !msg.failures.is_empty() {
+                    if matches!(&msg.target, DeleteTarget::Batch) && !msg.deleted.is_empty() {
+                        let _ = self.reload();
+                    }
+                    if matches!(&msg.target, DeleteTarget::Batch) {
+                        self.marked
+                            .extend(msg.failures.iter().map(|(path, _)| path.clone()));
+                    }
                     let names: Vec<String> = msg
                         .failures
                         .iter()
@@ -2320,13 +2379,59 @@ impl App {
                             p.file_name().map(|n| n.to_string_lossy().into_owned())
                         })
                         .collect();
-                    format!("some items failed: {}", names.join(", "))
-                };
+                    self.status = format!("Trash failed for: {}", names.join(", "));
+                    return true;
+                }
 
-                self.status = match reload_result {
-                    Ok(()) => delete_status,
-                    Err(err) => format!("{delete_status} · reload failed: {err}"),
-                };
+                match msg.target {
+                    DeleteTarget::FileEntry(entry) => {
+                        let result = self.reload();
+                        self.status = match result {
+                            Ok(()) => format!("moved to trash: {}", entry.name),
+                            Err(err) => format!("moved to trash · reload failed: {err}"),
+                        };
+                    }
+                    DeleteTarget::TopFile { name, .. } => {
+                        self.status = format!("moved to trash: {name}");
+                        if let Some(path) = self.top_files_path.clone() {
+                            self.open_top_files_for_path(path);
+                        }
+                    }
+                    DeleteTarget::ReclaimPath {
+                        finding_index,
+                        name,
+                        ..
+                    } => {
+                        self.status = format!("moved to trash: {name}");
+                        self.rescan_reclaim_finding(finding_index);
+                        self.selected_reclaim =
+                            finding_index.min(self.reclaim_item_count().saturating_sub(1));
+                    }
+                    DeleteTarget::Package {
+                        name,
+                        is_project_dep,
+                        ..
+                    } => {
+                        self.status = format!("moved to trash: {name}");
+                        if is_project_dep {
+                            self.reload_project_deps();
+                        } else {
+                            self.refresh_packages();
+                        }
+                    }
+                    DeleteTarget::Batch => {
+                        let deleted_count = msg.deleted.len();
+                        let result = self.reload();
+                        let base = format!(
+                            "moved {deleted_count} marked {} to trash",
+                            item_noun(deleted_count)
+                        );
+                        self.status = match result {
+                            Ok(()) => base,
+                            Err(err) => format!("{base} · reload failed: {err}"),
+                        };
+                    }
+                }
                 true
             }
             Err(TryRecvError::Empty) => false,
@@ -2354,7 +2459,16 @@ impl App {
             return Ok(());
         }
         let entries = self.size_cache_entries_for_store(now_secs());
-        state::store_size_cache(&entries)?;
+        let invalidations: Vec<state::CacheInvalidation> = self
+            .cache_invalidations
+            .iter()
+            .map(|(path, invalidated_at)| state::CacheInvalidation {
+                path: path.clone(),
+                invalidated_at: *invalidated_at,
+            })
+            .collect();
+        state::store_size_cache(&entries, &invalidations)?;
+        self.cache_invalidations.clear();
         self.size_cache_dirty = false;
         self.last_size_cache_save = Instant::now();
         Ok(())
@@ -2384,6 +2498,13 @@ impl App {
             entries.truncate(state::SIZE_CACHE_MAX_ENTRIES);
             let retained: HashSet<PathBuf> =
                 entries.iter().map(|entry| entry.path.clone()).collect();
+            let invalidated_at = now_secs();
+            self.cache_invalidations.extend(
+                self.size_cache
+                    .keys()
+                    .filter(|path| !retained.contains(*path))
+                    .map(|path| (path.clone(), invalidated_at)),
+            );
             self.size_cache.retain(|path, _| retained.contains(path));
             self.inaccessible_cache
                 .retain(|path, _| retained.contains(path));
@@ -2401,6 +2522,7 @@ impl App {
         scanned_at: u64,
         stale: bool,
     ) {
+        self.cache_invalidations.remove(&path);
         self.size_cache.insert(path.clone(), size);
         if inaccessible > 0 {
             self.inaccessible_cache.insert(path.clone(), inaccessible);
@@ -2422,11 +2544,20 @@ impl App {
         removed |= self.cache_age.remove(path).is_some();
         removed |= self.stale_size_cache.remove(path);
         if removed {
+            self.cache_invalidations
+                .insert(path.to_path_buf(), now_secs());
             self.size_cache_dirty = true;
         }
     }
 
     fn remove_cached_subtree(&mut self, path: &Path) {
+        let invalidated_at = now_secs();
+        let removed_paths: Vec<PathBuf> = self
+            .size_cache
+            .keys()
+            .filter(|cached| cached.starts_with(path))
+            .cloned()
+            .collect();
         let mut removed = false;
         self.size_cache.retain(|cached, _| {
             let keep = !cached.starts_with(path);
@@ -2449,6 +2580,8 @@ impl App {
             keep
         });
         if removed {
+            self.cache_invalidations
+                .extend(removed_paths.into_iter().map(|path| (path, invalidated_at)));
             self.size_cache_dirty = true;
         }
     }
@@ -2586,12 +2719,13 @@ impl App {
             } else {
                 Vec::new()
             };
-            let project_deps = packages::find_project_deps(&cwd, 5);
+            let project_scan = packages::scan_project_deps(&cwd, 5);
             let _ = tx.send(PkgScanMsg {
                 scan_id,
                 cwd,
                 reports,
-                project_deps,
+                project_deps: project_scan.projects,
+                project_dep_errors: project_scan.inaccessible,
                 include_managers,
             });
         });
@@ -2625,6 +2759,7 @@ impl App {
                         self.packages_loaded = true;
                     }
                     self.project_deps = msg.project_deps;
+                    self.project_dep_errors = msg.project_dep_errors;
                     self.project_deps_cwd = Some(msg.cwd);
                     self.rebuild_project_dep_search_text();
                     self.rebuild_flat_packages();
@@ -2646,16 +2781,29 @@ impl App {
                             self.pkg_reports.iter().filter(|r| r.available).count(),
                             self.project_deps.len()
                         );
-                        if warnings.is_empty() {
+                        if warnings.is_empty() && self.project_dep_errors == 0 {
                             self.status = base;
                         } else {
+                            let mut warnings: Vec<String> =
+                                warnings.into_iter().map(str::to_owned).collect();
+                            if self.project_dep_errors > 0 {
+                                warnings.push(format!(
+                                    "{} project paths unreadable",
+                                    self.project_dep_errors
+                                ));
+                            }
                             self.status = format!("{base} ({})", warnings.join("; "));
                         }
                         self.start_dep_scan();
                     } else {
                         self.status = format!(
-                            "project dependencies refreshed · {} projects",
-                            self.project_deps.len()
+                            "project dependencies refreshed · {} projects{}",
+                            self.project_deps.len(),
+                            if self.project_dep_errors > 0 {
+                                format!(" · {} paths unreadable", self.project_dep_errors)
+                            } else {
+                                String::new()
+                            }
                         );
                     }
                     true
@@ -2762,7 +2910,8 @@ impl App {
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
                 self.uninstall_rx = None;
-                false
+                self.status = String::from("uninstall worker failed");
+                true
             }
         }
     }
@@ -4123,6 +4272,30 @@ mod tests {
     }
 
     #[test]
+    fn active_trash_worker_preserves_new_marks() {
+        let root = test_root("delete_worker_guard");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("a.txt");
+        fs::write(&path, b"a").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.selected = app
+            .entries
+            .iter()
+            .position(|entry| entry.path == path)
+            .unwrap();
+        app.toggle_mark();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.batch_delete_rx = Some(rx);
+
+        app.request_delete();
+
+        assert!(app.is_marked(&path));
+        assert!(!app.confirming_delete);
+        assert!(app.status.contains("already in progress"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn batch_delete_result_invalidates_and_reports_without_blocking() {
         let root = test_root("batch_delete_worker_result");
         fs::create_dir_all(&root).unwrap();
@@ -4133,7 +4306,8 @@ mod tests {
         app.size_cache.insert(path.clone(), SizeInfo::new(10, 10));
         let (tx, rx) = std::sync::mpsc::channel();
         app.batch_delete_rx = Some(rx);
-        tx.send(BatchDeleteMsg {
+        tx.send(DeleteJobMsg {
+            target: DeleteTarget::Batch,
             deleted: vec![path.clone()],
             failures: Vec::new(),
         })
@@ -4144,6 +4318,28 @@ mod tests {
         assert!(!app.size_cache.contains_key(&path));
         assert_eq!(app.status, "moved 1 marked item to trash");
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_batch_delete_paths_are_marked_again() {
+        let root = test_root("batch_delete_failed_marks");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("failed.txt");
+        fs::write(&path, b"still here").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.batch_delete_rx = Some(rx);
+        tx.send(DeleteJobMsg {
+            target: DeleteTarget::Batch,
+            deleted: Vec::new(),
+            failures: vec![(path.clone(), String::from("denied"))],
+        })
+        .unwrap();
+
+        assert!(app.drain_batch_delete_results());
+        assert!(app.is_marked(&path));
+        assert!(app.status.contains("failed.txt"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4674,6 +4870,13 @@ mod tests {
 
         app.open_file_info();
 
+        for _ in 0..100 {
+            if app.drain_file_info_results() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
         let info = app.file_info.as_ref().expect("file info");
         assert!(app.file_info_open);
         assert_eq!(info.kind, "directory");
@@ -4723,6 +4926,7 @@ mod tests {
         app.history_baseline = Some(history::ScanRecord {
             path: root.clone(),
             timestamp: now_secs().saturating_sub(60),
+            enumeration_errors: 0,
             children: Vec::new(),
         });
 
@@ -4768,6 +4972,7 @@ mod tests {
         let baseline = history::ScanRecord {
             path: root.clone(),
             timestamp: now_secs().saturating_sub(30),
+            enumeration_errors: 0,
             children: Vec::new(),
         };
 
@@ -4778,6 +4983,22 @@ mod tests {
         assert!(app.history_rx.is_some());
         assert!(app.history_diff.is_none());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_baseline_save_is_coalesced() {
+        let root = test_root("history_save_single_flight");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.history_saving = true;
+        app.history_loading = true;
+        let request_id = app.active_history_request_id;
+
+        app.save_history_baseline();
+
+        assert_eq!(app.active_history_request_id, request_id);
+        assert_eq!(app.status, "baseline save already in progress");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4796,6 +5017,7 @@ mod tests {
                 history::ScanRecord {
                     path,
                     timestamp: idx as u64,
+                    enumeration_errors: 0,
                     children: Vec::new(),
                 },
             );
@@ -4812,6 +5034,7 @@ mod tests {
             result: HistoryResult::Save(Ok(history::ScanRecord {
                 path: canonical.clone(),
                 timestamp: history::HISTORY_MAX_RECORDS as u64 + 10,
+                enumeration_errors: 0,
                 children: Vec::new(),
             })),
         })
@@ -4845,6 +5068,7 @@ mod tests {
         app.history_baseline = Some(history::ScanRecord {
             path: root_a.clone(),
             timestamp: 100,
+            enumeration_errors: 0,
             children: Vec::new(),
         });
         app.cwd = root_b.clone();
@@ -4897,6 +5121,7 @@ mod tests {
             result: HistoryResult::Save(Ok(history::ScanRecord {
                 path: canonical.clone(),
                 timestamp: 100,
+                enumeration_errors: 0,
                 children: Vec::new(),
             })),
         })
@@ -4974,6 +5199,7 @@ mod tests {
                 deps_size: None,
                 deps_dir: Some(root_a.join("target")),
             }],
+            project_dep_errors: 0,
             include_managers: false,
         })
         .unwrap();

@@ -35,6 +35,8 @@ pub struct ScanRecord {
     pub path: PathBuf,
     /// Seconds since the Unix epoch when the baseline was captured.
     pub timestamp: u64,
+    /// Immediate entries that could not be enumerated or inspected.
+    pub enumeration_errors: u32,
     pub children: Vec<ChildSize>,
 }
 
@@ -53,7 +55,9 @@ impl ScanRecord {
     pub fn inaccessible(&self) -> u32 {
         self.children
             .iter()
-            .fold(0u32, |acc, child| acc.saturating_add(child.inaccessible))
+            .fold(self.enumeration_errors, |acc, child| {
+                acc.saturating_add(child.inaccessible)
+            })
     }
 }
 
@@ -221,6 +225,7 @@ pub(crate) fn scan_record(path: &Path) -> Result<ScanRecord> {
         scan_record_with_cancellation(path, &never)?.unwrap_or_else(|| ScanRecord {
             path: path.to_path_buf(),
             timestamp: now_secs(),
+            enumeration_errors: 0,
             children: Vec::new(),
         }),
     )
@@ -238,16 +243,29 @@ pub(crate) fn scan_record_with_cancellation(
         .canonicalize()
         .with_context(|| format!("resolve {}", path.display()))?;
     let mut children = Vec::new();
+    let mut enumeration_errors = 0u32;
     let read =
         std::fs::read_dir(&canonical).with_context(|| format!("read {}", canonical.display()))?;
-    for entry in read.flatten() {
+    for entry in read {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                enumeration_errors = enumeration_errors.saturating_add(1);
+                continue;
+            }
+        };
         let name = entry.file_name().to_string_lossy().into_owned();
         let meta = match std::fs::symlink_metadata(entry.path()) {
             Ok(meta) => meta,
-            Err(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                enumeration_errors = enumeration_errors.saturating_add(1);
+                continue;
+            }
         };
         let file_type = meta.file_type();
         if file_type.is_symlink() {
@@ -281,6 +299,7 @@ pub(crate) fn scan_record_with_cancellation(
     Ok(Some(ScanRecord {
         path: canonical,
         timestamp: now_secs(),
+        enumeration_errors,
         children,
     }))
 }
@@ -338,9 +357,7 @@ fn load_records_from_path(path: &Path) -> Result<HashMap<PathBuf, ScanRecord>> {
             (path, record)
         })
         .collect();
-    if prune_records(&mut records) {
-        store_records_to_path(path, &records)?;
-    }
+    prune_records(&mut records);
     Ok(records)
 }
 
@@ -364,11 +381,12 @@ pub(crate) fn store_record_to_path(path: &Path, record: &ScanRecord) -> Result<(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    let mut records = load_records_from_path(path)?;
-    records.insert(record.path.clone(), record.clone());
-    prune_records(&mut records);
-    store_records_to_path(path, &records)?;
-    Ok(())
+    state::with_exclusive_lock(path, || {
+        let mut records = load_records_from_path(path)?;
+        records.insert(record.path.clone(), record.clone());
+        prune_records(&mut records);
+        store_records_to_path(path, &records)
+    })
 }
 
 pub(crate) fn prune_records(records: &mut HashMap<PathBuf, ScanRecord>) -> bool {
@@ -418,12 +436,18 @@ fn record_to_json(record: &ScanRecord) -> serde_json::Value {
     serde_json::json!({
         "path": record.path.to_string_lossy(),
         "timestamp": record.timestamp,
+        "enumeration_errors": record.enumeration_errors,
         "children": children,
     })
 }
 
 fn record_from_json(path: &Path, value: &serde_json::Value) -> ScanRecord {
     let timestamp = value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+    let enumeration_errors = value
+        .get("enumeration_errors")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
     let children = value
         .get("children")
         .and_then(|v| v.as_array())
@@ -458,6 +482,7 @@ fn record_from_json(path: &Path, value: &serde_json::Value) -> ScanRecord {
     ScanRecord {
         path: path.to_path_buf(),
         timestamp,
+        enumeration_errors,
         children,
     }
 }
@@ -479,6 +504,7 @@ mod tests {
         ScanRecord {
             path: PathBuf::from("/tmp/example"),
             timestamp: 1000,
+            enumeration_errors: 0,
             children,
         }
     }
@@ -526,6 +552,7 @@ mod tests {
         let original = ScanRecord {
             path: PathBuf::from("/tmp/example"),
             timestamp: 4242,
+            enumeration_errors: 2,
             children: vec![
                 ChildSize {
                     name: "dir".to_string(),
@@ -558,6 +585,7 @@ mod tests {
         let baseline = ScanRecord {
             path: dir.clone(),
             timestamp: 0,
+            enumeration_errors: 0,
             children: Vec::new(),
         };
         // A token whose generation has already moved past its expected value is
@@ -665,6 +693,7 @@ mod tests {
                 record_to_json(&ScanRecord {
                     path,
                     timestamp: idx as u64,
+                    enumeration_errors: 0,
                     children: Vec::new(),
                 }),
             );
@@ -676,17 +705,47 @@ mod tests {
         .unwrap();
 
         let records = load_records_from_path(&path).unwrap();
-        let pruned_text = std::fs::read_to_string(&path).unwrap();
-
         assert_eq!(records.len(), HISTORY_MAX_RECORDS);
         assert!(!records.contains_key(Path::new("/tmp/history-0")));
         assert!(records.contains_key(Path::new(&format!(
             "/tmp/history-{}",
             HISTORY_MAX_RECORDS + 1
         ))));
-        let pruned_value: serde_json::Value = serde_json::from_str(&pruned_text).unwrap();
-        assert_eq!(pruned_value.as_object().unwrap().len(), HISTORY_MAX_RECORDS);
-
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn concurrent_history_writers_keep_both_baselines() {
+        let dir = std::env::temp_dir().join(format!(
+            "diskr_history_merge_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.json");
+        let spawn = |name: &'static str, timestamp| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                store_record_to_path(
+                    &path,
+                    &ScanRecord {
+                        path: PathBuf::from(format!("/tmp/{name}")),
+                        timestamp,
+                        enumeration_errors: 0,
+                        children: Vec::new(),
+                    },
+                )
+                .unwrap();
+            })
+        };
+        let first = spawn("first", 1);
+        let second = spawn("second", 2);
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let loaded = load_records_from_path(&path).unwrap();
+        assert!(loaded.contains_key(Path::new("/tmp/first")));
+        assert!(loaded.contains_key(Path::new("/tmp/second")));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

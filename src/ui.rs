@@ -22,6 +22,7 @@ use crate::bulkstat::SizeInfo;
 use crate::keymap::{self, KeySection};
 use crate::packages::{DepEvidence, PackageUseStatus};
 use crate::reclaim::Reclaimability;
+use crate::terminal_text;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::default()
@@ -103,7 +104,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_input_overlay(f, app);
     }
     if app.show_help {
-        draw_help_overlay(f);
+        draw_help_overlay(f, app);
     }
 }
 
@@ -152,6 +153,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     if app.fda_limited {
         spans.push(Span::styled(
             " · limited access (no Full Disk Access)",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if app.cwd_enumeration_errors > 0 {
+        spans.push(Span::styled(
+            format!(" · {} entry errors", app.cwd_enumeration_errors),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -690,7 +697,7 @@ const MODAL_LIST_HINT: &str = "f/enter: reveal  ·  O: open  ·  d: trash  ·  e
 /// Standard centered, bordered list-modal shell. Clears the area, draws the
 /// block, and returns the `(list_area, footer_area)` for the caller to fill, or
 /// `None` when there is no room. Shared by the top-files and reclaim-paths
-/// overlays so their placement and chrome stay identical (issue #77).
+/// overlays so their placement and chrome stay identical.
 fn modal_list_regions(f: &mut Frame, title: &str) -> Option<(Rect, Rect)> {
     let area = centered_rect(70, 70, 74, 20, f.area());
     f.render_widget(Clear, area);
@@ -933,7 +940,7 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
 /// Standard centered placement for the record-like detail modals (disk, file,
 /// package, project-deps info). Clears a consistently-sized area and returns it,
 /// so the four modals share one placement instead of each rolling its own
-/// dimensions (issue #93).
+/// dimensions.
 fn detail_modal_area(f: &mut Frame) -> Rect {
     let area = centered_rect(78, 70, 64, 20, f.area());
     f.render_widget(Clear, area);
@@ -1148,10 +1155,26 @@ fn draw_file_info(f: &mut Frame, app: &App) {
         lines.push(Line::from(vec![
             Span::styled("  Items: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{count} direct children"),
+                format!(
+                    "{}{count} direct children",
+                    if info.direct_item_errors > 0 {
+                        "≥"
+                    } else {
+                        ""
+                    }
+                ),
                 Style::default().fg(Color::White),
             ),
         ]));
+    }
+    if info.direct_item_errors > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} directory entries could not be read; item count is a lower bound.",
+                info.direct_item_errors
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
     }
     if info.inaccessible > 0 {
         lines.push(Line::from(Span::styled(
@@ -1700,7 +1723,7 @@ fn draw_help(f: &mut Frame, area: Rect, focus: Focus) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_help_overlay(f: &mut Frame) {
+fn draw_help_overlay(f: &mut Frame, app: &mut App) {
     let area = centered_rect(84, 80, 64, 22, f.area());
     f.render_widget(Clear, area);
 
@@ -1719,21 +1742,46 @@ fn draw_help_overlay(f: &mut Frame) {
         .split(inner);
     let sections_area = chunks[0];
 
-    if sections_area.width >= 76 {
+    let (total_lines, page_height) = if sections_area.width >= 76 {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(sections_area);
-        let split = keymap::HELP_SECTIONS.len().div_ceil(2);
-        draw_help_column(f, columns[0], &keymap::HELP_SECTIONS[..split]);
-        draw_help_column(f, columns[1], &keymap::HELP_SECTIONS[split..]);
+        let (left_sections, right_sections) =
+            balanced_help_columns(keymap::HELP_SECTIONS, columns[0].width, columns[1].width);
+        let left = help_paragraph(&left_sections);
+        let right = help_paragraph(&right_sections);
+        let left_lines = help_rendered_lines(&left_sections, columns[0].width);
+        let right_lines = help_rendered_lines(&right_sections, columns[1].width);
+        let total = left_lines.max(right_lines);
+        let page = usize::from(sections_area.height);
+        let max_scroll = total.saturating_sub(page);
+        app.help_scroll = app.help_scroll.min(max_scroll);
+        let scroll = u16::try_from(app.help_scroll).unwrap_or(u16::MAX);
+        f.render_widget(left.scroll((scroll, 0)), columns[0]);
+        f.render_widget(right.scroll((scroll, 0)), columns[1]);
+        (total, page)
     } else {
-        draw_help_column(f, sections_area, keymap::HELP_SECTIONS);
-    }
+        let sections: Vec<&KeySection> = keymap::HELP_SECTIONS.iter().collect();
+        let paragraph = help_paragraph(&sections);
+        let total = help_rendered_lines(&sections, sections_area.width);
+        let page = usize::from(sections_area.height);
+        let max_scroll = total.saturating_sub(page);
+        app.help_scroll = app.help_scroll.min(max_scroll);
+        let scroll = u16::try_from(app.help_scroll).unwrap_or(u16::MAX);
+        f.render_widget(paragraph.scroll((scroll, 0)), sections_area);
+        (total, page)
+    };
 
     let marker = |m: &'static str| Span::styled(m, Style::default().fg(Color::Yellow));
     let note = |s: &'static str| Span::styled(s, Style::default().fg(Color::Gray));
+    let visible_start = app.help_scroll.saturating_add(1).min(total_lines.max(1));
+    let visible_end = app.help_scroll.saturating_add(page_height).min(total_lines);
     let legend = Line::from(vec![
+        Span::styled(
+            format!("↑↓ scroll {visible_start}-{visible_end}/{total_lines}  "),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled("markers  ", Style::default().fg(Color::DarkGray)),
         marker("~"),
         note(" cached  "),
@@ -1747,7 +1795,66 @@ fn draw_help_overlay(f: &mut Frame) {
     f.render_widget(Paragraph::new(legend), chunks[1]);
 }
 
-fn draw_help_column(f: &mut Frame, area: Rect, sections: &[KeySection]) {
+fn balanced_help_columns(
+    sections: &[KeySection],
+    left_width: u16,
+    right_width: u16,
+) -> (Vec<&KeySection>, Vec<&KeySection>) {
+    let mut best: Option<(usize, Vec<&KeySection>, Vec<&KeySection>)> = None;
+    for mask in 1usize..(1usize << sections.len()).saturating_sub(1) {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for (index, section) in sections.iter().enumerate() {
+            if mask & (1 << index) != 0 {
+                left.push(section);
+            } else {
+                right.push(section);
+            }
+        }
+        let difference = help_rendered_lines(&left, left_width)
+            .abs_diff(help_rendered_lines(&right, right_width));
+        if best
+            .as_ref()
+            .map(|(best_difference, _, _)| difference < *best_difference)
+            .unwrap_or(true)
+        {
+            best = Some((difference, left, right));
+        }
+    }
+    best.map(|(_, left, right)| (left, right))
+        .unwrap_or_else(|| (sections.iter().collect(), Vec::new()))
+}
+
+fn help_rendered_lines(sections: &[&KeySection], width: u16) -> usize {
+    let width = usize::from(width).max(1);
+    let key_width = sections
+        .iter()
+        .flat_map(|section| section.bindings.iter())
+        .map(|binding| terminal_text::display_width(binding.key))
+        .max()
+        .unwrap_or(1)
+        .min(16);
+    sections
+        .iter()
+        .enumerate()
+        .map(|(section_index, section)| {
+            let gap = usize::from(section_index > 0);
+            let heading = terminal_text::display_width(section.title).div_ceil(width);
+            let bindings = section
+                .bindings
+                .iter()
+                .map(|binding| {
+                    (2 + key_width + 2 + terminal_text::display_width(binding.action))
+                        .div_ceil(width)
+                        .max(1)
+                })
+                .sum::<usize>();
+            gap + heading.max(1) + bindings
+        })
+        .sum()
+}
+
+fn help_paragraph(sections: &[&KeySection]) -> Paragraph<'static> {
     let key_width = sections
         .iter()
         .flat_map(|section| section.bindings.iter())
@@ -1785,7 +1892,7 @@ fn draw_help_column(f: &mut Frame, area: Rect, sections: &[KeySection]) {
         }
     }
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    Paragraph::new(lines).wrap(Wrap { trim: false })
 }
 
 fn draw_confirm(f: &mut Frame, app: &App) {
@@ -2151,51 +2258,11 @@ fn centered_rect(px: u16, py: u16, min_width: u16, min_height: u16, area: Rect) 
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if display_width(s) <= max {
-        s.to_string()
-    } else {
-        let mut out = String::new();
-        let mut width = 0;
-        let limit = max.saturating_sub(1);
-        for ch in s.chars() {
-            let ch_width = char_display_width(ch);
-            if width + ch_width > limit {
-                break;
-            }
-            out.push(ch);
-            width += ch_width;
-        }
-        out.push('…');
-        out
-    }
+    terminal_text::truncate_end(s, max)
 }
 
 fn truncate_start(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if display_width(s) <= max {
-        return s.to_string();
-    }
-    if max == 1 {
-        return String::from("…");
-    }
-    let mut tail = Vec::new();
-    let mut width = 0;
-    let limit = max.saturating_sub(1);
-    for ch in s.chars().rev() {
-        let ch_width = char_display_width(ch);
-        if width + ch_width > limit {
-            break;
-        }
-        tail.push(ch);
-        width += ch_width;
-    }
-    let tail: String = tail.into_iter().rev().collect();
-    format!("…{tail}")
+    terminal_text::truncate_start(s, max)
 }
 
 fn pad_truncated(s: &str, width: usize) -> String {
@@ -2206,39 +2273,7 @@ fn pad_truncated(s: &str, width: usize) -> String {
 }
 
 fn display_width(s: &str) -> usize {
-    s.chars().map(char_display_width).sum()
-}
-
-fn char_display_width(ch: char) -> usize {
-    if ch.is_control()
-        || matches!(
-            ch,
-            '\u{0300}'..='\u{036F}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{206F}'
-        )
-    {
-        return 0;
-    }
-
-    if matches!(
-        ch,
-        '\u{1100}'..='\u{115F}'
-            | '\u{2329}'..='\u{232A}'
-            | '\u{2E80}'..='\u{A4CF}'
-            | '\u{AC00}'..='\u{D7A3}'
-            | '\u{F900}'..='\u{FAFF}'
-            | '\u{FE10}'..='\u{FE19}'
-            | '\u{FE30}'..='\u{FE6F}'
-            | '\u{FF00}'..='\u{FF60}'
-            | '\u{FFE0}'..='\u{FFE6}'
-            | '\u{1F300}'..='\u{1FAFF}'
-    ) {
-        2
-    } else {
-        1
-    }
+    terminal_text::display_width(s)
 }
 
 fn pad_key(s: &str, width: usize) -> String {
@@ -2953,6 +2988,37 @@ fn file_size_bar(
 mod tests {
     use super::*;
 
+    fn render_help(width: u16, height: u16, scroll: usize) -> (String, usize) {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+
+        let root = std::env::temp_dir().join(format!(
+            "diskr_help_render_{}_{}_{}",
+            std::process::id(),
+            width,
+            height
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.open_help();
+        app.help_scroll = scroll;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_help_overlay(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let offset = app.help_scroll;
+        std::fs::remove_dir_all(root).unwrap();
+        (text, offset)
+    }
+
     #[test]
     fn truncate_preserves_short_names() {
         assert_eq!(truncate("Downloads", 40), "Downloads");
@@ -2994,6 +3060,32 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let got = centered_rect(60, 20, 40, 6, area);
         assert_eq!(got.height, 6);
+    }
+
+    #[test]
+    fn help_overlay_scrolls_to_every_section_at_80x24() {
+        let (first_page, _) = render_help(80, 24, 0);
+        assert!(first_page.contains("keyboard help"));
+        assert!(first_page.contains("Global"));
+
+        let (last_page, offset) = render_help(80, 24, usize::MAX);
+        assert!(offset > 0, "short help overlay should require scrolling");
+        assert!(last_page.contains("Reclaim / Reports"));
+        assert!(last_page.contains("scroll"));
+    }
+
+    #[test]
+    fn help_columns_balance_by_rendered_content() {
+        let (left_sections, right_sections) = balanced_help_columns(keymap::HELP_SECTIONS, 48, 48);
+        let left = help_rendered_lines(&left_sections, 48);
+        let right = help_rendered_lines(&right_sections, 48);
+        assert!(
+            left.abs_diff(right) <= 8,
+            "unbalanced help columns: {left}/{right}"
+        );
+        let (wide, _) = render_help(120, 30, 0);
+        assert!(wide.contains("Files"));
+        assert!(wide.contains("Packages"));
     }
 
     #[test]
