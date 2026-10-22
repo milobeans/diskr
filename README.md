@@ -18,6 +18,11 @@ Most disk usage tools show you a tree of sizes and leave you to figure out the r
 
 **Package and dependency inspection.** The TUI has a dedicated packages pane showing Homebrew, Cargo, pip, npm, and other package managers with per-package sizes. It also finds project dependency directories (`node_modules`, `target`, `.venv`) under the current path and shows how much space each one takes.
 
+Package reports distinguish empty inventories from unavailable managers, command
+failures, malformed output, and partial results. Package details retain inventory
+and dependency-graph warnings. JSON includes every manager's `scan_state` and
+each package's dependency evidence; incomplete graphs have unknown leaf status.
+
 **macOS-native integration.** Reveal any file in Finder with `f`, open with the default app with `O`, and move files or project dependency directories to Trash with `d`. On an installed package, `d` runs that manager's uninstall flow after confirmation.
 
 ## Install

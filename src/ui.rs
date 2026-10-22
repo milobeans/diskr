@@ -2017,40 +2017,58 @@ fn help_paragraph(sections: &[&KeySection]) -> Paragraph<'static> {
     Paragraph::new(lines).wrap(Wrap { trim: false })
 }
 
+fn render_confirm_modal(f: &mut Frame, area: Rect, title: &str, body: Vec<Line<'_>>) {
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let body_area = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let footer_area = Rect {
+        y: inner.y.saturating_add(body_area.height),
+        height: inner.height.saturating_sub(body_area.height),
+        ..inner
+    };
+    f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), body_area);
+    f.render_widget(
+        Paragraph::new("y confirm · n cancel").alignment(Alignment::Center),
+        footer_area,
+    );
+}
+
 fn draw_confirm(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 20, 40, 7, f.area());
-    f.render_widget(Clear, area);
-    let name = app.pending_delete_name();
+    let text_width = area.width.saturating_sub(4) as usize;
     let mut body = vec![
-        Line::from(""),
+        Line::from("Move to Trash:"),
         Line::from(Span::styled(
-            format!("Move to Trash: {name}"),
+            truncate(app.pending_delete_name(), text_width),
             Style::default().add_modifier(Modifier::BOLD),
         )),
     ];
+    if let Some(path) = app.pending_delete_path() {
+        body.push(Line::from(format!(
+            "Path: {}",
+            truncate_start(&path.display().to_string(), text_width.saturating_sub(6))
+        )));
+    }
     if let Some(summary) = app.pending_batch_summary() {
         body.push(Line::from(Span::styled(
-            summary,
+            truncate(&summary, text_width),
             Style::default().fg(Color::Gray),
         )));
     }
-    body.push(Line::from(""));
-    body.push(Line::from("press  y  to confirm   ·   n  to cancel"));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("confirm")
-        .border_style(Style::default().fg(Color::Red));
-    f.render_widget(
-        Paragraph::new(body)
-            .block(block)
-            .alignment(Alignment::Center),
-        area,
-    );
+    render_confirm_modal(f, area, "confirm", body);
 }
 
 fn draw_empty_trash_confirm(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 20, 48, 8, f.area());
-    f.render_widget(Clear, area);
+    let text_width = area.width.saturating_sub(4) as usize;
     // request_empty_trash only arms when the report lists Trash, so the
     // finding is normally present; the fallback covers a report swapped out
     // by a reclaim re-scan while the confirmation is open.
@@ -2066,54 +2084,40 @@ fn draw_empty_trash_confirm(f: &mut Frame, app: &App) {
         None => (String::new(), String::new()),
     };
     let body = vec![
-        Line::from(""),
         Line::from(Span::styled(
-            format!("Empty Trash{size_note}?"),
+            truncate(&format!("Empty Trash{size_note}?"), text_width),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(path_note, Style::default().fg(Color::Gray))),
+        Line::from(Span::styled(
+            truncate_start(&path_note, text_width),
+            Style::default().fg(Color::Gray),
+        )),
         Line::from(Span::styled(
             "already-discarded items are removed permanently",
             Style::default().fg(Color::Gray),
         )),
-        Line::from(""),
-        Line::from("press  y  to confirm   ·   n  to cancel"),
     ];
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("empty trash")
-        .border_style(Style::default().fg(Color::Red));
-    f.render_widget(
-        Paragraph::new(body)
-            .block(block)
-            .alignment(Alignment::Center),
-        area,
-    );
+    render_confirm_modal(f, area, "empty trash", body);
 }
 
 fn draw_uninstall_confirm(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 20, 44, 6, f.area());
-    f.render_widget(Clear, area);
+    let text_width = area.width.saturating_sub(4) as usize;
     let name = app.pending_uninstall_name();
-    let body = vec![
-        Line::from(""),
+    let mut body = vec![
+        Line::from("Uninstall package:"),
         Line::from(Span::styled(
-            format!("Uninstall: {name}"),
+            truncate(name, text_width),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(""),
-        Line::from("press  y  to confirm   ·   n  to cancel"),
     ];
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("uninstall")
-        .border_style(Style::default().fg(Color::Red));
-    f.render_widget(
-        Paragraph::new(body)
-            .block(block)
-            .alignment(Alignment::Center),
-        area,
-    );
+    if display_width(name) > text_width {
+        body.push(Line::from(Span::styled(
+            truncate_start(name, text_width),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    render_confirm_modal(f, area, "uninstall", body);
 }
 
 fn draw_pkg_detail(f: &mut Frame, app: &App) {
@@ -2152,6 +2156,29 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
             Span::styled("  Size: ", Style::default().fg(Color::DarkGray)),
             Span::styled(size_detail(size), Style::default().fg(Color::Green)),
         ]));
+    }
+    if let Some(report) = app
+        .pkg_reports
+        .iter()
+        .find(|report| report.manager == manager)
+    {
+        lines.push(Line::from(format!("  Inventory: {}", report.state.label())));
+        if let Some(warning) = &report.warning {
+            lines.push(Line::from(Span::styled(
+                format!("  Warning: {}", terminal_text::sanitize(warning)),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    }
+    if let Some(warning) = app
+        .dep_graph
+        .as_ref()
+        .and_then(|graph| graph.warning_for(manager))
+    {
+        lines.push(Line::from(Span::styled(
+            format!("  Dependency graph: {}", terminal_text::sanitize(warning)),
+            Style::default().fg(Color::Yellow),
+        )));
     }
     if let Some(path) = &pkg.path {
         let max_path_len = area.width.saturating_sub(10) as usize;
@@ -2226,6 +2253,20 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
                     Span::styled(rev_text, rev_style),
                 ]));
             }
+        }
+        Some(info) if info.evidence == DepEvidence::PartialGraph => {
+            lines.push(Line::from(Span::styled(
+                "  Usage: incomplete dependency graph; leaf status is unknown",
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(format!(
+                "  Known dependencies: {}",
+                info.dependencies.join(", ")
+            )));
+            lines.push(Line::from(format!(
+                "  Known dependents: {}",
+                info.dependents.join(", ")
+            )));
         }
         Some(_) => {
             lines.push(Line::from(Span::styled(
@@ -3298,6 +3339,23 @@ mod tests {
         assert_eq!(app.active_modal(), ActiveModal::Delete);
         assert!(frame.contains("Move to Trash"));
         assert!(!frame.contains("Loading file info"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn long_delete_confirmation_keeps_target_tail_and_actions_visible() {
+        let root = std::env::temp_dir().join(format!("diskr_long_confirm_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let name = format!("{}-tail.txt", "long".repeat(30));
+        std::fs::write(root.join(&name), b"x").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.request_delete();
+        for (width, height) in [(40, 16), (80, 24), (120, 30)] {
+            let frame = render_app(&mut app, width, height);
+            assert!(frame.contains("Move to Trash:"));
+            assert!(frame.contains("-tail.txt"));
+            assert!(frame.contains("y confirm · n cancel"));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

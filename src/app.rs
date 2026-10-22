@@ -2975,6 +2975,16 @@ impl App {
         }
     }
 
+    pub fn pending_delete_path(&self) -> Option<&Path> {
+        match &self.pending_delete {
+            Some(DeleteTarget::FileEntry(entry)) => Some(&entry.path),
+            Some(DeleteTarget::Package { path, .. })
+            | Some(DeleteTarget::TopFile { path, .. })
+            | Some(DeleteTarget::ReclaimPath { path, .. }) => Some(path),
+            Some(DeleteTarget::Batch) | None => None,
+        }
+    }
+
     fn schedule_cache_write(&mut self) {
         let entries = self.size_cache_entries_for_store(now_secs());
         let invalidations: Vec<_> = std::mem::take(&mut self.cache_invalidations)
@@ -3470,11 +3480,19 @@ impl App {
                 self.status = format!(
                     "{total} packages · {dependency_leaves} dependency leaves · u to filter · i for details"
                 );
-                let warnings: Vec<_> = self
+                let mut warnings: Vec<String> = self
                     .pkg_reports
                     .iter()
-                    .filter_map(|report| report.warning.as_deref())
+                    .filter_map(|report| report.warning.clone())
                     .collect();
+                if let Some(graph) = &self.dep_graph {
+                    warnings.extend(
+                        graph
+                            .warnings()
+                            .iter()
+                            .map(|warning| warning.message.clone()),
+                    );
+                }
                 if !warnings.is_empty() {
                     self.status.push_str(" · warnings: ");
                     self.status.push_str(&warnings.join("; "));
@@ -3485,7 +3503,11 @@ impl App {
             Err(TryRecvError::Disconnected) => {
                 self.deps_loading = false;
                 self.dep_scan_rx = None;
-                self.drain_uninstall_results()
+                self.dep_graph = None;
+                self.rebuild_pkg_visible_indices();
+                self.status = String::from("dependency graph worker failed");
+                self.drain_uninstall_results();
+                true
             }
         }
     }
@@ -5509,6 +5531,7 @@ mod tests {
             total_size: SizeInfo::default(),
             available: true,
             warning: Some(String::from("missing RECORD files")),
+            state: packages::ManagerScanState::Failed,
         }];
         let (tx, rx) = channel();
         app.dep_scan_rx = Some(rx);
@@ -5788,6 +5811,7 @@ mod tests {
             total_size: SizeInfo::new(30, 30),
             available: true,
             warning: None,
+            state: packages::ManagerScanState::Complete,
         }];
         app.dep_graph = Some(DepGraph::from_entries(vec![
             (
@@ -5899,6 +5923,7 @@ mod tests {
             total_size: SizeInfo::new(30, 30),
             available: true,
             warning: None,
+            state: packages::ManagerScanState::Complete,
         }];
         app.rebuild_flat_packages();
 

@@ -835,16 +835,20 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
     let reports = packages::scan_managers();
     let project_scan = packages::scan_project_deps(&path, 5);
     let project_deps = &project_scan.projects;
+    let graph = packages::scan_dep_graph(&reports);
 
     if json {
         let managers: Vec<_> = reports
             .iter()
-            .filter(|r| r.available)
             .map(|r| {
                 let pkgs: Vec<_> = r
                     .packages
                     .iter()
                     .map(|p| {
+                        let dep_info = graph.get(r.manager, &p.name);
+                        let evidence = dep_info
+                            .map(|info| info.evidence.label())
+                            .unwrap_or("untracked");
                         serde_json::json!({
                             "name": p.name,
                             "version": p.version,
@@ -852,11 +856,16 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
                             "allocated": p.size.map(|s| s.allocated),
                             "path": p.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
                             "metadata_path": p.metadata_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                            "dependency_evidence": evidence,
+                            "dependencies": dep_info.map(|info| &info.dependencies),
+                            "dependents": dep_info.map(|info| &info.dependents),
                         })
                     })
                     .collect();
                 let mut obj = serde_json::json!({
                     "manager": r.manager.label(),
+                    "available": r.available,
+                    "scan_state": r.state.label(),
                     "count": r.packages.len(),
                     "total_logical": r.total_size.logical,
                     "total_allocated": r.total_size.allocated,
@@ -887,6 +896,10 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             "project_scope": project_scan.scope.json(),
             "system_packages": managers,
             "project_dependencies": projects,
+            "dependency_graph_warnings": graph.warnings().iter().map(|warning| serde_json::json!({
+                "manager": warning.manager.label(),
+                "message": warning.message,
+            })).collect::<Vec<_>>(),
         });
         cli_println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
@@ -898,13 +911,18 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
     let mut any_manager = false;
     for report in &reports {
         if !report.available {
+            cli_println!("{}: {}", report.manager.label(), report.state.label());
+            if let Some(warning) = &report.warning {
+                cli_println!("  Warning: {}", terminal_text::sanitize(warning));
+            }
             continue;
         }
         any_manager = true;
         cli_println!(
-            "{}: {} packages · {}{}",
+            "{}: {} packages · {} · {}{}",
             report.manager.label(),
             report.packages.len(),
+            report.state.label(),
             human(report.total_size.allocated),
             if report.warning.is_some() {
                 " known allocated (incomplete)"
@@ -942,6 +960,14 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
     if !any_manager {
         cli_println!("No supported package managers found.");
         cli_println!();
+    }
+
+    for warning in graph.warnings() {
+        cli_println!(
+            "Dependency graph warning ({}): {}",
+            warning.manager.label(),
+            terminal_text::sanitize(&warning.message)
+        );
     }
 
     if !project_deps.is_empty() {
@@ -2305,6 +2331,7 @@ mod tests {
             total_size: crate::bulkstat::SizeInfo::default(),
             available: true,
             warning: None,
+            state: packages::ManagerScanState::Complete,
         }];
         app.project_deps = vec![packages::ProjectDeps {
             path: root.clone(),
@@ -2453,6 +2480,7 @@ mod tests {
             total_size: crate::bulkstat::SizeInfo::new(60, 60),
             available: true,
             warning: None,
+            state: packages::ManagerScanState::Complete,
         }];
         app.rebuild_flat_packages();
 

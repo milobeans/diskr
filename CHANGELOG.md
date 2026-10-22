@@ -6,6 +6,17 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.77] - 2026-10-22
+
+### Fixed
+
+- Destructive-action confirmations now keep confirm/cancel hints visible, show
+  a tail-preserving target path, and identify long file or package names in
+  narrow terminals.
+- Package reports now distinguish absent, empty, failed, malformed and partial
+  manager scans. Dependency-graph failures remain visible beside partial
+  results in the TUI and JSON output instead of appearing as confident leaves.
+
 ## [0.1.76] - 2026-10-22
 
 ### Fixed

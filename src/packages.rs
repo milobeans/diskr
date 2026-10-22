@@ -102,7 +102,18 @@ impl Manager {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DepEvidence {
     ManagerGraph,
+    PartialGraph,
     Untracked,
+}
+
+impl DepEvidence {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ManagerGraph => "manager_graph",
+            Self::PartialGraph => "partial_graph",
+            Self::Untracked => "untracked",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,11 +157,29 @@ impl DepInfo {
 #[derive(Clone, Debug, Default)]
 pub struct DepGraph {
     entries: HashMap<(Manager, String), DepInfo>,
+    warnings: Vec<GraphWarning>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GraphWarning {
+    pub manager: Manager,
+    pub message: String,
 }
 
 impl DepGraph {
     pub fn get(&self, manager: Manager, name: &str) -> Option<&DepInfo> {
         self.entries.get(&(manager, name.to_string()))
+    }
+
+    pub fn warnings(&self) -> &[GraphWarning] {
+        &self.warnings
+    }
+
+    pub fn warning_for(&self, manager: Manager) -> Option<&str> {
+        self.warnings
+            .iter()
+            .find(|warning| warning.manager == manager)
+            .map(|warning| warning.message.as_str())
     }
 
     #[cfg(test)]
@@ -160,6 +189,7 @@ impl DepGraph {
                 .into_iter()
                 .map(|(manager, name, info)| ((manager, name.to_string()), info))
                 .collect(),
+            warnings: Vec::new(),
         }
     }
 
@@ -192,6 +222,50 @@ pub struct ManagerReport {
     pub total_size: SizeInfo,
     pub available: bool,
     pub warning: Option<String>,
+    pub state: ManagerScanState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagerScanState {
+    Absent,
+    Empty,
+    Complete,
+    Failed,
+    ParseFailed,
+    Partial,
+}
+
+impl ManagerScanState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Empty => "empty",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::ParseFailed => "parse_failed",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+fn manager_scan_state(
+    package_count: usize,
+    warning: Option<&str>,
+    parse_failed: bool,
+) -> ManagerScanState {
+    if package_count > 0 {
+        if warning.is_some() || parse_failed {
+            ManagerScanState::Partial
+        } else {
+            ManagerScanState::Complete
+        }
+    } else if parse_failed {
+        ManagerScanState::ParseFailed
+    } else if warning.is_some() {
+        ManagerScanState::Failed
+    } else {
+        ManagerScanState::Empty
+    }
 }
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -235,6 +309,7 @@ pub fn scan_managers() -> Vec<ManagerReport> {
             total_size: SizeInfo::default(),
             available: false,
             warning: Some("scan thread panicked".into()),
+            state: ManagerScanState::Failed,
         });
         reports[index] = Some(report);
     }
@@ -245,11 +320,22 @@ pub fn scan_managers() -> Vec<ManagerReport> {
 pub fn scan_dep_graph(reports: &[ManagerReport]) -> DepGraph {
     let mut graph = DepGraph::default();
 
-    let brew_handle = thread::spawn(|| {
-        if command_exists("brew") {
-            scan_brew_dep_graph()
+    let brew_names: Vec<String> = reports
+        .iter()
+        .find(|report| report.manager == Manager::Brew && report.available)
+        .map(|report| {
+            report
+                .packages
+                .iter()
+                .map(|package| package.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let brew_handle = thread::spawn(move || {
+        if !brew_names.is_empty() && command_exists("brew") {
+            scan_brew_dep_graph(&brew_names)
         } else {
-            HashMap::new()
+            (HashMap::new(), None)
         }
     });
 
@@ -260,14 +346,29 @@ pub fn scan_dep_graph(reports: &[ManagerReport]) -> DepGraph {
         .unwrap_or_default();
     let pip_handle = thread::spawn(move || {
         if pip_names.is_empty() || pip_command().is_none() {
-            HashMap::new()
+            (HashMap::new(), None)
         } else {
             scan_pip_dep_graph(&pip_names)
         }
     });
 
-    let brew_deps = brew_handle.join().unwrap_or_default();
-    let pip_deps = pip_handle.join().unwrap_or_default();
+    let (brew_deps, brew_warning) = brew_handle.join().unwrap_or_else(|_| {
+        (
+            HashMap::new(),
+            Some(String::from("brew dependency scan panicked")),
+        )
+    });
+    let (pip_deps, pip_warning) = pip_handle.join().unwrap_or_else(|_| {
+        (
+            HashMap::new(),
+            Some(String::from("pip dependency scan panicked")),
+        )
+    });
+    for (manager, warning) in [(Manager::Brew, brew_warning), (Manager::Pip, pip_warning)] {
+        if let Some(message) = warning {
+            graph.warnings.push(GraphWarning { manager, message });
+        }
+    }
 
     for report in reports {
         if !report.available {
@@ -292,19 +393,58 @@ fn package_dep_info(
 ) -> DepInfo {
     match manager {
         Manager::Brew => brew_deps.get(name).cloned().unwrap_or_default(),
-        Manager::Pip => pip_deps.get(name).cloned().unwrap_or_default(),
+        Manager::Pip => pip_deps
+            .get(&normalize_dist_name(name))
+            .cloned()
+            .unwrap_or_default(),
         Manager::BrewCask | Manager::Npm | Manager::Cargo | Manager::Bun => {
             DepInfo::tracked(Vec::new(), Vec::new())
         }
     }
 }
 
-fn scan_brew_dep_graph() -> HashMap<String, DepInfo> {
+fn scan_brew_dep_graph(names: &[String]) -> (HashMap<String, DepInfo>, Option<String>) {
     let result = run_command("brew", &["deps", "--installed", "--for-each"]);
-    if result.stdout.is_empty() {
-        return HashMap::new();
+    brew_graph_from_result(&result, names)
+}
+
+fn brew_graph_from_result(
+    result: &CommandResult,
+    names: &[String],
+) -> (HashMap<String, DepInfo>, Option<String>) {
+    let mut warning = cmd_warning(result, "brew dependency graph");
+    let mut graph = parse_brew_dep_graph(&result.stdout);
+    let invalid = result
+        .stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            line.split_once(':')
+                .is_none_or(|(name, _)| name.trim().is_empty())
+        })
+        .count();
+    let declared: HashSet<&str> = result
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim()))
+        .filter(|name| !name.is_empty())
+        .collect();
+    let missing = names
+        .iter()
+        .filter(|name| !declared.contains(name.as_str()))
+        .count();
+    if invalid > 0 || missing > 0 {
+        warning = add_warning(
+            warning,
+            format!("brew dependency graph: {invalid} malformed rows, {missing} installed formulae missing"),
+        );
     }
-    parse_brew_dep_graph(&result.stdout)
+    if warning.is_some() {
+        for info in graph.values_mut() {
+            info.evidence = DepEvidence::PartialGraph;
+        }
+    }
+    (graph, warning)
 }
 
 fn parse_brew_dep_graph(output: &str) -> HashMap<String, DepInfo> {
@@ -316,6 +456,9 @@ fn parse_brew_dep_graph(output: &str) -> HashMap<String, DepInfo> {
             continue;
         };
         let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
         let deps: Vec<String> = deps_str
             .split_whitespace()
             .map(String::from)
@@ -341,33 +484,70 @@ fn parse_brew_dep_graph(output: &str) -> HashMap<String, DepInfo> {
     result
 }
 
-fn scan_pip_dep_graph(names: &[String]) -> HashMap<String, DepInfo> {
+fn scan_pip_dep_graph(names: &[String]) -> (HashMap<String, DepInfo>, Option<String>) {
     let mut args: Vec<&str> = vec!["show"];
     for name in names {
         args.push(name);
     }
     let result = run_pip_command(&args);
-    if result.stdout.is_empty() {
-        return HashMap::new();
+    pip_graph_from_result(&result, names)
+}
+
+fn pip_graph_from_result(
+    result: &CommandResult,
+    names: &[String],
+) -> (HashMap<String, DepInfo>, Option<String>) {
+    let mut warning = cmd_warning(result, "pip dependency graph");
+    let mut graph = parse_pip_show_output(&result.stdout);
+    let missing = names
+        .iter()
+        .filter(|name| !graph.contains_key(&normalize_dist_name(name)))
+        .count();
+    let incomplete = graph
+        .values()
+        .filter(|info| info.evidence == DepEvidence::PartialGraph)
+        .count();
+    if missing > 0 || incomplete > 0 {
+        warning = add_warning(
+            warning,
+            format!("pip dependency graph: {missing} installed distributions missing, {incomplete} incomplete records"),
+        );
     }
-    parse_pip_show_output(&result.stdout)
+    if warning.is_some() {
+        for info in graph.values_mut() {
+            info.evidence = DepEvidence::PartialGraph;
+        }
+    }
+    (graph, warning)
 }
 
 fn parse_pip_show_output(output: &str) -> HashMap<String, DepInfo> {
     let mut result = HashMap::new();
     let mut current_name = String::new();
-    let mut current_deps = Vec::new();
-    let mut current_rev = Vec::new();
+    let mut current_deps = None;
+    let mut current_rev = None;
 
     let flush = |result: &mut HashMap<String, DepInfo>,
                  name: &mut String,
-                 deps: &mut Vec<String>,
-                 rev: &mut Vec<String>| {
+                 deps: &mut Option<Vec<String>>,
+                 rev: &mut Option<Vec<String>>| {
         if !name.is_empty() {
+            let evidence = if deps.is_some() && rev.is_some() {
+                DepEvidence::ManagerGraph
+            } else {
+                DepEvidence::PartialGraph
+            };
             result.insert(
-                std::mem::take(name),
-                DepInfo::tracked(std::mem::take(deps), std::mem::take(rev)),
+                normalize_dist_name(&std::mem::take(name)),
+                DepInfo {
+                    dependencies: deps.take().unwrap_or_default(),
+                    dependents: rev.take().unwrap_or_default(),
+                    evidence,
+                },
             );
+        } else {
+            deps.take();
+            rev.take();
         }
     };
 
@@ -381,7 +561,7 @@ fn parse_pip_show_output(output: &str) -> HashMap<String, DepInfo> {
             );
             continue;
         }
-        if let Some(name) = line.strip_prefix("Name: ") {
+        if let Some(name) = line.strip_prefix("Name:") {
             flush(
                 &mut result,
                 &mut current_name,
@@ -389,18 +569,20 @@ fn parse_pip_show_output(output: &str) -> HashMap<String, DepInfo> {
                 &mut current_rev,
             );
             current_name = name.trim().to_string();
-        } else if let Some(deps) = line.strip_prefix("Requires: ") {
-            current_deps = deps
-                .split(", ")
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        } else if let Some(rev) = line.strip_prefix("Required-by: ") {
-            current_rev = rev
-                .split(", ")
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+        } else if let Some(deps) = line.strip_prefix("Requires:") {
+            current_deps = Some(
+                deps.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
+        } else if let Some(rev) = line.strip_prefix("Required-by:") {
+            current_rev = Some(
+                rev.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            );
         }
     }
     flush(
@@ -445,11 +627,15 @@ fn scan_manager(manager: Manager) -> ManagerReport {
             total_size: SizeInfo::default(),
             available: false,
             warning: None,
+            state: ManagerScanState::Absent,
         };
     }
 
-    let (packages, warning) = match manager {
-        Manager::Brew => (scan_brew_formulae(), None),
+    let (packages, warning, parse_failed) = match manager {
+        Manager::Brew => {
+            let (packages, warning) = scan_brew_formulae();
+            (packages, warning, false)
+        }
         Manager::BrewCask => scan_brew_casks(),
         Manager::Npm => scan_npm_global(),
         Manager::Pip => scan_pip(),
@@ -465,12 +651,14 @@ fn scan_manager(manager: Manager) -> ManagerReport {
         }
     }
 
+    let state = manager_scan_state(packages.len(), warning.as_deref(), parse_failed);
     ManagerReport {
         manager,
         packages,
         total_size,
         available: true,
         warning,
+        state,
     }
 }
 
@@ -489,23 +677,63 @@ fn cmd_warning(result: &CommandResult, manager_label: &str) -> Option<String> {
     None
 }
 
-fn scan_brew_formulae() -> Vec<Package> {
+fn add_warning(existing: Option<String>, detail: impl AsRef<str>) -> Option<String> {
+    Some(match existing {
+        Some(existing) => format!("{existing}; {}", detail.as_ref()),
+        None => detail.as_ref().to_string(),
+    })
+}
+
+fn scan_brew_formulae() -> (Vec<Package>, Option<String>) {
     let cellar = brew_prefix().join("Cellar");
     scan_brew_dir(&cellar)
 }
 
-fn scan_brew_casks() -> (Vec<Package>, Option<String>) {
+fn scan_brew_casks() -> (Vec<Package>, Option<String>, bool) {
     let result = run_command_with_timeout(
         "brew",
         &["info", "--cask", "--json=v2", "--installed"],
         CMD_TIMEOUT_SLOW,
     );
-    let warning = cmd_warning(&result, "brew cask");
-    if result.stdout.is_empty() {
-        return (Vec::new(), warning);
-    }
     let caskroom = brew_prefix().join("Caskroom");
-    (parse_brew_cask_json(&result.stdout, &caskroom), warning)
+    brew_casks_from_result(&result, &caskroom)
+}
+
+fn brew_casks_from_result(
+    result: &CommandResult,
+    caskroom: &Path,
+) -> (Vec<Package>, Option<String>, bool) {
+    let mut warning = cmd_warning(result, "brew cask");
+    if result.stdout.is_empty() {
+        let parse_failed = result.success;
+        if parse_failed {
+            warning = add_warning(warning, "brew cask: missing JSON inventory");
+        }
+        return (Vec::new(), warning, parse_failed);
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(&result.stdout) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return (
+                Vec::new(),
+                add_warning(warning, format!("brew cask: invalid JSON: {error}")),
+                true,
+            );
+        }
+    };
+    let Some(casks) = parsed.get("casks").and_then(|value| value.as_array()) else {
+        return (
+            Vec::new(),
+            add_warning(warning, "brew cask: missing casks array"),
+            true,
+        );
+    };
+    let packages = parse_brew_cask_json(&result.stdout, caskroom);
+    let skipped = casks.len().saturating_sub(packages.len());
+    if skipped > 0 {
+        warning = add_warning(warning, format!("brew cask: {skipped} malformed records"));
+    }
+    (packages, warning, skipped > 0)
 }
 
 fn parse_brew_cask_json(output: &str, caskroom: &Path) -> Vec<Package> {
@@ -529,7 +757,11 @@ fn parse_brew_cask_json_with_app_roots(
     };
 
     pool::par_map(casks, |cask| {
-        let token = cask.get("token")?.as_str()?.to_string();
+        let token = cask
+            .get("token")?
+            .as_str()
+            .filter(|token| !token.is_empty())?
+            .to_string();
         let version = cask
             .get("installed")
             .and_then(|v| v.as_str())
@@ -611,24 +843,35 @@ fn find_cask_app_path(app_name: &str, app_roots: &[PathBuf]) -> Option<PathBuf> 
         .find(|path| path.exists())
 }
 
-fn scan_brew_dir(install_dir: &Path) -> Vec<Package> {
-    if !install_dir.is_dir() {
-        return Vec::new();
-    }
-    let Ok(read) = std::fs::read_dir(install_dir) else {
-        return Vec::new();
+fn scan_brew_dir(install_dir: &Path) -> (Vec<Package>, Option<String>) {
+    let read = match std::fs::read_dir(install_dir) {
+        Ok(read) => read,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(error) => {
+            return (
+                Vec::new(),
+                Some(format!("brew cellar cannot be read: {error}")),
+            );
+        }
     };
-    let entries: Vec<_> = read
-        .flatten()
-        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-        .map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let pkg_path = e.path();
-            (name, pkg_path)
-        })
-        .collect();
+    let mut errors = 0usize;
+    let mut entries = Vec::new();
+    for entry in read {
+        let Ok(entry) = entry else {
+            errors += 1;
+            continue;
+        };
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => entries.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+            )),
+            Ok(_) => {}
+            Err(_) => errors += 1,
+        }
+    }
 
-    pool::par_map(entries, |(name, pkg_path)| {
+    let packages = pool::par_map(entries, |(name, pkg_path)| {
         let version = latest_subdir_name(&pkg_path);
         let size = Some(bulkstat::scan_dir(&pkg_path, 0).size);
         Package {
@@ -638,7 +881,9 @@ fn scan_brew_dir(install_dir: &Path) -> Vec<Package> {
             path: Some(pkg_path),
             metadata_path: None,
         }
-    })
+    });
+    let warning = (errors > 0).then(|| format!("brew cellar: {errors} entries unreadable"));
+    (packages, warning)
 }
 
 fn latest_subdir_name(dir: &Path) -> String {
@@ -653,20 +898,58 @@ fn latest_subdir_name(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn scan_npm_global() -> (Vec<Package>, Option<String>) {
+fn scan_npm_global() -> (Vec<Package>, Option<String>, bool) {
     let result = run_command("npm", &["list", "-g", "--depth=0", "--json"]);
-    let warning = cmd_warning(&result, "npm");
+    let global_root = find_npm_global_root();
+    npm_inventory_from_result(&result, global_root.as_deref())
+}
+
+fn npm_inventory_from_result(
+    result: &CommandResult,
+    global_root: Option<&Path>,
+) -> (Vec<Package>, Option<String>, bool) {
+    let mut warning = cmd_warning(result, "npm");
     if result.stdout.is_empty() {
-        return (Vec::new(), warning);
+        let parse_failed = result.success;
+        if parse_failed {
+            warning = add_warning(warning, "npm: missing JSON inventory");
+        }
+        return (Vec::new(), warning, parse_failed);
     }
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result.stdout) else {
-        return (Vec::new(), warning);
+    let parsed: serde_json::Value = match serde_json::from_str(&result.stdout) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return (
+                Vec::new(),
+                add_warning(warning, format!("npm: invalid JSON: {error}")),
+                true,
+            );
+        }
     };
-    let Some(deps) = parsed.get("dependencies").and_then(|d| d.as_object()) else {
-        return (Vec::new(), warning);
+    let Some(root) = parsed.as_object() else {
+        return (
+            Vec::new(),
+            add_warning(warning, "npm: invalid JSON root"),
+            true,
+        );
+    };
+    if let Some(error) = root.get("error") {
+        warning = add_warning(warning, format!("npm inventory error: {error}"));
+    }
+    let Some(deps) = root.get("dependencies") else {
+        return (Vec::new(), warning, false);
+    };
+    let Some(deps) = deps.as_object() else {
+        return (
+            Vec::new(),
+            add_warning(warning, "npm: invalid dependencies object"),
+            true,
+        );
     };
 
-    let global_root = find_npm_global_root();
+    if global_root.is_none() && !deps.is_empty() {
+        warning = add_warning(warning, "npm: global package root unresolved");
+    }
 
     let entries: Vec<_> = deps
         .iter()
@@ -679,6 +962,20 @@ fn scan_npm_global() -> (Vec<Package>, Option<String>) {
             (name.clone(), version)
         })
         .collect();
+    let malformed = deps
+        .values()
+        .filter(|info| {
+            info.get("version")
+                .and_then(|value| value.as_str())
+                .is_none()
+        })
+        .count();
+    if malformed > 0 {
+        warning = add_warning(
+            warning,
+            format!("npm: {malformed} package versions unavailable or malformed"),
+        );
+    }
 
     let packages = pool::par_map(entries, |(name, version)| {
         let pkg_path = global_root.as_ref().map(|root| root.join(&name));
@@ -694,7 +991,7 @@ fn scan_npm_global() -> (Vec<Package>, Option<String>) {
             metadata_path: None,
         }
     });
-    (packages, warning)
+    (packages, warning, malformed > 0)
 }
 
 fn find_npm_global_root() -> Option<PathBuf> {
@@ -761,29 +1058,54 @@ fn single_version_node_modules_root(base: &Path, suffix: &Path) -> Option<PathBu
     Some(first)
 }
 
-fn scan_pip() -> (Vec<Package>, Option<String>) {
+fn scan_pip() -> (Vec<Package>, Option<String>, bool) {
     // Resolve the pip interpreter once so the package list and the
     // site-packages lookup come from the *same* Python. Deriving the list from
     // pip3 but site-packages from a different python3 (the previous behavior)
     // mismatched sizes on Homebrew/CLT/pyenv splits.
     let Some(cmd) = pip_command() else {
-        return (Vec::new(), Some(String::from("pip: not found")));
+        return (Vec::new(), Some(String::from("pip: not found")), false);
     };
     let result = run_pip_command_with(cmd, &["list", "--format=json"]);
-    let mut warning = cmd_warning(&result, "pip");
+    let site_packages = find_pip_site_packages(cmd);
+    pip_inventory_from_result(&result, &site_packages)
+}
+
+fn pip_inventory_from_result(
+    result: &CommandResult,
+    site_packages: &[PathBuf],
+) -> (Vec<Package>, Option<String>, bool) {
+    let mut warning = cmd_warning(result, "pip");
     if result.stdout.is_empty() {
-        return (Vec::new(), warning);
+        let parse_failed = result.success;
+        if parse_failed {
+            warning = add_warning(warning, "pip: missing JSON inventory");
+        }
+        return (Vec::new(), warning, parse_failed);
     }
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result.stdout) else {
-        return (Vec::new(), warning);
+    let parsed: serde_json::Value = match serde_json::from_str(&result.stdout) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return (
+                Vec::new(),
+                add_warning(warning, format!("pip: invalid JSON: {error}")),
+                true,
+            );
+        }
     };
     let Some(arr) = parsed.as_array() else {
-        return (Vec::new(), warning);
+        return (
+            Vec::new(),
+            add_warning(warning, "pip: invalid JSON array"),
+            true,
+        );
     };
 
     // Global and per-user site-packages for this interpreter; `--user`
     // installs land in the user root and were previously never found.
-    let site_packages = find_pip_site_packages(cmd);
+    if site_packages.is_empty() && !arr.is_empty() {
+        warning = add_warning(warning, "pip: site-packages roots unresolved");
+    }
     let mut index_errors = 0u32;
     let indexes: Vec<_> = site_packages
         .iter()
@@ -802,15 +1124,26 @@ fn scan_pip() -> (Vec<Package>, Option<String>) {
     let entries: Vec<_> = arr
         .iter()
         .filter_map(|entry| {
-            let name = entry.get("name")?.as_str()?.to_string();
+            let name = entry
+                .get("name")?
+                .as_str()
+                .filter(|name| !name.is_empty())?
+                .to_string();
             let version = entry
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+                .get("version")?
+                .as_str()
+                .filter(|version| !version.is_empty())?
                 .to_string();
             Some((name, version))
         })
         .collect();
+    let malformed = arr.len().saturating_sub(entries.len());
+    if malformed > 0 {
+        warning = add_warning(
+            warning,
+            format!("pip: {malformed} malformed package records"),
+        );
+    }
 
     let measured = pool::par_map(entries, |(name, version)| {
         let (size, path, problems) =
@@ -839,29 +1172,38 @@ fn scan_pip() -> (Vec<Package>, Option<String>) {
             "pip footprint incomplete: {} missing RECORD files, {} unreadable files, {} unreadable manifests, {} site-package enumeration errors",
             problems.missing_files, problems.unreadable_files, problems.unreadable_manifests, index_errors
         );
-        warning = Some(match warning {
-            Some(existing) => format!("{existing}; {message}"),
-            None => message,
-        });
+        warning = add_warning(warning, message);
     }
-    (packages, warning)
+    (packages, warning, malformed > 0)
 }
 
-fn scan_cargo() -> (Vec<Package>, Option<String>) {
+fn scan_cargo() -> (Vec<Package>, Option<String>, bool) {
     let result = run_command("cargo", &["install", "--list"]);
-    let warning = cmd_warning(&result, "cargo");
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cargo_bin = home.as_ref().map(|h| h.join(".cargo/bin"));
+    cargo_inventory_from_result(&result, cargo_bin.as_deref())
+}
+
+fn cargo_inventory_from_result(
+    result: &CommandResult,
+    cargo_bin: Option<&Path>,
+) -> (Vec<Package>, Option<String>, bool) {
+    let mut warning = cmd_warning(result, "cargo");
     if result.stdout.is_empty() {
-        return (Vec::new(), warning);
+        return (Vec::new(), warning, false);
     }
     let output = &result.stdout;
 
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let cargo_bin = home.as_ref().map(|h| h.join(".cargo/bin"));
+    let cargo_bin = cargo_bin.map(Path::to_path_buf);
+    if cargo_bin.is_none() {
+        warning = add_warning(warning, "cargo: install bin root unresolved");
+    }
 
     let mut packages = Vec::new();
     let mut current_name = String::new();
     let mut current_version = String::new();
     let mut current_bins: Vec<String> = Vec::new();
+    let mut malformed = 0usize;
 
     let flush = |name: &str,
                  version: &str,
@@ -927,10 +1269,17 @@ fn scan_cargo() -> (Vec<Package>, Option<String>) {
         let Some(name) = parts.next() else {
             continue;
         };
+        let Some(version) = parts.next().filter(|version| {
+            version.starts_with('v') && line.trim_end().ends_with(':') && version.len() > 1
+        }) else {
+            malformed += 1;
+            current_name.clear();
+            current_version.clear();
+            current_bins.clear();
+            continue;
+        };
         current_name = name.to_string();
-        current_version = parts
-            .next()
-            .unwrap_or("")
+        current_version = version
             .trim_start_matches('v')
             .trim_end_matches(':')
             .to_string();
@@ -945,21 +1294,34 @@ fn scan_cargo() -> (Vec<Package>, Option<String>) {
         &cargo_bin,
     );
 
-    (packages, warning)
+    if malformed > 0 {
+        warning = add_warning(
+            warning,
+            format!("cargo: {malformed} malformed install rows"),
+        );
+    }
+    (packages, warning, malformed > 0)
 }
 
-fn scan_bun_global() -> (Vec<Package>, Option<String>) {
+fn scan_bun_global() -> (Vec<Package>, Option<String>, bool) {
     let result = run_command("bun", &["pm", "ls", "-g"]);
-    let warning = cmd_warning(&result, "bun");
-    if result.stdout.is_empty() {
-        return (Vec::new(), warning);
-    }
-
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let bun_global = home
         .as_ref()
         .map(|h| h.join(".bun/install/global/node_modules"));
+    bun_inventory_from_result(&result, bun_global.as_deref())
+}
 
+fn bun_inventory_from_result(
+    result: &CommandResult,
+    bun_global: Option<&Path>,
+) -> (Vec<Package>, Option<String>, bool) {
+    let mut warning = cmd_warning(result, "bun");
+    if result.stdout.is_empty() {
+        return (Vec::new(), warning, false);
+    }
+
+    let mut malformed = 0usize;
     let entries: Vec<_> = result
         .stdout
         .lines()
@@ -971,6 +1333,7 @@ fn scan_bun_global() -> (Vec<Package>, Option<String>) {
             let cleaned = line.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '@');
             let (name, version) = if let Some(at_pos) = cleaned.rfind('@') {
                 if at_pos == 0 {
+                    malformed += 1;
                     return None;
                 }
                 (
@@ -980,9 +1343,19 @@ fn scan_bun_global() -> (Vec<Package>, Option<String>) {
             } else {
                 (cleaned.to_string(), String::new())
             };
+            if name.is_empty() || version.is_empty() {
+                malformed += 1;
+                return None;
+            }
             Some((name, version))
         })
         .collect();
+    if malformed > 0 {
+        warning = add_warning(warning, format!("bun: {malformed} malformed package rows"));
+    }
+    if bun_global.is_none() && !entries.is_empty() {
+        warning = add_warning(warning, "bun: global package root unresolved");
+    }
 
     let packages = pool::par_map(entries, |(name, version)| {
         let (size, path) = if let Some(global_dir) = &bun_global {
@@ -1003,7 +1376,7 @@ fn scan_bun_global() -> (Vec<Package>, Option<String>) {
             metadata_path: None,
         }
     });
-    (packages, warning)
+    (packages, warning, malformed > 0)
 }
 
 #[cfg(test)]
@@ -2329,6 +2702,133 @@ dev = ["pytest", "ruff"]
     }
 
     #[test]
+    fn inventory_parsers_distinguish_malformed_empty_and_partial_results() {
+        let output = |stdout: &str| CommandResult {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            success: true,
+            timed_out: false,
+        };
+        let unused = test_root("inventory_parse_unused");
+        for malformed in ["", "{broken", "null"] {
+            for (packages, warning, parse_failed) in [
+                npm_inventory_from_result(&output(malformed), None),
+                pip_inventory_from_result(&output(malformed), &[]),
+                brew_casks_from_result(&output(malformed), &unused),
+            ] {
+                assert!(packages.is_empty());
+                assert!(warning.is_some());
+                assert!(parse_failed);
+            }
+        }
+        for (packages, warning, parse_failed) in [
+            npm_inventory_from_result(&output("{}"), None),
+            pip_inventory_from_result(&output("[]"), &[]),
+            brew_casks_from_result(&output(r#"{"casks":[]}"#), &unused),
+        ] {
+            assert!(packages.is_empty());
+            assert!(warning.is_none());
+            assert!(!parse_failed);
+        }
+        let (packages, warning, malformed) = pip_inventory_from_result(
+            &output(r#"[{"name":"valid","version":"1.0"},{"name":"broken"}]"#),
+            &[],
+        );
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "valid");
+        assert!(malformed);
+        assert!(warning.unwrap().contains("1 malformed package records"));
+    }
+
+    #[test]
+    fn text_inventory_parsers_keep_local_and_scoped_install_identifiers() {
+        let output = |stdout: &str| CommandResult {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            success: true,
+            timed_out: false,
+        };
+        let (cargo, warning, malformed) = cargo_inventory_from_result(
+            &output("local-tool v1.2.3 (/fixture/source):\n    local-tool\nunrecognized\n"),
+            None,
+        );
+        assert_eq!(cargo.len(), 1);
+        assert_eq!(cargo[0].name, "local-tool");
+        assert_eq!(cargo[0].version, "1.2.3");
+        assert!(malformed);
+        assert!(warning.unwrap().contains("malformed install rows"));
+        let (bun, warning, malformed) = bun_inventory_from_result(
+            &output("global node_modules\n├── @scope/tool@1.0.0\n└── @broken\n"),
+            None,
+        );
+        assert_eq!(bun.len(), 1);
+        assert_eq!(bun[0].name, "@scope/tool");
+        assert!(malformed);
+        assert!(warning.unwrap().contains("malformed package rows"));
+    }
+
+    #[test]
+    fn manager_scan_states_distinguish_absent_empty_failure_and_partial() {
+        assert_eq!(manager_scan_state(0, None, false), ManagerScanState::Empty);
+        assert_eq!(
+            manager_scan_state(2, None, false),
+            ManagerScanState::Complete
+        );
+        assert_eq!(
+            manager_scan_state(0, Some("command failed"), false),
+            ManagerScanState::Failed
+        );
+        assert_eq!(
+            manager_scan_state(0, None, true),
+            ManagerScanState::ParseFailed
+        );
+        assert_eq!(
+            manager_scan_state(2, Some("one malformed row"), true),
+            ManagerScanState::Partial
+        );
+        assert_eq!(ManagerScanState::Absent.label(), "absent");
+    }
+
+    #[test]
+    fn dependency_graph_results_keep_partial_output_and_diagnostics() {
+        let brew_result = CommandResult {
+            stdout: String::from("alpha: beta\nmalformed row\n"),
+            stderr: String::new(),
+            success: true,
+            timed_out: false,
+        };
+        let (brew, warning) = brew_graph_from_result(
+            &brew_result,
+            &[String::from("alpha"), String::from("missing")],
+        );
+        assert_eq!(brew["alpha"].dependencies, vec!["beta"]);
+        let warning = warning.unwrap();
+        assert!(warning.contains("1 malformed rows"));
+        assert!(warning.contains("1 installed formulae missing"));
+
+        let pip_result = CommandResult {
+            stdout: String::from("Name: Requests\nRequires: urllib3\nRequired-by:\n"),
+            stderr: String::from("one distribution was not found"),
+            success: false,
+            timed_out: false,
+        };
+        let (pip, warning) = pip_graph_from_result(
+            &pip_result,
+            &[String::from("requests"), String::from("missing")],
+        );
+        assert_eq!(pip["requests"].dependencies, vec!["urllib3"]);
+        assert_eq!(
+            package_dep_info(Manager::Pip, "Requests", &HashMap::new(), &pip).evidence,
+            DepEvidence::PartialGraph
+        );
+        assert!(!pip["requests"].is_dependency_leaf());
+        assert!(!brew["alpha"].is_dependency_leaf());
+        let warning = warning.unwrap();
+        assert!(warning.contains("one distribution was not found"));
+        assert!(warning.contains("1 installed distributions missing"));
+    }
+
+    #[test]
     fn global_cli_managers_are_dependency_leaves() {
         let brew_deps = HashMap::new();
         let pip_deps = HashMap::new();
@@ -2654,6 +3154,7 @@ dev = ["pytest", "ruff"]
             total_size: SizeInfo::default(),
             available: true,
             warning: Some("brew cask: timed out".into()),
+            state: ManagerScanState::Failed,
         };
         assert_eq!(report.warning.as_deref(), Some("brew cask: timed out"));
     }
