@@ -510,6 +510,8 @@ pub struct App {
     disk_info_loading: bool,
     disk_info_id: ScanId,
     disk_info_scan_rx: Option<Receiver<DiskInfoMsg>>,
+    disk_snapshots_rx: Option<Receiver<space::SnapshotListing>>,
+    disk_apfs_rx: Option<Receiver<Result<space::ApfsContainer, String>>>,
     pub disk_info_report: Option<space::SpaceReport>,
     pub file_info: Option<FileInfo>,
     pub file_info_open: bool,
@@ -549,6 +551,8 @@ pub struct App {
     empty_trash_rx: Option<Receiver<Result<(), String>>>,
     batch_delete_rx: Option<Receiver<DeleteJobMsg>>,
     external_action_rxs: Vec<Receiver<ExternalActionResult>>,
+    shutting_down: bool,
+    shutdown_results: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -785,6 +789,8 @@ impl App {
             disk_info_loading: false,
             disk_info_id: 0,
             disk_info_scan_rx: None,
+            disk_snapshots_rx: None,
+            disk_apfs_rx: None,
             disk_info_report: None,
             file_info: None,
             file_info_open: false,
@@ -818,6 +824,8 @@ impl App {
             empty_trash_rx: None,
             batch_delete_rx: None,
             external_action_rxs: Vec::new(),
+            shutting_down: false,
+            shutdown_results: Vec::new(),
         };
         app.fda_limited = full_disk_access_missing();
         app.refresh_disks();
@@ -1607,6 +1615,7 @@ impl App {
         changed |= self.drain_reclaim_results();
         changed |= self.drain_top_files_results();
         changed |= self.drain_disk_info_results();
+        changed |= self.drain_disk_enrichment_results();
         changed |= self.drain_file_info_results();
         changed |= self.drain_history_results();
         changed |= self.drain_external_action_results();
@@ -1653,6 +1662,14 @@ impl App {
 
     pub fn disk_info_loading(&self) -> bool {
         self.disk_info_loading
+    }
+
+    pub fn disk_snapshots_loading(&self) -> bool {
+        self.disk_snapshots_rx.is_some()
+    }
+
+    pub fn disk_apfs_loading(&self) -> bool {
+        self.disk_apfs_rx.is_some()
     }
 
     pub fn reclaim_paths_selected(&self) -> usize {
@@ -1773,6 +1790,61 @@ impl App {
                 true
             }
         }
+    }
+
+    fn drain_disk_enrichment_results(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(rx) = &self.disk_snapshots_rx {
+            match rx.try_recv() {
+                Ok(listing) => {
+                    self.status = if let Some(error) = &listing.error {
+                        format!("snapshot refresh failed: {error}")
+                    } else {
+                        format!("snapshot list refreshed: {} found", listing.names.len())
+                    };
+                    if let Some(report) = self.disk_info_report.as_mut() {
+                        report.local_snapshots = listing;
+                    }
+                    self.disk_snapshots_rx = None;
+                    changed = true;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.disk_snapshots_rx = None;
+                    self.status = String::from("snapshot refresh worker failed");
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.disk_apfs_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    if let Some(report) = self.disk_info_report.as_mut() {
+                        match result {
+                            Ok(container) => {
+                                report.apfs_container = Some(container);
+                                report.apfs_error = None;
+                                self.status = String::from("APFS container refreshed");
+                            }
+                            Err(error) => {
+                                report.apfs_container = None;
+                                report.apfs_error = Some(error.clone());
+                                self.status = format!("APFS refresh failed: {error}");
+                            }
+                        }
+                    }
+                    self.disk_apfs_rx = None;
+                    changed = true;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.disk_apfs_rx = None;
+                    self.status = String::from("APFS refresh worker failed");
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        changed
     }
 
     fn next_reclaim_scan_id(&mut self) -> ScanId {
@@ -2192,6 +2264,8 @@ impl App {
         self.disk_info_open = false;
         self.disk_info_loading = false;
         self.disk_info_scan_rx = None;
+        self.disk_snapshots_rx = None;
+        self.disk_apfs_rx = None;
     }
 
     pub fn open_file_info(&mut self) {
@@ -2348,21 +2422,31 @@ impl App {
             Ok(Ok(())) => {
                 self.empty_trash_rx = None;
                 self.status = String::from("Trash emptied");
-                self.refresh_disks();
-                if self.focus == Focus::Reclaim {
-                    self.request_reclaim_scan();
+                if self.shutting_down {
+                    self.shutdown_results.push(self.status.clone());
+                } else {
+                    self.refresh_disks();
+                    if self.focus == Focus::Reclaim {
+                        self.request_reclaim_scan();
+                    }
                 }
                 true
             }
             Ok(Err(e)) => {
                 self.empty_trash_rx = None;
                 self.status = format!("empty trash failed: {e}");
+                if self.shutting_down {
+                    self.shutdown_results.push(self.status.clone());
+                }
                 true
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
                 self.empty_trash_rx = None;
                 self.status = String::from("empty trash failed");
+                if self.shutting_down {
+                    self.shutdown_results.push(self.status.clone());
+                }
                 true
             }
         }
@@ -2410,6 +2494,8 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.disk_info_id = scan_id;
         self.disk_info_loading = true;
+        self.disk_snapshots_rx = None;
+        self.disk_apfs_rx = None;
         self.disk_info_report = None;
         self.disk_info_open = true;
         self.status = String::from("loading disk info…");
@@ -2421,12 +2507,64 @@ impl App {
         });
     }
 
+    pub fn retry_disk_snapshots(&mut self) {
+        self.retry_disk_snapshots_with(space::list_local_snapshots);
+    }
+
+    fn retry_disk_snapshots_with(&mut self, runner: fn(&Path) -> space::SnapshotListing) {
+        let Some(report) = self.disk_info_report.as_ref() else {
+            self.status = String::from("load disk details before retrying snapshots");
+            return;
+        };
+        if self.disk_snapshots_rx.is_some() {
+            self.status = String::from("snapshot refresh already running");
+            return;
+        }
+        let mount = report.mount.clone();
+        let (tx, rx) = channel();
+        self.disk_snapshots_rx = Some(rx);
+        self.status = String::from("refreshing snapshots…");
+        thread::spawn(move || {
+            let _ = tx.send(runner(&mount));
+        });
+    }
+
+    pub fn retry_disk_apfs(&mut self) {
+        self.retry_disk_apfs_with(|mount| {
+            space::apfs_container_for_mount(mount).map_err(|error| error.to_string())
+        });
+    }
+
+    fn retry_disk_apfs_with(&mut self, runner: fn(&Path) -> Result<space::ApfsContainer, String>) {
+        let Some(report) = self.disk_info_report.as_ref() else {
+            self.status = String::from("load disk details before retrying APFS");
+            return;
+        };
+        if report.fs_type != "apfs" {
+            self.status = String::from("selected volume is not APFS");
+            return;
+        }
+        if self.disk_apfs_rx.is_some() {
+            self.status = String::from("APFS refresh already running");
+            return;
+        }
+        let mount = report.mount.clone();
+        let (tx, rx) = channel();
+        self.disk_apfs_rx = Some(rx);
+        self.status = String::from("refreshing APFS container…");
+        thread::spawn(move || {
+            let _ = tx.send(runner(&mount));
+        });
+    }
+
     pub fn has_pending_scan_work(&self) -> bool {
         self.sort_dirty
             || self.entries.iter().any(|entry| entry.scanning)
             || self.top_files_loading
             || self.reclaim_loading
             || self.disk_info_loading
+            || self.disk_snapshots_rx.is_some()
+            || self.disk_apfs_rx.is_some()
             || self.file_info_rx.is_some()
             || self.history_loading
             || self.packages_loading
@@ -2435,6 +2573,61 @@ impl App {
             || self.empty_trash_rx.is_some()
             || self.batch_delete_rx.is_some()
             || !self.external_action_rxs.is_empty()
+    }
+
+    pub fn has_pending_shutdown_work(&self) -> bool {
+        self.uninstall_rx.is_some()
+            || self.empty_trash_rx.is_some()
+            || self.batch_delete_rx.is_some()
+            || !self.external_action_rxs.is_empty()
+            || self.history_saving
+            || self.history_jobs.load(AtomicOrdering::Relaxed) > 0
+    }
+
+    pub fn begin_shutdown(&mut self) {
+        self.shutting_down = true;
+        self.scanner.cancel_current();
+        self.pending_scan_dirs.clear();
+        self.top_files_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        if !self.history_saving {
+            self.history_generation
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.history_rx = None;
+        }
+        self.reclaim_scan_rx = None;
+        self.top_files_scan_rx = None;
+        self.disk_info_scan_rx = None;
+        self.disk_snapshots_rx = None;
+        self.disk_apfs_rx = None;
+        self.pkg_scan_rx = None;
+        self.dep_scan_rx = None;
+        self.file_info_rx = None;
+        self.status = String::from("finishing active operations before quit…");
+    }
+
+    pub fn drain_shutdown_results(&mut self) -> bool {
+        let mut changed = self.drain_empty_trash_results();
+        changed |= self.drain_batch_delete_results();
+        changed |= self.drain_uninstall_results();
+        changed |= self.drain_external_action_results();
+        let was_saving = self.history_saving;
+        let history_changed = self.drain_history_results();
+        if was_saving && history_changed && !self.history_saving {
+            self.shutdown_results.push(self.status.clone());
+        }
+        changed |= history_changed;
+        changed
+    }
+
+    pub fn shutdown_summary(&self) -> Option<String> {
+        self.shutting_down.then(|| {
+            if self.shutdown_results.is_empty() {
+                String::from("active operations finished")
+            } else {
+                self.shutdown_results.join("; ")
+            }
+        })
     }
 
     pub fn start_external_open(&mut self, path: PathBuf, label: String, reveal: bool) {
@@ -2470,12 +2663,18 @@ impl App {
                     Ok(()) => format!("{} requested: {}", msg.action, msg.label),
                     Err(error) => format!("{} failed for {}: {error}", msg.action, msg.label),
                 };
+                if self.shutting_down {
+                    self.shutdown_results.push(self.status.clone());
+                }
                 changed = true;
                 false
             }
             Err(TryRecvError::Empty) => true,
             Err(TryRecvError::Disconnected) => {
                 self.status = String::from("external action worker failed");
+                if self.shutting_down {
+                    self.shutdown_results.push(self.status.clone());
+                }
                 changed = true;
                 false
             }
@@ -2645,9 +2844,29 @@ impl App {
                 for path in &msg.deleted {
                     self.invalidate_cache_for(path);
                 }
-                if !msg.deleted.is_empty() {
+                if !msg.deleted.is_empty() && !self.shutting_down {
                     self.refresh_disks();
                     self.refresh_history_state();
+                }
+
+                if self.shutting_down {
+                    let failures: Vec<_> = msg
+                        .failures
+                        .iter()
+                        .map(|(path, error)| format!("{}: {error}", path.display()))
+                        .collect();
+                    self.status = format!(
+                        "Trash operation finished: {} moved, {} failed{}",
+                        msg.deleted.len(),
+                        failures.len(),
+                        if failures.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", failures.join(", "))
+                        }
+                    );
+                    self.shutdown_results.push(self.status.clone());
+                    return true;
                 }
 
                 if !msg.failures.is_empty() {
@@ -2727,6 +2946,9 @@ impl App {
             Err(TryRecvError::Disconnected) => {
                 self.batch_delete_rx = None;
                 self.status = String::from("batch delete failed");
+                if self.shutting_down {
+                    self.shutdown_results.push(self.status.clone());
+                }
                 true
             }
         }
@@ -3238,6 +3460,15 @@ impl App {
                 self.status = format!(
                     "{total} packages · {dependency_leaves} dependency leaves · u to filter · i for details"
                 );
+                let warnings: Vec<_> = self
+                    .pkg_reports
+                    .iter()
+                    .filter_map(|report| report.warning.as_deref())
+                    .collect();
+                if !warnings.is_empty() {
+                    self.status.push_str(" · warnings: ");
+                    self.status.push_str(&warnings.join("; "));
+                }
                 true
             }
             Err(TryRecvError::Empty) => self.drain_uninstall_results(),
@@ -3262,11 +3493,16 @@ impl App {
                     Ok(_) => {
                         self.status = format!("uninstalled {}", msg.display_name);
                         self.dep_graph = None;
-                        self.refresh_packages();
+                        if !self.shutting_down {
+                            self.refresh_packages();
+                        }
                     }
                     Err(err) => {
                         self.status = format!("uninstall failed: {err}");
                     }
+                }
+                if self.shutting_down {
+                    self.shutdown_results.push(self.status.clone());
                 }
                 true
             }
@@ -3274,6 +3510,9 @@ impl App {
             Err(TryRecvError::Disconnected) => {
                 self.uninstall_rx = None;
                 self.status = String::from("uninstall worker failed");
+                if self.shutting_down {
+                    self.shutdown_results.push(self.status.clone());
+                }
                 true
             }
         }
@@ -4978,6 +5217,49 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_waits_for_injected_trash_and_records_all_outcomes() {
+        fn simulated_trash(_path: &Path) -> Result<()> {
+            thread::sleep(Duration::from_millis(30));
+            Ok(())
+        }
+
+        let root = test_root("shutdown_mutations");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("item.txt");
+        fs::write(&path, b"item").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.size_cache.insert(path.clone(), SizeInfo::new(4, 4096));
+        assert!(app.start_delete_with(DeleteTarget::Batch, vec![path.clone()], simulated_trash));
+        let (uninstall_tx, uninstall_rx) = channel();
+        app.uninstall_rx = Some(uninstall_rx);
+        app.begin_shutdown();
+        assert!(app.has_pending_shutdown_work());
+        uninstall_tx
+            .send(UninstallResult {
+                display_name: String::from("pip example"),
+                result: Err(String::from("simulated uninstall failure")),
+            })
+            .unwrap();
+        for _ in 0..100 {
+            app.drain_shutdown_results();
+            if !app.has_pending_shutdown_work() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!app.has_pending_shutdown_work());
+        assert!(!app.size_cache.contains_key(&path));
+        let summary = app.shutdown_summary().unwrap();
+        assert!(summary.contains("1 moved, 0 failed"), "{summary}");
+        assert!(summary.contains("simulated uninstall failure"), "{summary}");
+        assert!(
+            path.exists(),
+            "injected runner must not touch real Trash state"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn failed_batch_delete_paths_are_marked_again() {
         let root = test_root("batch_delete_failed_marks");
         fs::create_dir_all(&root).unwrap();
@@ -5205,6 +5487,30 @@ mod tests {
     }
 
     #[test]
+    fn dependency_completion_keeps_package_scan_warnings_visible() {
+        let root = test_root("package_warning_survives_deps");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.pkg_reports = vec![packages::ManagerReport {
+            manager: packages::Manager::Pip,
+            packages: Vec::new(),
+            total_size: SizeInfo::default(),
+            available: true,
+            warning: Some(String::from("missing RECORD files")),
+        }];
+        let (tx, rx) = channel();
+        app.dep_scan_rx = Some(rx);
+        app.deps_loading = true;
+        tx.send(DepScanMsg {
+            graph: DepGraph::default(),
+        })
+        .unwrap();
+        assert!(app.drain_dep_results());
+        assert!(app.status.contains("missing RECORD files"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn external_action_reports_completion_after_worker_result() {
         fn simulated_open(_path: &Path, _reveal: bool) -> Result<(), String> {
             Err(String::from("simulated utility failure"))
@@ -5230,6 +5536,77 @@ mod tests {
         }
         assert!(app.external_action_rxs.is_empty());
         assert!(app.status.contains("simulated utility failure"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disk_enrichments_retry_independently_without_real_utilities() {
+        fn snapshots(_mount: &Path) -> space::SnapshotListing {
+            space::SnapshotListing {
+                names: vec![String::from("snapshot-one")],
+                error: None,
+            }
+        }
+        fn apfs_failure(_mount: &Path) -> Result<space::ApfsContainer, String> {
+            Err(String::from("simulated diskutil failure"))
+        }
+        fn apfs_success(_mount: &Path) -> Result<space::ApfsContainer, String> {
+            Ok(space::ApfsContainer {
+                reference: String::from("disk1"),
+                size: 100,
+                free: 40,
+            })
+        }
+
+        let root = test_root("disk_enrichment_retry");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.disk_info_open = true;
+        app.disk_info_report = Some(space::SpaceReport {
+            path: root.clone(),
+            mount: root.clone(),
+            device: String::from("disk1s1"),
+            fs_type: String::from("apfs"),
+            total: 100,
+            used: 60,
+            free: 40,
+            available: 40,
+            local_snapshots: space::SnapshotListing {
+                names: Vec::new(),
+                error: Some(String::from("old snapshot error")),
+            },
+            apfs_container: None,
+            apfs_error: Some(String::from("old APFS error")),
+        });
+        app.retry_disk_snapshots_with(snapshots);
+        app.retry_disk_apfs_with(apfs_failure);
+        assert!(app.disk_snapshots_loading());
+        assert!(app.disk_apfs_loading());
+        for _ in 0..100 {
+            app.drain_disk_enrichment_results();
+            if !app.disk_snapshots_loading() && !app.disk_apfs_loading() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let report = app.disk_info_report.as_ref().unwrap();
+        assert_eq!(report.local_snapshots.names, ["snapshot-one"]);
+        assert_eq!(
+            report.apfs_error.as_deref(),
+            Some("simulated diskutil failure")
+        );
+        app.retry_disk_apfs_with(apfs_success);
+        for _ in 0..100 {
+            app.drain_disk_enrichment_results();
+            if !app.disk_apfs_loading() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let report = app.disk_info_report.as_ref().unwrap();
+        assert_eq!(report.local_snapshots.names, ["snapshot-one"]);
+        assert_eq!(report.apfs_container.as_ref().unwrap().reference, "disk1");
+        assert!(report.apfs_error.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

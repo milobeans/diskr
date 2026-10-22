@@ -770,7 +770,7 @@ fn scan_pip() -> (Vec<Package>, Option<String>) {
         return (Vec::new(), Some(String::from("pip: not found")));
     };
     let result = run_pip_command_with(cmd, &["list", "--format=json"]);
-    let warning = cmd_warning(&result, "pip");
+    let mut warning = cmd_warning(&result, "pip");
     if result.stdout.is_empty() {
         return (Vec::new(), warning);
     }
@@ -784,6 +784,20 @@ fn scan_pip() -> (Vec<Package>, Option<String>) {
     // Global and per-user site-packages for this interpreter; `--user`
     // installs land in the user root and were previously never found.
     let site_packages = find_pip_site_packages(cmd);
+    let mut index_errors = 0u32;
+    let indexes: Vec<_> = site_packages
+        .iter()
+        .filter_map(|root| match PipDistIndex::build(root) {
+            Ok(index) => {
+                index_errors = index_errors.saturating_add(index.entry_errors);
+                Some(index)
+            }
+            Err(_) => {
+                index_errors = index_errors.saturating_add(1);
+                None
+            }
+        })
+        .collect();
 
     let entries: Vec<_> = arr
         .iter()
@@ -798,16 +812,38 @@ fn scan_pip() -> (Vec<Package>, Option<String>) {
         })
         .collect();
 
-    let packages = pool::par_map(entries, |(name, version)| {
-        let (size, path) = find_pip_package_size_and_path_in_roots(&site_packages, &name);
-        Package {
-            name,
-            version,
-            size,
-            path,
-            metadata_path: None,
-        }
+    let measured = pool::par_map(entries, |(name, version)| {
+        let (size, path, problems) =
+            find_pip_package_size_and_path_in_indexes(&indexes, &name, &version);
+        (
+            Package {
+                name,
+                version,
+                size,
+                path,
+                metadata_path: None,
+            },
+            problems,
+        )
     });
+    let mut problems = PipRecordProblems::default();
+    let packages = measured
+        .into_iter()
+        .map(|(package, current)| {
+            problems.add(current);
+            package
+        })
+        .collect();
+    if !problems.is_empty() || index_errors > 0 {
+        let message = format!(
+            "pip footprint incomplete: {} missing RECORD files, {} unreadable files, {} unreadable manifests, {} site-package enumeration errors",
+            problems.missing_files, problems.unreadable_files, problems.unreadable_manifests, index_errors
+        );
+        warning = Some(match warning {
+            Some(existing) => format!("{existing}; {message}"),
+            None => message,
+        });
+    }
     (packages, warning)
 }
 
@@ -1589,39 +1625,114 @@ fn pip_command() -> Option<PipCommand> {
     None
 }
 
-/// Search every resolved site-packages root (global plus per-user) for the
-/// package, returning the first root with a `RECORD`-sized dist-info. Falls
-/// back to the first inferred package directory if no root records a size.
-fn find_pip_package_size_and_path_in_roots(
-    roots: &[PathBuf],
+struct PipDistIndex {
+    root: PathBuf,
+    by_name: HashMap<String, Vec<(String, PathBuf)>>,
+    entry_errors: u32,
+}
+
+impl PipDistIndex {
+    fn build(root: &Path) -> io::Result<Self> {
+        let mut by_name: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
+        let mut entry_errors = 0u32;
+        for entry in std::fs::read_dir(root)? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    entry_errors = entry_errors.saturating_add(1);
+                    continue;
+                }
+            };
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    entry_errors = entry_errors.saturating_add(1);
+                    continue;
+                }
+            }
+            let file_name = entry.file_name();
+            let Some(stem) = file_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".dist-info"))
+            else {
+                continue;
+            };
+            let (name, version) = stem
+                .rsplit_once('-')
+                .filter(|(_, version)| version.starts_with(|ch: char| ch.is_ascii_digit()))
+                .unwrap_or((stem, ""));
+            by_name
+                .entry(normalize_dist_name(name))
+                .or_default()
+                .push((version.to_string(), entry.path()));
+        }
+        for candidates in by_name.values_mut() {
+            candidates.sort_by(|a, b| a.1.cmp(&b.1));
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            by_name,
+            entry_errors,
+        })
+    }
+
+    fn dist_info(&self, package: &str, version: &str) -> Option<&Path> {
+        let candidates = self.by_name.get(&normalize_dist_name(package))?;
+        candidates
+            .iter()
+            .find(|(candidate, _)| candidate == version)
+            .or_else(|| {
+                if version.is_empty() || candidates.len() == 1 && candidates[0].0.is_empty() {
+                    candidates.first()
+                } else {
+                    None
+                }
+            })
+            .map(|(_, path)| path.as_path())
+    }
+}
+
+/// Search indexed roots in interpreter order and only size a matching version.
+fn find_pip_package_size_and_path_in_indexes(
+    indexes: &[PipDistIndex],
     package: &str,
-) -> (Option<SizeInfo>, Option<PathBuf>) {
+    version: &str,
+) -> (Option<SizeInfo>, Option<PathBuf>, PipRecordProblems) {
     let mut fallback_path = None;
-    for root in roots {
-        let (size, path) = find_pip_package_size_and_path(root, package);
+    let mut all_problems = PipRecordProblems::default();
+    for index in indexes {
+        let (size, path, problems) = find_pip_package_size_and_path(index, package, version);
+        all_problems.add(problems);
         if size.is_some() {
-            return (size, path);
+            return (size, path, all_problems);
         }
         if fallback_path.is_none() {
             fallback_path = path;
         }
     }
-    (None, fallback_path)
+    (None, fallback_path, all_problems)
 }
 
 fn find_pip_package_size_and_path(
-    site_packages: &Path,
+    index: &PipDistIndex,
     package: &str,
-) -> (Option<SizeInfo>, Option<PathBuf>) {
-    let Some(dist_info_path) = find_pip_dist_info(site_packages, package) else {
-        return (None, infer_pip_package_dir(site_packages, package));
+    version: &str,
+) -> (Option<SizeInfo>, Option<PathBuf>, PipRecordProblems) {
+    let site_packages = &index.root;
+    let Some(dist_info_path) = index.dist_info(package, version) else {
+        return (
+            None,
+            infer_pip_package_dir(site_packages, package),
+            PipRecordProblems::default(),
+        );
     };
 
-    let size = parse_pip_record_size(site_packages, &dist_info_path);
-    let path = find_pip_top_level_path(site_packages, &dist_info_path)
+    let (size, problems) = parse_pip_record_size(site_packages, dist_info_path);
+    let path = find_pip_top_level_path(site_packages, dist_info_path)
         .or_else(|| infer_pip_package_dir(site_packages, package));
 
-    (size, path)
+    (size, path, problems)
 }
 
 fn infer_pip_package_dir(site_packages: &Path, package: &str) -> Option<PathBuf> {
@@ -1636,32 +1747,12 @@ fn infer_pip_package_dir(site_packages: &Path, package: &str) -> Option<PathBuf>
     None
 }
 
+#[cfg(test)]
 fn find_pip_dist_info(site_packages: &Path, package: &str) -> Option<PathBuf> {
-    let needle = normalize_dist_name(package);
-    let read = std::fs::read_dir(site_packages).ok()?;
-
-    for entry in read.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if !name.ends_with(".dist-info") {
-            continue;
-        }
-        let prefix = &name[..name.len() - ".dist-info".len()];
-        let normalized = normalize_dist_name(prefix);
-        let exact = normalized == needle;
-        // A versioned dist-info is `name-VERSION`, so the segment after the
-        // needle must begin with a version digit. Without this, `sentry`
-        // wrongly matched `sentry-sdk-2.0` (and `boto` matched `boto3`).
-        let versioned = normalized
-            .strip_prefix(&(needle.clone() + "-"))
-            .is_some_and(|rest| rest.starts_with(|ch: char| ch.is_ascii_digit()));
-        if exact || versioned {
-            return Some(entry.path());
-        }
-    }
-    None
+    PipDistIndex::build(site_packages)
+        .ok()?
+        .dist_info(package, "")
+        .map(Path::to_path_buf)
 }
 
 fn find_pip_top_level_path(site_packages: &Path, dist_info: &Path) -> Option<PathBuf> {
@@ -1680,10 +1771,46 @@ fn find_pip_top_level_path(site_packages: &Path, dist_info: &Path) -> Option<Pat
     None
 }
 
-fn parse_pip_record_size(site_packages: &Path, dist_info: &Path) -> Option<SizeInfo> {
-    let record = std::fs::read_to_string(dist_info.join("RECORD")).ok()?;
+#[derive(Clone, Copy, Default)]
+struct PipRecordProblems {
+    missing_files: u32,
+    unreadable_files: u32,
+    unreadable_manifests: u32,
+}
+
+impl PipRecordProblems {
+    fn add(&mut self, other: Self) {
+        self.missing_files = self.missing_files.saturating_add(other.missing_files);
+        self.unreadable_files = self.unreadable_files.saturating_add(other.unreadable_files);
+        self.unreadable_manifests = self
+            .unreadable_manifests
+            .saturating_add(other.unreadable_manifests);
+    }
+
+    fn is_empty(self) -> bool {
+        self.missing_files == 0 && self.unreadable_files == 0 && self.unreadable_manifests == 0
+    }
+}
+
+fn parse_pip_record_size(
+    site_packages: &Path,
+    dist_info: &Path,
+) -> (Option<SizeInfo>, PipRecordProblems) {
+    let record = match std::fs::read_to_string(dist_info.join("RECORD")) {
+        Ok(record) => record,
+        Err(_) => {
+            return (
+                None,
+                PipRecordProblems {
+                    unreadable_manifests: 1,
+                    ..Default::default()
+                },
+            );
+        }
+    };
     let mut logical = 0u64;
     let mut allocated = 0u64;
+    let mut problems = PipRecordProblems::default();
 
     for row in record.lines().filter(|line| !line.trim().is_empty()) {
         let fields = split_csv_row(row);
@@ -1695,17 +1822,22 @@ fn parse_pip_record_size(site_packages: &Path, dist_info: &Path) -> Option<SizeI
             continue;
         }
 
-        if let Ok(bytes) = fields[2].trim().parse::<u64>() {
-            logical = logical.saturating_add(bytes);
-        }
-
         let full_path = site_packages.join(rel_path);
-        if let Ok(meta) = std::fs::symlink_metadata(&full_path) {
-            allocated = allocated.saturating_add(allocated_size_from_metadata(&meta));
+        match std::fs::symlink_metadata(&full_path) {
+            Ok(meta) => {
+                logical = logical.saturating_add(meta.len());
+                allocated = allocated.saturating_add(allocated_size_from_metadata(&meta));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                problems.missing_files = problems.missing_files.saturating_add(1);
+            }
+            Err(_) => {
+                problems.unreadable_files = problems.unreadable_files.saturating_add(1);
+            }
         }
     }
 
-    Some(SizeInfo { logical, allocated })
+    (Some(SizeInfo { logical, allocated }), problems)
 }
 
 fn split_csv_row(line: &str) -> Vec<String> {
@@ -2031,11 +2163,63 @@ dev = ["pytest", "ruff"]
 
         // Package is only in the user root; the global root is searched first
         // but the size must still be found in the user root.
-        let (size, path) = find_pip_package_size_and_path_in_roots(&[global, user.clone()], "flit");
+        let indexes = [
+            PipDistIndex::build(&global).unwrap(),
+            PipDistIndex::build(&user).unwrap(),
+        ];
+        let (size, path, problems) =
+            find_pip_package_size_and_path_in_indexes(&indexes, "flit", "3.9.0");
         assert!(size.is_some());
         assert_eq!(path, Some(user.join("flit")));
+        assert!(problems.is_empty());
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pip_index_matches_exact_version_and_normalized_name() {
+        let root = test_root("pip_index_version");
+        std::fs::create_dir_all(root.join("typing_extensions-4.0.dist-info")).unwrap();
+        std::fs::create_dir_all(root.join("typing_extensions-5.0.dist-info")).unwrap();
+        let index = PipDistIndex::build(&root).unwrap();
+        assert_eq!(
+            index.dist_info("typing-extensions", "5.0"),
+            Some(root.join("typing_extensions-5.0.dist-info").as_path())
+        );
+        assert!(index.dist_info("typing-extensions", "6.0").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual site-packages scaling benchmark"]
+    fn benchmark_pip_dist_index_sizes() {
+        for count in [100, 1_000, 5_000] {
+            let root = test_root(&format!("pip_index_bench_{count}"));
+            std::fs::create_dir_all(&root).unwrap();
+            for n in 0..count {
+                std::fs::create_dir(root.join(format!("package{n}-1.0.dist-info"))).unwrap();
+            }
+            let started = Instant::now();
+            let index = PipDistIndex::build(&root).unwrap();
+            let build_time = started.elapsed();
+            let started = Instant::now();
+            for n in 0..count {
+                assert!(index.dist_info(&format!("package{n}"), "1.0").is_some());
+            }
+            let lookup_time = started.elapsed();
+            let repeated_started = Instant::now();
+            for n in 0..count {
+                let expected = format!("package{n}-1.0.dist-info");
+                assert!(std::fs::read_dir(&root)
+                    .unwrap()
+                    .any(|entry| entry.unwrap().file_name() == expected.as_str()));
+            }
+            eprintln!(
+                "pip index: {count} distributions, one enumeration in {build_time:?}, {count} lookups in {lookup_time:?}; repeated enumeration in {:?}",
+                repeated_started.elapsed()
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -2068,7 +2252,7 @@ dev = ["pytest", "ruff"]
     }
 
     #[test]
-    fn parses_pip_record_sizes_from_manifest() {
+    fn measures_pip_record_sizes_from_live_files() {
         let root = test_root("pip_record_sizes");
         let dist_info = root.join("requests-2.32.0.dist-info");
         std::fs::create_dir_all(&dist_info).unwrap();
@@ -2080,14 +2264,29 @@ dev = ["pytest", "ruff"]
         .unwrap();
         std::fs::write(
             dist_info.join("RECORD"),
-            "requests/__init__.py,sha256=abc,13\n\
-             requests-2.32.0.dist-info/RECORD,sha256=def,7\n",
+            "requests/__init__.py,sha256=abc,99999\n\
+             requests-2.32.0.dist-info/RECORD,sha256=def,\n\
+             requests/missing.py,sha256=missing,90000\n",
         )
         .unwrap();
 
-        let size = parse_pip_record_size(&root, &dist_info).unwrap();
-        assert_eq!(size.logical, 20);
+        let (size, problems) = parse_pip_record_size(&root, &dist_info);
+        let size = size.unwrap();
+        let expected = std::fs::symlink_metadata(root.join("requests/__init__.py"))
+            .unwrap()
+            .len()
+            + std::fs::symlink_metadata(dist_info.join("RECORD"))
+                .unwrap()
+                .len();
+        assert_eq!(size.logical, expected);
         assert!(size.allocated > 0);
+        assert_eq!(problems.missing_files, 1);
+        assert_eq!(problems.unreadable_files, 0);
+
+        std::fs::remove_file(dist_info.join("RECORD")).unwrap();
+        let (size, problems) = parse_pip_record_size(&root, &dist_info);
+        assert!(size.is_none());
+        assert_eq!(problems.unreadable_manifests, 1);
 
         std::fs::remove_dir_all(&root).unwrap();
     }

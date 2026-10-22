@@ -200,7 +200,7 @@ fn statfs_for_path(path: &Path) -> Result<StatfsInfo> {
     })
 }
 
-fn list_local_snapshots(path: &Path) -> SnapshotListing {
+pub(crate) fn list_local_snapshots(path: &Path) -> SnapshotListing {
     let mut command = Command::new("tmutil");
     command.arg("listlocalsnapshots").arg(path);
     let output = packages::run_process(command, Duration::from_secs(15));
@@ -222,7 +222,7 @@ fn list_local_snapshots(path: &Path) -> SnapshotListing {
     }
 }
 
-fn apfs_container_for_mount(mount: &Path) -> Result<ApfsContainer> {
+pub(crate) fn apfs_container_for_mount(mount: &Path) -> Result<ApfsContainer> {
     let mut command = Command::new("diskutil");
     command.arg("info").arg("-plist").arg(mount);
     let output = packages::run_process(command, Duration::from_secs(15));

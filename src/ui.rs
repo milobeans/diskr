@@ -160,8 +160,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     // wide enough to spare the room.
     const MODIFIED_AUTO_WIDTH: u16 = 100;
     let show_modified = app.sort == SortMode::Modified || area.width >= MODIFIED_AUTO_WIDTH;
-    let (name_width, size_width, modified_width, bar_width) =
-        file_columns(area.width.saturating_sub(2), show_modified);
+    let content_width = area.width.saturating_sub(4);
     let visible_count = app.visible_entry_count();
     if visible_count == 0 {
         let block = Block::default()
@@ -279,6 +278,31 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 Style::default()
             };
+            if content_width < 3 {
+                return ListItem::new(truncate(icon, content_width as usize));
+            }
+            let mut growth = if e.scanning {
+                None
+            } else {
+                e.size_delta.and_then(growth_badge)
+            };
+            let mut chip = app.reclaim_class(&e.path).map(|class| {
+                let (name, color) = reclaim_chip(class);
+                (format!(" [{name}]"), Style::default().fg(color))
+            });
+            let max_suffix = content_width.saturating_sub(3) as usize;
+            let growth_width = growth.as_ref().map_or(0, |(text, _)| display_width(text));
+            let chip_width = chip.as_ref().map_or(0, |(text, _)| display_width(text));
+            if growth_width + chip_width > max_suffix {
+                chip = None;
+            }
+            if growth_width > max_suffix {
+                growth = None;
+            }
+            let suffix_width = growth.as_ref().map_or(0, |(text, _)| display_width(text))
+                + chip.as_ref().map_or(0, |(text, _)| display_width(text));
+            let (name_width, size_width, modified_width, bar_width) =
+                file_columns_for_row(content_width, suffix_width, show_modified);
             let mut spans = vec![
                 Span::styled(icon, icon_style),
                 Span::styled(pad_truncated(&e.name, name_width), name_style),
@@ -291,7 +315,10 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
             );
             if size_width > 0 {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled(format!("{size_str:>size_width$}"), size_style));
+                spans.push(Span::styled(
+                    pad_left_truncated(&size_str, size_width),
+                    size_style,
+                ));
             }
             if bar_width > 0 {
                 spans.push(Span::raw("  "));
@@ -312,25 +339,15 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                 let modified = format_modified_time(e.modified);
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
-                    format!("{modified:>modified_width$}"),
+                    pad_left_truncated(&modified, modified_width),
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-            // Growth badge for directories that changed since their last scan.
-            if !e.scanning {
-                if let Some((badge, badge_style)) = e.size_delta.and_then(growth_badge) {
-                    spans.push(Span::styled(badge, badge_style));
-                }
+            if let Some((badge, badge_style)) = growth {
+                spans.push(Span::styled(badge, badge_style));
             }
-            // Reclaim class chip for rows the reclaim engine recognizes
-            // (node_modules, target, ~/Library/Caches, …) — name/path only,
-            // no I/O on the render path.
-            if let Some(class) = app.reclaim_class(&e.path) {
-                let (chip, chip_color) = reclaim_chip(class);
-                spans.push(Span::styled(
-                    format!(" [{chip}]"),
-                    Style::default().fg(chip_color),
-                ));
+            if let Some((badge, badge_style)) = chip {
+                spans.push(Span::styled(badge, badge_style));
             }
             let line = Line::from(spans);
             ListItem::new(line)
@@ -1102,8 +1119,16 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
             }
         }
     }
+    if app.disk_snapshots_loading() {
+        lines.push(Line::from("refreshing snapshot list…"));
+    }
+    if app.disk_apfs_loading() {
+        lines.push(Line::from("refreshing APFS container…"));
+    }
     lines.push(Line::from(""));
-    lines.push(Line::from("esc closes this panel"));
+    lines.push(Line::from(
+        "s refresh snapshots · a refresh APFS · Esc close",
+    ));
 
     render_detail_modal(f, area, " disk details ", Color::DarkGray, lines);
 }
@@ -1465,7 +1490,8 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
 
     let visible_indices = app.pkg_visible_indices();
     let item_count = visible_indices.len();
-    let inner_width = area.width.saturating_sub(2);
+    // The List reserves two columns for its selection symbol inside the border.
+    let inner_width = area.width.saturating_sub(4);
 
     if item_count == 0 {
         let message = if app.pkg_filter_active() {
@@ -1564,27 +1590,30 @@ fn package_line_with_version(
         PackageUseStatus::DependencyLeaf => "  ",
         PackageUseStatus::Untracked => "? ",
     };
-    let mgr_label = format!("{manager} ");
+    let dep_display = truncate(dep_indicator, name_width);
+    let mgr_label = truncate(
+        &format!("{manager} "),
+        name_width.saturating_sub(display_width(&dep_display)),
+    );
     let name_budget = name_width
-        .saturating_sub(mgr_label.len())
-        .saturating_sub(dep_indicator.len());
+        .saturating_sub(display_width(&dep_display))
+        .saturating_sub(display_width(&mgr_label));
     let name_ver = format!("{name}{ver_display}");
-    let name_truncated = truncate(&name_ver, name_budget);
-    let padded_name = format!("{name_truncated:<width$}", width = name_budget);
+    let padded_name = pad_truncated(&name_ver, name_budget);
 
     let dep_style = match use_status {
         PackageUseStatus::Untracked => Style::default().fg(Color::Yellow),
         _ => Style::default().fg(Color::DarkGray),
     };
     let mut spans = vec![
-        Span::styled(dep_indicator, dep_style),
+        Span::styled(dep_display, dep_style),
         Span::styled(mgr_label, Style::default().fg(Color::DarkGray)),
         Span::styled(padded_name, Style::default().fg(Color::White)),
     ];
     if size_width > 0 {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            format!("{size:>size_width$}"),
+            pad_left_truncated(size, size_width),
             Style::default().fg(Color::Green),
         ));
     }
@@ -1598,17 +1627,13 @@ fn package_line(
     size_width: usize,
 ) -> ListItem<'static> {
     let mut spans = vec![Span::styled(
-        format!(
-            "{:<width$}",
-            truncate(label, name_width),
-            width = name_width
-        ),
+        pad_truncated(label, name_width),
         Style::default().fg(Color::White),
     )];
     if size_width > 0 {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            format!("{size:>size_width$}"),
+            pad_left_truncated(size, size_width),
             Style::default().fg(Color::Green),
         ));
     }
@@ -2314,6 +2339,15 @@ fn pad_truncated(s: &str, width: usize) -> String {
     out
 }
 
+fn pad_left_truncated(s: &str, width: usize) -> String {
+    let out = truncate_start(s, width);
+    format!(
+        "{}{}",
+        " ".repeat(width.saturating_sub(display_width(&out))),
+        out
+    )
+}
+
 fn display_width(s: &str) -> usize {
     terminal_text::display_width(s)
 }
@@ -2944,6 +2978,32 @@ fn file_columns(inner_width: u16, show_modified: bool) -> (usize, usize, usize, 
     (name_width, 0, modified_width, bar_width)
 }
 
+fn file_columns_for_row(
+    content_width: u16,
+    suffix_width: usize,
+    show_modified: bool,
+) -> (usize, usize, usize, usize) {
+    let available = content_width.saturating_sub(suffix_width as u16);
+    let (_, mut size, mut modified, mut bar) = file_columns(available, show_modified);
+    loop {
+        let fixed = 2
+            + if size > 0 { 2 + size } else { 0 }
+            + if bar > 0 { 2 + bar + 5 } else { 0 }
+            + if modified > 0 { 2 + modified } else { 0 };
+        let name = (available as usize).saturating_sub(fixed);
+        if name >= 8 || size == 0 && modified == 0 && bar == 0 {
+            return (name, size, modified, bar);
+        }
+        if bar > 0 {
+            bar = 0;
+        } else if modified > 0 {
+            modified = 0;
+        } else {
+            size = 0;
+        }
+    }
+}
+
 fn package_columns(inner_width: u16) -> (usize, usize) {
     const GAP_WIDTH: usize = 2;
     const MIN_NAME_WIDTH: usize = 10;
@@ -3195,7 +3255,10 @@ mod tests {
         );
         let (wide, _) = render_help(120, 30, 0);
         assert!(wide.contains("Files"));
-        assert!(wide.contains("Packages"));
+        assert!(
+            (0..=30).any(|scroll| render_help(120, 30, scroll).0.contains("Packages")),
+            "Packages section should remain reachable after adding more help bindings"
+        );
     }
 
     #[test]
@@ -3272,6 +3335,98 @@ mod tests {
     }
 
     #[test]
+    fn final_file_columns_include_badges_and_bar_percentage() {
+        for width in [3_u16, 20, 40, 80, 120] {
+            for suffix in [0_usize, 8, 16] {
+                for show_modified in [false, true] {
+                    let suffix = suffix.min(width.saturating_sub(3) as usize);
+                    let (name, size, modified, bar) =
+                        file_columns_for_row(width, suffix, show_modified);
+                    let used = 2
+                        + name
+                        + if size > 0 { 2 + size } else { 0 }
+                        + if modified > 0 { 2 + modified } else { 0 }
+                        + if bar > 0 { 2 + bar + 5 } else { 0 }
+                        + suffix;
+                    assert!(used <= width as usize, "width {width}, suffix {suffix}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_row_keeps_growth_chip_and_percent_at_common_widths() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+        let root = std::env::temp_dir().join(format!(
+            "diskr_file_row_budget_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::create_dir_all(
+            root.join(
+                "very-long-directory-name-with-unicode-漢字-and-more-than-one-screen-of-text",
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("package.json"), b"{}").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        let row_index = app
+            .entries
+            .iter()
+            .position(|entry| entry.name == "node_modules")
+            .unwrap();
+        app.entries[row_index].size = Some(crate::bulkstat::SizeInfo::new(1_000_000, 1_000_000));
+        app.entries[row_index].inaccessible = 1;
+        app.entries[row_index].skipped_mounts = 1;
+        app.entries[row_index].size_delta = Some(500_000);
+        app.entries[row_index].scanning = false;
+        app.selected = row_index;
+        app.toggle_mark();
+        assert!(app.reclaim_class(&app.entries[row_index].path).is_some());
+        let long_row_index = app
+            .entries
+            .iter()
+            .position(|entry| entry.name.starts_with("very-long-directory"))
+            .unwrap();
+        app.entries[long_row_index].size = Some(crate::bulkstat::SizeInfo::new(500_000, 500_000));
+        app.entries[long_row_index].size_delta = Some(300_000);
+        app.entries[long_row_index].scanning = false;
+        for (width, height) in [(80_u16, 24_u16), (120, 30)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_files(frame, Rect::new(0, 0, width, height), &mut app))
+                .unwrap();
+            let get_row = |index: usize| -> String {
+                (0..width)
+                    .map(|x| {
+                        terminal
+                            .backend()
+                            .buffer()
+                            .cell((x, index as u16 + 1))
+                            .unwrap()
+                            .symbol()
+                    })
+                    .collect()
+            };
+            let row = get_row(row_index);
+            assert!(row.contains("[build]"), "{row}");
+            assert!(row.contains('↑'), "{row}");
+            assert!(row.contains('%'), "{row}");
+            assert!(row.ends_with('│'), "{row}");
+            let long_row = get_row(long_row_index);
+            assert!(long_row.contains("very-long-directory"), "{long_row}");
+            assert!(long_row.contains('↑'), "{long_row}");
+            assert!(long_row.contains('%'), "{long_row}");
+            assert!(long_row.ends_with('│'), "{long_row}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn file_size_bar_renders_scaled_blocks() {
         let (bar, percent, _style) = file_size_bar(Some(50), 100, 200, 10);
         // bar.len() returns bytes (█ is 3 bytes), use chars().count() for visual width
@@ -3289,6 +3444,26 @@ mod tests {
     #[test]
     fn package_columns_hide_size_when_narrow() {
         assert_eq!(package_columns(12), (12, 0));
+    }
+
+    #[test]
+    fn package_rows_fit_cell_budget_with_wide_unicode() {
+        for width in [8_u16, 20, 41] {
+            let (name_width, size_width) = package_columns(width);
+            for label in ["漢字長い名前", "e\u{301}cole", "📦🧩large-package"] {
+                let package = package_line_with_version(
+                    "brew (cask)",
+                    label,
+                    "2.0",
+                    "1023.9 GiB",
+                    PackageUseStatus::Untracked,
+                    width,
+                );
+                assert!(package.width() <= width as usize, "{label} at {width}");
+                let project = package_line(label, "1023.9 GiB", name_width, size_width);
+                assert!(project.width() <= width as usize, "{label} at {width}");
+            }
+        }
     }
 
     #[test]

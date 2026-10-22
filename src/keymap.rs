@@ -260,6 +260,19 @@ const RECLAIM_REPORTS: &[KeyBinding] = &[
     },
 ];
 
+const DISK_DETAILS: &[KeyBinding] = &[
+    KeyBinding {
+        key: "s (disk details)",
+        action: "Retry local snapshot discovery",
+        footer: None,
+    },
+    KeyBinding {
+        key: "a (disk details)",
+        action: "Retry APFS container discovery",
+        footer: None,
+    },
+];
+
 pub const HELP_SECTIONS: &[KeySection] = &[
     KeySection {
         title: "Global",
@@ -284,6 +297,10 @@ pub const HELP_SECTIONS: &[KeySection] = &[
     KeySection {
         title: "Reclaim / Reports",
         bindings: RECLAIM_REPORTS,
+    },
+    KeySection {
+        title: "Disk details",
+        bindings: DISK_DETAILS,
     },
 ];
 

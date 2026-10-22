@@ -98,6 +98,8 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | x | Uninstall the selected package |
 | R | Re-scan the Reclaim pane |
 | E | Empty Trash from the Reclaim pane, when the report lists a Trash finding |
+| s (disk details) | Retry local snapshot discovery without rerunning APFS discovery |
+| a (disk details) | Retry APFS container discovery without rerunning snapshot discovery |
 
 ## How it works
 

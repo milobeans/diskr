@@ -136,6 +136,12 @@ fn run_app(start: PathBuf) -> Result<()> {
     res?;
     cache_res?;
     cursor_res?;
+    let shutdown_summary = app.shutdown_summary();
+    drop(terminal);
+    drop(_terminal_guard);
+    if let Some(summary) = shutdown_summary {
+        eprintln!("diskr: {}", terminal_text::sanitize(&summary));
+    }
     Ok(())
 }
 
@@ -895,17 +901,20 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             continue;
         }
         any_manager = true;
-        if let Some(w) = &report.warning {
-            cli_println!("{}: {}", report.manager.label(), terminal_text::sanitize(w));
-            cli_println!();
-            continue;
-        }
         cli_println!(
-            "{}: {} packages · {}",
+            "{}: {} packages · {}{}",
             report.manager.label(),
             report.packages.len(),
-            human(report.total_size.allocated)
+            human(report.total_size.allocated),
+            if report.warning.is_some() {
+                " known allocated (incomplete)"
+            } else {
+                ""
+            }
         );
+        if let Some(w) = &report.warning {
+            cli_println!("  Warning: {}", terminal_text::sanitize(w));
+        }
         let mut sorted: Vec<_> = report.packages.iter().collect();
         sorted.sort_by(|a, b| {
             let a_size = a.size.map(|s| s.allocated).unwrap_or(0);
@@ -1096,9 +1105,17 @@ where
     B: ratatui_core::backend::Backend<Error = io::Error>,
 {
     let mut needs_draw = true;
+    let mut shutting_down = false;
 
     loop {
-        if app.drain_scan_results() {
+        if shutting_down {
+            if app.drain_shutdown_results() {
+                needs_draw = true;
+            }
+            if !app.has_pending_shutdown_work() {
+                return Ok(());
+            }
+        } else if app.drain_scan_results() {
             needs_draw = true;
         }
 
@@ -1107,14 +1124,21 @@ where
             needs_draw = false;
         }
 
-        let timeout = if app.has_pending_scan_work() {
+        let timeout = if shutting_down || app.has_pending_scan_work() {
             Duration::from_millis(50)
         } else {
             Duration::from_secs(1)
         };
 
         if event::poll(timeout)? {
-            match event::read()? {
+            let input = event::read()?;
+            if shutting_down {
+                if matches!(input, Event::Resize(_, _)) {
+                    needs_draw = true;
+                }
+                continue;
+            }
+            match input {
                 Event::Resize(_, _) => {
                     needs_draw = true;
                 }
@@ -1383,6 +1407,14 @@ where
                                 app.close_disk_info();
                                 true
                             }
+                            KeyCode::Char('s') => {
+                                app.retry_disk_snapshots();
+                                true
+                            }
+                            KeyCode::Char('a') => {
+                                app.retry_disk_apfs();
+                                true
+                            }
                             _ => false,
                         };
                         if handled {
@@ -1516,7 +1548,15 @@ where
                             app.open_help();
                             true
                         }
-                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Char('q') => {
+                            if app.has_pending_shutdown_work() {
+                                app.begin_shutdown();
+                                shutting_down = true;
+                                true
+                            } else {
+                                return Ok(());
+                            }
+                        }
                         KeyCode::Esc => {
                             if app.focus != Focus::Files {
                                 app.focus = Focus::Files;

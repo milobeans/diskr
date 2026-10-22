@@ -6,6 +6,32 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.75] - 2026-10-22
+
+### Fixed
+
+- Python package apparent size now uses live file metadata for the same RECORD
+  files as allocated size. Missing files and unreadable manifests are reported
+  as incomplete instead of contributing stale declared bytes.
+- Package-report warnings no longer hide the successfully measured package
+  rows, and TUI package-scan warnings survive dependency-graph completion.
+- Package and project labels now use terminal-cell width, including the list
+  selection gutter, so wide Unicode names do not clip their size column.
+- Files rows now reserve the selection gutter, percentage and intelligence
+  badges before allocating name and optional columns, keeping visible status
+  at narrow terminal widths.
+- Disk details now let snapshot and APFS discovery be retried independently
+  after a utility failure or timeout.
+- Quit waits for in-flight Trash, uninstall, baseline-save and external-action
+  jobs, cancels read-only scans, and prints their final outcomes after the
+  terminal is restored.
+
+### Changed
+
+- Python distribution metadata is indexed once per site-packages root and
+  matched by normalized name and installed version, avoiding a directory
+  enumeration for every installed package.
+
 ## [0.1.74] - 2026-10-22
 
 ### Fixed
