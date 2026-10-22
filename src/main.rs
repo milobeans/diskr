@@ -1244,6 +1244,42 @@ where
                         }
                         continue;
                     }
+                    if matches!(
+                        app.active_modal(),
+                        ActiveModal::Package | ActiveModal::DiskInfo | ActiveModal::FileInfo
+                    ) {
+                        let scrolled = match key.code {
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.scroll_detail(1);
+                                true
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.scroll_detail(-1);
+                                true
+                            }
+                            KeyCode::PageDown => {
+                                app.scroll_detail(10);
+                                true
+                            }
+                            KeyCode::PageUp => {
+                                app.scroll_detail(-10);
+                                true
+                            }
+                            KeyCode::Home => {
+                                app.detail_scroll = 0;
+                                true
+                            }
+                            KeyCode::End => {
+                                app.detail_scroll = usize::MAX;
+                                true
+                            }
+                            _ => false,
+                        };
+                        if scrolled {
+                            needs_draw = true;
+                            continue;
+                        }
+                    }
                     if app.active_modal() == ActiveModal::Package {
                         let handled = match key.code {
                             KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {

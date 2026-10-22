@@ -6,9 +6,13 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.75] - 2026-10-22
+## [0.1.76] - 2026-10-22
 
 ### Fixed
+
+- Disk, file, package and project detail drawers now scroll their full content
+  while keeping actions and the visible range pinned below the viewport.
+  Disk details no longer cap the snapshot list at six entries.
 
 - Python package apparent size now uses live file metadata for the same RECORD
   files as allocated size. Missing files and unreadable manifests are reported

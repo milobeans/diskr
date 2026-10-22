@@ -69,9 +69,9 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | ? | Show full keyboard help |
 | q | Quit |
 | Esc, Ctrl+C | Focus the Files pane, or close a modal and clear search/filter |
-| Up/Down, j/k | Move selection, or scroll the keyboard-help overlay |
-| PageUp/PageDown | Move by a page, including in keyboard help |
-| Home/End | Jump to first or last item |
+| Up/Down, j/k | Move selection, or scroll keyboard help and detail drawers |
+| PageUp/PageDown | Move by a page, including in keyboard help and detail drawers |
+| Home/End | Jump to first or last item in lists, help, and detail drawers |
 | Enter | Open the selected directory, disk, package, or reclaim finding |
 | Backspace | Go to parent directory |
 | Left/Right, h/l | Switch pane or package view |
@@ -100,6 +100,9 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | E | Empty Trash from the Reclaim pane, when the report lists a Trash finding |
 | s (disk details) | Retry local snapshot discovery without rerunning APFS discovery |
 | a (disk details) | Retry APFS container discovery without rerunning snapshot discovery |
+| Up/Down, j/k (details) | Scroll the detail body while actions remain visible |
+| PageUp/PageDown (details) | Scroll detail body by ten lines |
+| Home/End (details) | Jump to the start or end of detail content |
 
 ## How it works
 

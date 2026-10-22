@@ -273,6 +273,24 @@ const DISK_DETAILS: &[KeyBinding] = &[
     },
 ];
 
+const DETAIL_DRAWERS: &[KeyBinding] = &[
+    KeyBinding {
+        key: "Up/Down, j/k (details)",
+        action: "Scroll the detail body while keeping actions visible",
+        footer: None,
+    },
+    KeyBinding {
+        key: "PageUp/PageDown (details)",
+        action: "Scroll detail body by ten lines",
+        footer: None,
+    },
+    KeyBinding {
+        key: "Home/End (details)",
+        action: "Jump to the start or end of detail content",
+        footer: None,
+    },
+];
+
 pub const HELP_SECTIONS: &[KeySection] = &[
     KeySection {
         title: "Global",
@@ -301,6 +319,10 @@ pub const HELP_SECTIONS: &[KeySection] = &[
     KeySection {
         title: "Disk details",
         bindings: DISK_DETAILS,
+    },
+    KeySection {
+        title: "Detail drawers",
+        bindings: DETAIL_DRAWERS,
     },
 ];
 

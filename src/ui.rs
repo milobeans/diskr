@@ -982,16 +982,44 @@ fn render_detail_modal(
     title: &str,
     border: Color,
     lines: Vec<Line<'_>>,
+    footer: Line<'_>,
+    scroll: usize,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title.to_string())
         .border_style(Style::default().fg(border));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let content_height = inner.height.saturating_sub(2);
+    let content_area = Rect {
+        height: content_height,
+        ..inner
+    };
+    let footer_area = Rect {
+        y: inner.y.saturating_add(content_height),
+        height: inner.height.saturating_sub(content_height),
+        ..inner
+    };
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total = paragraph.line_count(content_area.width);
+    let visible = content_area.height as usize;
+    let offset = scroll.min(total.saturating_sub(visible));
     f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
+        paragraph.scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
+        content_area,
+    );
+    let first = if total == 0 { 0 } else { offset + 1 };
+    let last = (offset + visible).min(total);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("↑/↓ PgUp/PgDn scroll · {first}-{last} of {total}"),
+                Style::default().fg(Color::DarkGray),
+            )),
+            footer,
+        ]),
+        footer_area,
     );
 }
 
@@ -1014,6 +1042,8 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
                     Span::styled("loading disk details…", Style::default().fg(Color::White)),
                 ]),
             ],
+            Line::from("Esc close"),
+            0,
         );
         return;
     }
@@ -1025,6 +1055,8 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
             " disk info ",
             Color::DarkGray,
             vec![Line::from("no disk details available")],
+            Line::from("Esc close"),
+            0,
         );
         return;
     };
@@ -1110,7 +1142,7 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
                     format!("snapshots: {}", names.len()),
                     Style::default().fg(Color::DarkGray),
                 )));
-                for name in names.iter().take(6) {
+                for name in names {
                     lines.push(Line::from(Span::styled(
                         truncate(name, area.width.saturating_sub(6) as usize),
                         Style::default().fg(Color::Gray),
@@ -1125,12 +1157,15 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
     if app.disk_apfs_loading() {
         lines.push(Line::from("refreshing APFS container…"));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(
-        "s refresh snapshots · a refresh APFS · Esc close",
-    ));
-
-    render_detail_modal(f, area, " disk details ", Color::DarkGray, lines);
+    render_detail_modal(
+        f,
+        area,
+        " disk details ",
+        Color::DarkGray,
+        lines,
+        Line::from("s refresh snapshots · a refresh APFS · Esc close"),
+        app.detail_scroll,
+    );
 }
 
 fn draw_file_info(f: &mut Frame, app: &App) {
@@ -1142,6 +1177,8 @@ fn draw_file_info(f: &mut Frame, app: &App) {
             " file info ",
             Color::DarkGray,
             vec![Line::from("Loading file info…"), Line::from("Esc cancels")],
+            Line::from("Esc close"),
+            0,
         );
         return;
     };
@@ -1313,7 +1350,17 @@ fn draw_file_info(f: &mut Frame, app: &App) {
         Span::styled(" close", Style::default().fg(Color::Gray)),
     ]));
 
-    render_detail_modal(f, area, " file info ", Color::Cyan, lines);
+    let footer = lines.pop().unwrap_or_default();
+    lines.pop();
+    render_detail_modal(
+        f,
+        area,
+        " file info ",
+        Color::Cyan,
+        lines,
+        footer,
+        app.detail_scroll,
+    );
 }
 
 fn info_path_line(
@@ -2230,7 +2277,17 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
         Span::styled(" close", Style::default().fg(Color::Gray)),
     ]));
 
-    render_detail_modal(f, area, " package info ", Color::Cyan, lines);
+    let footer = lines.pop().unwrap_or_default();
+    lines.pop();
+    render_detail_modal(
+        f,
+        area,
+        " package info ",
+        Color::Cyan,
+        lines,
+        footer,
+        app.detail_scroll,
+    );
 }
 
 fn draw_project_dep_detail(f: &mut Frame, app: &App) {
@@ -2303,7 +2360,17 @@ fn draw_project_dep_detail(f: &mut Frame, app: &App) {
         Span::styled(" close", Style::default().fg(Color::Gray)),
     ]));
 
-    render_detail_modal(f, area, " project deps ", Color::Cyan, lines);
+    let footer = lines.pop().unwrap_or_default();
+    lines.pop();
+    render_detail_modal(
+        f,
+        area,
+        " project deps ",
+        Color::Cyan,
+        lines,
+        footer,
+        app.detail_scroll,
+    );
 }
 
 fn centered_rect(px: u16, py: u16, min_width: u16, min_height: u16, area: Rect) -> Rect {
@@ -3089,6 +3156,94 @@ fn file_size_bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detail_modal_scrolls_all_rows_without_losing_action_footer() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+
+        for (width, height) in [(80, 16), (80, 24), (120, 30)] {
+            for (scroll, expected, hidden) in [
+                (0, "snapshot-01", "snapshot-30"),
+                (usize::MAX, "snapshot-30", "snapshot-01"),
+            ] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let area = detail_modal_area(frame);
+                        let lines = (1..=30)
+                            .map(|index| Line::from(format!("snapshot-{index:02}")))
+                            .collect();
+                        render_detail_modal(
+                            frame,
+                            area,
+                            " disk details ",
+                            Color::DarkGray,
+                            lines,
+                            Line::from("Esc close · retry discovery"),
+                            scroll,
+                        );
+                    })
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(text.contains(expected), "{width}x{height} scroll {scroll}");
+                assert!(!text.contains(hidden), "{width}x{height} scroll {scroll}");
+                assert!(text.contains("Esc close · retry discovery"));
+                assert!(text.contains("of 30"));
+            }
+        }
+    }
+
+    #[test]
+    fn disk_detail_exposes_snapshot_beyond_old_six_row_cap() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+
+        let root = std::env::temp_dir().join(format!(
+            "diskr_snapshot_detail_render_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.disk_info_report = Some(crate::space::SpaceReport {
+            path: root.clone(),
+            mount: root.clone(),
+            device: String::from("disk-test"),
+            fs_type: String::from("apfs"),
+            total: 100,
+            used: 40,
+            free: 60,
+            available: 60,
+            local_snapshots: crate::space::SnapshotListing {
+                names: (1..=30)
+                    .map(|index| format!("snapshot-{index:02}"))
+                    .collect(),
+                error: None,
+            },
+            apfs_container: None,
+            apfs_error: None,
+        });
+        app.detail_scroll = usize::MAX;
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal
+            .draw(|frame| draw_disk_info_modal(frame, &app))
+            .unwrap();
+        let frame: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(frame.contains("snapshot-30"));
+        assert!(frame.contains("Esc close"));
+        assert!(frame.contains("of "));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn render_app(app: &mut App, width: u16, height: u16) -> String {
         use ratatui_core::{backend::TestBackend, terminal::Terminal};

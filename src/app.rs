@@ -412,6 +412,7 @@ pub struct App {
     pub hidden_entry_count: usize,
     pub show_help: bool,
     pub help_scroll: usize,
+    pub detail_scroll: usize,
     pub confirming_delete: bool,
 
     pub pkg_reports: Vec<ManagerReport>,
@@ -710,6 +711,7 @@ impl App {
             hidden_entry_count: 0,
             show_help: false,
             help_scroll: 0,
+            detail_scroll: 0,
             confirming_delete: false,
             pkg_reports: Vec::new(),
             project_deps: Vec::new(),
@@ -1656,6 +1658,10 @@ impl App {
         self.help_scroll = self.help_scroll.saturating_add_signed(delta);
     }
 
+    pub fn scroll_detail(&mut self, delta: isize) {
+        self.detail_scroll = self.detail_scroll.saturating_add_signed(delta);
+    }
+
     pub fn top_files_loading(&self) -> bool {
         self.top_files_loading
     }
@@ -2262,6 +2268,7 @@ impl App {
 
     pub fn close_disk_info(&mut self) {
         self.disk_info_open = false;
+        self.detail_scroll = 0;
         self.disk_info_loading = false;
         self.disk_info_scan_rx = None;
         self.disk_snapshots_rx = None;
@@ -2284,6 +2291,7 @@ impl App {
         let request_id = self.file_info_request_id;
         let cwd = self.cwd.clone();
         self.file_info_open = true;
+        self.detail_scroll = 0;
         self.file_info_rx = Some(rx);
         self.status = String::from("loading file info…");
         thread::spawn(move || {
@@ -2298,6 +2306,7 @@ impl App {
 
     pub fn close_file_info(&mut self) {
         self.file_info_open = false;
+        self.detail_scroll = 0;
         self.file_info_request_id = self.file_info_request_id.wrapping_add(1);
         self.file_info_rx = None;
         self.file_info_target = None;
@@ -2498,6 +2507,7 @@ impl App {
         self.disk_apfs_rx = None;
         self.disk_info_report = None;
         self.disk_info_open = true;
+        self.detail_scroll = 0;
         self.status = String::from("loading disk info…");
         self.disk_info_scan_rx = Some(rx);
 
@@ -3536,11 +3546,13 @@ impl App {
     pub fn open_pkg_detail(&mut self) {
         if self.pkg_item_count() > 0 {
             self.pkg_detail = true;
+            self.detail_scroll = 0;
         }
     }
 
     pub fn close_pkg_detail(&mut self) {
         self.pkg_detail = false;
+        self.detail_scroll = 0;
     }
 
     pub fn request_uninstall(&mut self) {
