@@ -2563,12 +2563,18 @@ dev = ["pytest", "ruff"]
     }
 
     #[test]
-    fn run_command_bounds_output_from_chatty_process() {
-        let result = run_command_with_timeout("yes", &["x"], Duration::from_secs(2));
-        assert!(!result.success);
-        assert!(!result.timed_out);
-        assert!(result.stderr.starts_with("command output exceeds 16 MiB"));
-        assert!(result.stdout.len() <= MAX_COMMAND_OUTPUT);
+    fn drain_pipe_enforces_output_bound_at_exact_boundary() {
+        let mut within_limit = Some(io::Cursor::new(vec![b'x'; MAX_COMMAND_OUTPUT]));
+        let mut output = Vec::new();
+        drain_pipe(&mut within_limit, &mut output).unwrap();
+        assert!(within_limit.is_none());
+        assert_eq!(output.len(), MAX_COMMAND_OUTPUT);
+
+        let mut over_limit = Some(io::Cursor::new(vec![b'x'; MAX_COMMAND_OUTPUT + 1]));
+        let mut output = Vec::new();
+        let error = drain_pipe(&mut over_limit, &mut output).unwrap_err();
+        assert_eq!(error.to_string(), "command output exceeds 16 MiB");
+        assert!(output.len() <= MAX_COMMAND_OUTPUT);
     }
 
     #[test]
