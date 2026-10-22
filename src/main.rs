@@ -453,12 +453,15 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
             "inaccessible": report.inaccessible,
             "skipped_mounts": report.skipped_mounts,
             "findings": findings,
+            "scope": report.scope.json(),
+            "measurement": "candidate allocated bytes, not guaranteed freed space",
+            "estimated_freed_bytes": null,
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
 
-    println!("Reclaimable space under {}", SafePath(&report.root));
+    println!("Cleanup candidates under {}", SafePath(&report.root));
     println!(
         "Total: {} disk / {} apparent",
         human(report.total.allocated),
@@ -476,10 +479,12 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
             report.skipped_mounts
         );
     }
+    println!("{}", report.scope.summary());
     if report.findings.is_empty() {
-        println!("No known reclaimable caches or build artifacts found.");
+        println!("No known cleanup candidates found within the searched scope.");
         return Ok(());
     }
+    println!("Allocated candidate bytes are not guaranteed freed space: hardlinks, APFS clones and snapshots can retain blocks. Moving items to Trash does not free space until Trash is emptied.");
     for finding in &report.findings {
         let count = if finding.count > 1 {
             format!(" (x{})", finding.count)
@@ -572,9 +577,11 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
                     "delta_allocated": change.delta_allocated().to_string(),
                     "before_inaccessible": change.before_inaccessible,
                     "after_inaccessible": change.after_inaccessible,
+                    "before_skipped_mounts": change.before_skipped_mounts,
+                    "after_skipped_mounts": change.after_skipped_mounts,
                     "before_is_dir": change.before_is_dir,
                     "after_is_dir": change.after_is_dir,
-                    "delta_complete": change.before_inaccessible == 0 && change.after_inaccessible == 0,
+                    "delta_complete": change.complete(),
                 })
             })
             .collect();
@@ -588,7 +595,9 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
             "after_total_allocated": report.after_total.allocated,
             "baseline_inaccessible": report.baseline_inaccessible,
             "current_inaccessible": report.current_inaccessible,
-            "delta_complete": report.baseline_inaccessible == 0 && report.current_inaccessible == 0,
+            "delta_complete": report.complete(),
+            "baseline_skipped_mounts": report.baseline_skipped_mounts,
+            "current_skipped_mounts": report.current_skipped_mounts,
             "total_delta_logical": report.total_delta_logical().to_string(),
             "total_delta_allocated": report.total_delta_allocated().to_string(),
             "changes": changes,
@@ -612,14 +621,14 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
         human(report.after_total.allocated),
         format_signed_bytes(report.total_delta_allocated())
     );
-    if report.baseline_inaccessible > 0 || report.current_inaccessible > 0 {
+    if !report.complete() {
         println!(
-            "Warning: unreadable directories (baseline {}, current {}); totals are lower bounds and deltas are indeterminate.",
-            report.baseline_inaccessible, report.current_inaccessible
+            "Warning: unreadable paths (baseline {}, current {}), skipped mounts (baseline {}, current {}); totals are lower bounds and deltas are indeterminate.",
+            report.baseline_inaccessible, report.current_inaccessible, report.baseline_skipped_mounts, report.current_skipped_mounts
         );
     }
     if report.changes.is_empty() {
-        if report.baseline_inaccessible > 0 || report.current_inaccessible > 0 {
+        if !report.complete() {
             println!("No observed changes; comparison incomplete.");
         } else {
             println!("No changes since the baseline.");
@@ -638,7 +647,7 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
 }
 
 fn change_status(change: &history::ChildChange) -> &'static str {
-    if change.before_inaccessible > 0 || change.after_inaccessible > 0 {
+    if !change.complete() {
         return "uncertain";
     }
     if change.before_is_dir != change.after_is_dir
@@ -801,6 +810,7 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
         let value = serde_json::json!({
             "path": path.to_string_lossy(),
             "project_inaccessible": project_scan.inaccessible,
+            "project_scope": project_scan.scope.json(),
             "system_packages": managers,
             "project_dependencies": projects,
         });
@@ -873,6 +883,7 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             );
         }
     }
+    println!("{}", project_scan.scope.summary());
     if project_scan.inaccessible > 0 {
         println!(
             "Warning: {} project paths were unreadable; dependency results are incomplete.",
@@ -1889,6 +1900,8 @@ mod tests {
             after: Some(bulkstat::SizeInfo::new(120, 100)),
             before_inaccessible: 0,
             after_inaccessible: 0,
+            before_skipped_mounts: 0,
+            after_skipped_mounts: 0,
             before_is_dir: Some(true),
             after_is_dir: Some(true),
         };
@@ -1898,6 +1911,8 @@ mod tests {
             after: Some(bulkstat::SizeInfo::new(200, 100)),
             before_inaccessible: 0,
             after_inaccessible: 0,
+            before_skipped_mounts: 0,
+            after_skipped_mounts: 0,
             before_is_dir: Some(true),
             after_is_dir: Some(true),
         };

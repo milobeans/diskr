@@ -72,8 +72,8 @@ const FIXED_CATEGORIES: &[FixedCategory] = &[
     },
     FixedCategory {
         label: "Simulator devices",
-        class: Reclaimability::Regenerable,
-        note: "Simulator state and installed apps; Xcode can recreate them.",
+        class: Reclaimability::Risky,
+        note: "Device sandboxes, test data and installed apps may be irreplaceable. Review devices in Xcode; use simctl delete unavailable only after checking needed state.",
         paths: &["Library/Developer/CoreSimulator/Devices"],
     },
     FixedCategory {
@@ -167,12 +167,12 @@ const ARTIFACTS: &[(&str, Reclaimability, &str)] = &[
     (
         ".venv",
         Reclaimability::Regenerable,
-        "Python virtualenv; recreate from requirements.",
+        "Python environment marker found; export dependencies and preserve local changes before recreating.",
     ),
     (
         "venv",
         Reclaimability::Regenerable,
-        "Python virtualenv; recreate from requirements.",
+        "Python environment marker found; export dependencies and preserve local changes before recreating.",
     ),
     (
         "__pycache__",
@@ -181,8 +181,8 @@ const ARTIFACTS: &[(&str, Reclaimability, &str)] = &[
     ),
     (
         ".next",
-        Reclaimability::Safe,
-        "Next.js build cache; rebuilt on the next build.",
+        Reclaimability::Risky,
+        "Next.js output may be the deployed application. Rebuild and redeploy from retained source before removal.",
     ),
     (
         ".gradle",
@@ -220,6 +220,7 @@ pub struct ReclaimReport {
     pub total: SizeInfo,
     pub inaccessible: u32,
     pub skipped_mounts: u32,
+    pub scope: bulkstat::DiscoveryCoverage,
 }
 
 struct FindingBuild {
@@ -233,6 +234,7 @@ struct PathContribution {
     size: SizeInfo,
     inaccessible: u32,
     skipped_mounts: u32,
+    hard_links: Vec<(u64, u64, SizeInfo)>,
 }
 
 /// Scan for reclaimable space under `root`, resolving fixed caches against `$HOME`.
@@ -251,11 +253,7 @@ pub fn classify_by_name_path(
     path: &Path,
     home: Option<&Path>,
 ) -> Option<Reclaimability> {
-    for (artifact, class, _note) in ARTIFACTS {
-        if name == *artifact {
-            return Some(*class);
-        }
-    }
+    let _ = name;
     if let Some(home) = home {
         for category in FIXED_CATEGORIES {
             for rel in category.paths {
@@ -268,6 +266,47 @@ pub fn classify_by_name_path(
     None
 }
 
+pub(crate) fn classify_path(path: &Path, home: Option<&Path>) -> Option<Reclaimability> {
+    let name = path.file_name()?.to_str()?;
+    classify_by_name_path(name, path, home).or_else(|| {
+        ARTIFACTS
+            .iter()
+            .find(|(n, _, _)| *n == name && artifact_evidence(path, name))
+            .map(|(_, class, _)| *class)
+    })
+}
+
+fn artifact_evidence(path: &Path, name: &str) -> bool {
+    let parent = path.parent().unwrap_or(path);
+    match name {
+        "target" => parent.join("Cargo.toml").is_file(),
+        "node_modules" => parent.join("package.json").is_file(),
+        "venv" | ".venv" => path.join("pyvenv.cfg").is_file(),
+        "__pycache__" => std::fs::read_dir(path).ok().is_some_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "pyc"))
+        }),
+        ".next" => std::fs::read_to_string(parent.join("package.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .is_some_and(|v| {
+                ["dependencies", "devDependencies"]
+                    .iter()
+                    .any(|k| v.get(k).and_then(|d| d.get("next")).is_some())
+            }),
+        ".gradle" => [
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+        ]
+        .iter()
+        .any(|m| parent.join(m).is_file()),
+        _ => false,
+    }
+}
+
 /// Same as [`report`], but with an explicit home directory (used in tests).
 pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -277,13 +316,26 @@ pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
     if let Some(home) = home.as_deref() {
         builds.extend(fixed_findings(&root, home));
     }
-    let (artifact_builds, artifact_search_errors) = artifact_findings(&root);
+    let (artifact_builds, artifact_search_errors, scope) = artifact_findings(&root);
     builds.extend(artifact_builds);
 
-    builds.retain(|build| build.finding.size.allocated > 0 || build.finding.size.logical > 0);
-    let (total, mut inaccessible, skipped_mounts) =
+    for build in &mut builds {
+        let (size, inaccessible, skipped_mounts) = union_totals(build.contributions.iter());
+        build.finding.size = size;
+        build.finding.inaccessible = inaccessible;
+        build.finding.skipped_mounts = skipped_mounts;
+    }
+
+    builds.retain(|build| {
+        build.finding.size.allocated > 0
+            || build.finding.size.logical > 0
+            || build.finding.inaccessible > 0
+            || build.finding.skipped_mounts > 0
+    });
+    let (total, mut inaccessible, mut skipped_mounts) =
         union_totals(builds.iter().flat_map(|build| build.contributions.iter()));
     inaccessible = inaccessible.saturating_add(artifact_search_errors);
+    skipped_mounts = skipped_mounts.saturating_add(scope.skipped_mounts);
     let mut findings: Vec<Finding> = builds.into_iter().map(|build| build.finding).collect();
 
     findings.sort_by(|a, b| {
@@ -306,6 +358,7 @@ pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
         total,
         inaccessible,
         skipped_mounts,
+        scope,
     }
 }
 
@@ -328,12 +381,19 @@ fn union_totals<'a>(
     let mut total = SizeInfo::default();
     let mut inaccessible = 0u32;
     let mut skipped_mounts = 0u32;
+    let mut hard_links = std::collections::HashSet::new();
     for contribution in ordered {
         if roots.iter().any(|root| contribution.path.starts_with(root)) {
             continue;
         }
         total.logical = total.logical.saturating_add(contribution.size.logical);
         total.allocated = total.allocated.saturating_add(contribution.size.allocated);
+        for (dev, ino, size) in &contribution.hard_links {
+            if !hard_links.insert((*dev, *ino)) {
+                total.logical = total.logical.saturating_sub(size.logical);
+                total.allocated = total.allocated.saturating_sub(size.allocated);
+            }
+        }
         inaccessible = inaccessible.saturating_add(contribution.inaccessible);
         skipped_mounts = skipped_mounts.saturating_add(contribution.skipped_mounts);
         roots.push(contribution.path);
@@ -389,11 +449,23 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<FindingBuild> {
             let mut paths = Vec::new();
             let mut contributions = Vec::new();
             for rel in category.paths {
-                let candidate = home.join(rel);
+                let known = home.join(rel);
+                let candidate = if root.starts_with(&known) {
+                    root.to_path_buf()
+                } else {
+                    known
+                };
                 if !candidate.starts_with(root) || !candidate.is_dir() {
                     continue;
                 }
-                let scanned = bulkstat::scan_dir(&candidate, 0);
+                let scope = bulkstat::ScanScope::new(root).ok().map(|s| s.fresh());
+                let scanned = bulkstat::scan_dir_in_scope(
+                    &candidate,
+                    0,
+                    &bulkstat::ScanCancellation::never(),
+                    scope.as_ref(),
+                )
+                .unwrap_or_default();
                 size.logical = size.logical.saturating_add(scanned.size.logical);
                 size.allocated = size.allocated.saturating_add(scanned.size.allocated);
                 inaccessible = inaccessible.saturating_add(scanned.inaccessible);
@@ -404,6 +476,7 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<FindingBuild> {
                     size: scanned.size,
                     inaccessible: scanned.inaccessible,
                     skipped_mounts: scanned.skipped_mounts,
+                    hard_links: scanned.hard_links,
                 });
             }
             if paths.is_empty() {
@@ -427,7 +500,7 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<FindingBuild> {
         .collect()
 }
 
-fn artifact_findings(root: &Path) -> (Vec<FindingBuild>, u32) {
+fn artifact_findings(root: &Path) -> (Vec<FindingBuild>, u32, bulkstat::DiscoveryCoverage) {
     let search = find_artifacts(root);
     // Preserve the declared ARTIFACTS order so output is stable before sorting.
     let findings = ARTIFACTS
@@ -439,7 +512,14 @@ fn artifact_findings(root: &Path) -> (Vec<FindingBuild>, u32) {
             let mut paths = Vec::new();
             let mut contributions = Vec::new();
             for path in search.hits.iter().filter(|(hit_name, _)| hit_name == name) {
-                let scanned = bulkstat::scan_dir(&path.1, 0);
+                let scope = bulkstat::ScanScope::new(root).ok().map(|s| s.fresh());
+                let scanned = bulkstat::scan_dir_in_scope(
+                    &path.1,
+                    0,
+                    &bulkstat::ScanCancellation::never(),
+                    scope.as_ref(),
+                )
+                .unwrap_or_default();
                 size.logical = size.logical.saturating_add(scanned.size.logical);
                 size.allocated = size.allocated.saturating_add(scanned.size.allocated);
                 inaccessible = inaccessible.saturating_add(scanned.inaccessible);
@@ -450,6 +530,7 @@ fn artifact_findings(root: &Path) -> (Vec<FindingBuild>, u32) {
                     size: scanned.size,
                     inaccessible: scanned.inaccessible,
                     skipped_mounts: scanned.skipped_mounts,
+                    hard_links: scanned.hard_links,
                 });
             }
             if paths.is_empty() {
@@ -471,12 +552,13 @@ fn artifact_findings(root: &Path) -> (Vec<FindingBuild>, u32) {
             })
         })
         .collect();
-    (findings, search.inaccessible)
+    (findings, search.inaccessible, search.scope)
 }
 
 struct ArtifactSearch {
     hits: Vec<(&'static str, PathBuf)>,
     inaccessible: u32,
+    scope: bulkstat::DiscoveryCoverage,
 }
 
 /// Walk `root` for artifact directories by name. Matched directories are recorded
@@ -486,9 +568,34 @@ struct ArtifactSearch {
 fn find_artifacts(root: &Path) -> ArtifactSearch {
     let mut hits = Vec::new();
     let mut inaccessible = 0u32;
+    let scan_scope = bulkstat::ScanScope::new(root).ok();
+    let mut scope = bulkstat::DiscoveryCoverage {
+        depth_limit: MAX_ARTIFACT_DEPTH,
+        ..Default::default()
+    };
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
+    if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
+        if let Some((matched, _, _)) = ARTIFACTS
+            .iter()
+            .find(|(n, _, _)| *n == name && artifact_evidence(root, name))
+        {
+            hits.push((*matched, root.to_path_buf()));
+            return ArtifactSearch {
+                hits,
+                inaccessible,
+                scope,
+            };
+        }
+    }
+
     while let Some((dir, depth)) = stack.pop() {
+        if let (Some(policy), Ok(meta)) = (&scan_scope, std::fs::symlink_metadata(&dir)) {
+            if !policy.accepts(&dir, &meta) {
+                scope.skipped_mounts = scope.skipped_mounts.saturating_add(1);
+                continue;
+            }
+        }
         let read = match std::fs::read_dir(&dir) {
             Ok(read) => read,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -521,16 +628,27 @@ fn find_artifacts(root: &Path) -> ArtifactSearch {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if let Some((matched, _, _)) = ARTIFACTS.iter().find(|(n, _, _)| *n == name) {
+            if let Some((matched, _, _)) = ARTIFACTS
+                .iter()
+                .find(|(n, _, _)| *n == name && artifact_evidence(&entry.path(), name))
+            {
                 hits.push((*matched, entry.path()));
                 continue; // do not descend into a matched artifact directory
             }
             if depth < MAX_ARTIFACT_DEPTH && should_descend(name) {
                 stack.push((entry.path(), depth + 1));
+            } else if !should_descend(name) {
+                scope.excluded_policy = scope.excluded_policy.saturating_add(1);
+            } else {
+                scope.depth_limited = scope.depth_limited.saturating_add(1);
             }
         }
     }
-    ArtifactSearch { hits, inaccessible }
+    ArtifactSearch {
+        hits,
+        inaccessible,
+        scope,
+    }
 }
 
 /// Skip the `Library` tree (its caches are covered by fixed categories) and any
@@ -548,15 +666,99 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn artifact_requires_evidence_and_selected_root_is_classified() {
+        let root = test_root("artifact_evidence");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("personal"), b"data").unwrap();
+        assert!(report_with_home(&root, None).findings.is_empty());
+        assert_eq!(classify_path(&target, None), None);
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.0.0'\n",
+        )
+        .unwrap();
+        let parent = report_with_home(&root, None);
+        let selected = report_with_home(&target, None);
+        assert_eq!(parent.total, selected.total);
+        assert_eq!(
+            selected.findings[0].paths,
+            vec![target.canonicalize().unwrap()]
+        );
+        assert_eq!(
+            FIXED_CATEGORIES
+                .iter()
+                .find(|c| c.label == "Simulator devices")
+                .unwrap()
+                .class,
+            Reclaimability::Risky
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fully_unreadable_candidate_is_retained_with_zero_known_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_root("unknown_candidate");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(root.join("Cargo.toml"), "").unwrap();
+        fs::write(target.join("data"), b"data").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+        let report = report_with_home(&root, None);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.total.logical, 0);
+        assert!(report.inaccessible > 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sibling_artifacts_count_shared_hardlinks_once_in_category_and_total() {
+        let root = test_root("candidate_hardlinks");
+        for p in ["a", "b"] {
+            fs::create_dir_all(root.join(p).join("node_modules")).unwrap();
+            fs::write(root.join(p).join("package.json"), "{}").unwrap();
+        }
+        fs::write(root.join("a/node_modules/data"), vec![0u8; 8192]).unwrap();
+        fs::hard_link(
+            root.join("a/node_modules/data"),
+            root.join("b/node_modules/data"),
+        )
+        .unwrap();
+        let report = report_with_home(&root, None);
+        assert_eq!(report.total.logical, 8192);
+        assert_eq!(report.findings[0].size.logical, 8192);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_reports_hidden_and_depth_exclusions_even_with_no_findings() {
+        let root = test_root("discovery_scope");
+        fs::create_dir_all(root.join(".hidden")).unwrap();
+        fs::create_dir_all(root.join("Library")).unwrap();
+        let mut deep = root.clone();
+        for _ in 0..13 {
+            deep = deep.join("level");
+            fs::create_dir_all(&deep).unwrap();
+        }
+        let report = report_with_home(&root, None);
+        assert!(report.findings.is_empty());
+        assert!(report.scope.depth_limited > 0);
+        assert!(report.scope.excluded_policy >= 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn classify_matches_artifacts_and_fixed_caches() {
-        // Artifact directory names match by name regardless of path/home.
+        // A name alone is not sufficient evidence for a cleanup recipe.
         assert_eq!(
             classify_by_name_path("node_modules", Path::new("/x/node_modules"), None),
-            Some(Reclaimability::Regenerable)
+            None
         );
         assert_eq!(
             classify_by_name_path("__pycache__", Path::new("/x/__pycache__"), None),
-            Some(Reclaimability::Safe)
+            None
         );
         // A fixed cache only matches when the path equals a home-relative root.
         let home = Path::new("/Users/example");
@@ -592,8 +794,10 @@ mod tests {
         fs::write(root.join("Library/Caches/big.bin"), vec![0u8; 8192]).unwrap();
         // Two separate project artifact directories.
         fs::create_dir_all(root.join("proj/node_modules/dep")).unwrap();
+        fs::write(root.join("proj/package.json"), "{}").unwrap();
         fs::write(root.join("proj/node_modules/dep/index.js"), vec![0u8; 4096]).unwrap();
         fs::create_dir_all(root.join("work/app/node_modules")).unwrap();
+        fs::write(root.join("work/app/package.json"), "{}").unwrap();
         fs::write(root.join("work/app/node_modules/lib.js"), vec![0u8; 2048]).unwrap();
 
         let report = report_with_home(&root, Some(&root));
@@ -624,6 +828,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         // A node_modules that itself contains a nested node_modules.
         fs::create_dir_all(root.join("proj/node_modules/dep/node_modules")).unwrap();
+        fs::write(root.join("proj/package.json"), "{}").unwrap();
         fs::write(
             root.join("proj/node_modules/dep/node_modules/inner.js"),
             vec![0u8; 1024],

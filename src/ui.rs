@@ -325,9 +325,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
             // Reclaim class chip for rows the reclaim engine recognizes
             // (node_modules, target, ~/Library/Caches, …) — name/path only,
             // no I/O on the render path.
-            if let Some(class) =
-                crate::reclaim::classify_by_name_path(&e.name, &e.path, app.home.as_deref())
-            {
+            if let Some(class) = app.reclaim_class(&e.path) {
                 let (chip, chip_color) = reclaim_chip(class);
                 spans.push(Span::styled(
                     format!(" [{chip}]"),
@@ -527,9 +525,12 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
     if item_count == 0 {
         app.reclaim_page_rows = area.height.saturating_sub(2).max(1) as usize;
         let inner = Block::default().borders(Borders::ALL).title(" reclaim ");
-        let body = Paragraph::new("no reclaim candidates found")
-            .block(inner)
-            .alignment(Alignment::Center);
+        let body = Paragraph::new(format!(
+            "no cleanup candidates found within scope\n{}",
+            report.scope.summary()
+        ))
+        .block(inner)
+        .alignment(Alignment::Center);
         f.render_widget(body, area);
         return;
     }
@@ -595,7 +596,7 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(
-                    " reclaim {} · {} ",
+                    " cleanup {} · {} candidate disk bytes ",
                     finding_count_label(item_count),
                     human(report.total.allocated)
                 ))
@@ -633,6 +634,8 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
                 finding.note.clone(),
                 Style::default().fg(Color::Gray),
             )),
+            Line::from("Allocated candidates are not guaranteed freed space; Trash retains bytes."),
+            Line::from(report.scope.summary()),
         ];
         if finding.inaccessible > 0 {
             lines.push(Line::from(Span::styled(
@@ -650,14 +653,18 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
             )));
         }
         lines.push(Line::from(""));
-        lines.push(Line::from(
-            "enter: open paths  ·  d: delete path  ·  esc: close paths",
-        ));
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" reclaim finding ")
             .border_style(Style::default().fg(Color::DarkGray));
-        f.render_widget(Paragraph::new(lines).block(block), detail_area);
+        let inner = block.inner(detail_area);
+        f.render_widget(block, detail_area);
+        let regions = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), regions[0]);
+        f.render_widget(
+            Paragraph::new("Enter paths · d Trash · Esc close"),
+            regions[1],
+        );
     }
 }
 
@@ -839,7 +846,12 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
 
     let file_count = app.top_files_count();
     if file_count == 0 {
-        let message = if app.top_files_scan().is_some() {
+        let message = if app
+            .top_files_scan()
+            .is_some_and(|scan| scan.inaccessible > 0 || scan.skipped_mounts > 0)
+        {
+            "no regular files observed · scan incomplete (unreadable paths or skipped mounts)"
+        } else if app.top_files_scan().is_some() {
             "no regular files found"
         } else {
             "no scan in progress"
@@ -905,7 +917,19 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
     };
     let footer = vec![
         Line::from(vec![
-            Span::styled(format!("total: {total}"), Style::default().fg(Color::Green)),
+            Span::styled(
+                format!(
+                    "{}total: {total} · {} unreadable · {} mounts skipped",
+                    if scan.inaccessible > 0 || scan.skipped_mounts > 0 {
+                        "≥ "
+                    } else {
+                        ""
+                    },
+                    scan.inaccessible,
+                    scan.skipped_mounts
+                ),
+                Style::default().fg(Color::Green),
+            ),
             Span::styled(
                 format!(" · {}-{} of {}", offset + 1, end, file_count),
                 Style::default().fg(Color::DarkGray),
@@ -1445,6 +1469,11 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
                 PkgView::SystemManagers => "no supported packages found",
                 PkgView::ProjectDeps => "no project manifests found",
             }
+        };
+        let message = if app.pkg_view == PkgView::ProjectDeps && !app.pkg_filter_active() {
+            format!("{message}\n{}", app.project_scope.summary())
+        } else {
+            message.to_string()
         };
         let empty = Paragraph::new(message)
             .block(block)
@@ -2667,7 +2696,7 @@ fn files_pane_title(app: &App, visible_count: usize, total_size: u64, sized: usi
         format!("files · {visible_count} items")
     };
     if total_size > 0 {
-        title.push_str(&format!(" · {}", human(total_size)));
+        title.push_str(&format!(" · {} rows*", human(total_size)));
     }
     if sized < visible_count {
         title.push_str(&format!(" · {sized}/{visible_count} sized"));

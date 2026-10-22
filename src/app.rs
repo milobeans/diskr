@@ -417,6 +417,7 @@ pub struct App {
     pub pkg_reports: Vec<ManagerReport>,
     pub project_deps: Vec<ProjectDeps>,
     pub project_dep_errors: u32,
+    pub project_scope: bulkstat::DiscoveryCoverage,
     project_deps_cwd: Option<PathBuf>,
     pub pkg_view: PkgView,
     pub packages_loaded: bool,
@@ -454,6 +455,7 @@ pub struct App {
     marked: HashSet<PathBuf>,
     size_cache: HashMap<PathBuf, SizeInfo>,
     inaccessible_cache: HashMap<PathBuf, u32>,
+    reclaim_classes: HashMap<PathBuf, reclaim::Reclaimability>,
     /// `$HOME`, captured once so the files pane can classify fixed-cache rows
     /// without re-reading the environment per frame.
     pub home: Option<PathBuf>,
@@ -560,6 +562,7 @@ struct PkgScanMsg {
     reports: Vec<ManagerReport>,
     project_deps: Vec<ProjectDeps>,
     project_dep_errors: u32,
+    project_scope: bulkstat::DiscoveryCoverage,
     include_managers: bool,
 }
 
@@ -682,6 +685,7 @@ impl App {
             pkg_reports: Vec::new(),
             project_deps: Vec::new(),
             project_dep_errors: 0,
+            project_scope: bulkstat::DiscoveryCoverage::default(),
             project_deps_cwd: None,
             pkg_view: PkgView::SystemManagers,
             packages_loaded: false,
@@ -713,6 +717,7 @@ impl App {
             marked: HashSet::new(),
             size_cache,
             inaccessible_cache,
+            reclaim_classes: HashMap::new(),
             cache_age,
             cache_details,
             stale_size_cache,
@@ -840,7 +845,7 @@ impl App {
 
     pub fn history_delta_status(&self) -> Option<String> {
         let diff = self.history_diff.as_ref()?;
-        if diff.baseline_inaccessible > 0 || diff.current_inaccessible > 0 {
+        if !diff.complete() {
             return Some(String::from(
                 "baseline comparison incomplete · delta uncertain",
             ));
@@ -900,6 +905,7 @@ impl App {
     }
 
     fn rebuild_entries(&mut self) -> Result<()> {
+        self.reclaim_classes.clear();
         self.entries.clear();
         self.entry_index.clear();
         self.cwd_enumeration_errors = 0;
@@ -973,6 +979,11 @@ impl App {
                 None
             };
             let name_lower = name.to_lowercase();
+            if is_dir {
+                if let Some(class) = reclaim::classify_path(&path, self.home.as_deref()) {
+                    self.reclaim_classes.insert(path.clone(), class);
+                }
+            }
             let skipped_mounts = self
                 .cache_details
                 .get(&path)
@@ -1005,6 +1016,10 @@ impl App {
         for (i, entry) in self.entries.iter().enumerate() {
             self.entry_index.insert(entry.path.clone(), i);
         }
+    }
+
+    pub fn reclaim_class(&self, path: &Path) -> Option<reclaim::Reclaimability> {
+        self.reclaim_classes.get(path).copied()
     }
 
     pub fn apply_sort(&mut self) {
@@ -3010,6 +3025,7 @@ impl App {
                 reports,
                 project_deps: project_scan.projects,
                 project_dep_errors: project_scan.inaccessible,
+                project_scope: project_scan.scope,
                 include_managers,
             });
         });
@@ -3044,6 +3060,7 @@ impl App {
                     }
                     self.project_deps = msg.project_deps;
                     self.project_dep_errors = msg.project_dep_errors;
+                    self.project_scope = msg.project_scope;
                     self.project_deps_cwd = Some(msg.cwd);
                     self.rebuild_project_dep_search_text();
                     self.rebuild_flat_packages();
@@ -4279,6 +4296,7 @@ fn page_target_index(current: usize, delta: i64, item_count: usize) -> Option<us
 #[cfg(test)]
 pub fn trash_only_report(root: &Path, allocated: u64) -> reclaim::ReclaimReport {
     reclaim::ReclaimReport {
+        scope: bulkstat::DiscoveryCoverage::default(),
         root: root.to_path_buf(),
         findings: vec![reclaim::Finding {
             label: String::from("Trash"),
@@ -4603,6 +4621,7 @@ mod tests {
 
         // Report loaded, but it has no Trash finding.
         app.reclaim_report = Some(reclaim::ReclaimReport {
+            scope: bulkstat::DiscoveryCoverage::default(),
             root: root.clone(),
             findings: Vec::new(),
             total: SizeInfo::default(),
@@ -4691,6 +4710,7 @@ mod tests {
         let mut app = App::new(root.clone()).unwrap();
         app.focus = Focus::Reclaim;
         app.reclaim_report = Some(reclaim::ReclaimReport {
+            scope: bulkstat::DiscoveryCoverage::default(),
             root: root.clone(),
             findings: vec![
                 reclaim::Finding {
@@ -4977,6 +4997,7 @@ mod tests {
 
         app.focus = Focus::Reclaim;
         app.reclaim_report = Some(reclaim::ReclaimReport {
+            scope: bulkstat::DiscoveryCoverage::default(),
             root: root.clone(),
             findings: (0..6)
                 .map(|idx| reclaim::Finding {
@@ -5670,6 +5691,8 @@ mod tests {
                 after_total: SizeInfo::new(1, 1),
                 baseline_inaccessible: 0,
                 current_inaccessible: 0,
+                baseline_skipped_mounts: 0,
+                current_skipped_mounts: 0,
                 changes: Vec::new(),
             })),
         })
@@ -5742,6 +5765,7 @@ mod tests {
             scan_id: 7,
             root: root_a.clone(),
             report: reclaim::ReclaimReport {
+                scope: bulkstat::DiscoveryCoverage::default(),
                 root: root_a.clone(),
                 findings: Vec::new(),
                 total: SizeInfo::default(),
@@ -5787,6 +5811,7 @@ mod tests {
                 deps_dir: Some(root_a.join("target")),
             }],
             project_dep_errors: 0,
+            project_scope: bulkstat::DiscoveryCoverage::default(),
             include_managers: false,
         })
         .unwrap();

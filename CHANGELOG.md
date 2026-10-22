@@ -6,9 +6,23 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.72] - 2026-10-22
+## [0.1.73] - 2026-10-22
 
 ### Fixed
+
+- Directory scans parse the native variable attribute layout consistently and
+  report absent required attributes as incomplete. Mount policy is checked on
+  each opened descriptor before file enumeration, including APFS helper mounts.
+- Cleanup detection requires project/environment evidence, recognizes the
+  selected artifact root and cache descendants, retains unknown-size findings,
+  and treats simulator state and deployment output conservatively.
+- Baselines and cleanup totals deduplicate hardlinks across sibling trees.
+  Discovery reports disclose depth, mount and policy exclusions; Top Files
+  exposes incomplete totals and empty states. Cleanup allocated bytes are
+  explicitly candidates, not guaranteed space savings.
+- Update epochs use an atomic operation supported by both the MSRV and current
+  stable toolchain. Publication of the preceding state batch stopped during
+  validation; its changes are included in this release.
 
 - Cache freshness survives interrupted launches and changes of watched root.
   Nanosecond update epochs prevent equal-time stale writers from resurrecting

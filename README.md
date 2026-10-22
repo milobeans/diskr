@@ -115,6 +115,16 @@ filenames and external tools; JSON retains normal structured escaping.
 
 The reclaimable-space detector runs two passes: a fixed-location pass that checks well-known paths (`~/Library/Caches`, Xcode DerivedData, Homebrew, Docker, etc.) and a bounded recursive pass that finds repeated build-artifact directories (`node_modules`, `target`, `.venv`, `__pycache__`, `.next`, `.gradle`). Both use the same fast bulk scanner for sizing.
 
+Artifact classifications require supporting project/environment markers; a name
+such as `target` alone is not a cleanup recommendation. Simulator devices and
+deployment output can contain state you cannot recreate. Reports disclose their
+depth, mount and hidden/cache exclusions. Candidate allocated bytes are not a
+promise of freed space: APFS clones, snapshots and links can retain blocks, and
+moving files to Trash does not free their storage until Trash is emptied.
+Baseline and cleanup totals deduplicate hardlinks within their selected scope;
+independently measured Files rows may share an inode and must not be summed as
+an exact unique-root total. Use Top Files for a root-unique content scan.
+
 APFS space reporting combines `statfs(2)` for mount-level stats, a narrow parser for `diskutil info -plist` output to get container-level free space, and `tmutil listlocalsnapshots` for snapshot discovery.
 
 ## Notes

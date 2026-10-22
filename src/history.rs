@@ -27,6 +27,7 @@ pub struct ChildSize {
     /// Directories under this child that could not be read while sizing it;
     /// when non-zero the recorded size is a lower bound.
     pub inaccessible: u32,
+    pub skipped_mounts: u32,
 }
 
 /// A saved scan of a directory's immediate children at a point in time.
@@ -42,6 +43,11 @@ pub struct ScanRecord {
 }
 
 impl ScanRecord {
+    pub fn skipped_mounts(&self) -> u32 {
+        self.children
+            .iter()
+            .fold(0u32, |acc, c| acc.saturating_add(c.skipped_mounts))
+    }
     pub fn total(&self) -> SizeInfo {
         let mut total = SizeInfo::default();
         for child in &self.children {
@@ -71,11 +77,19 @@ pub struct ChildChange {
     pub after: Option<SizeInfo>,
     pub before_inaccessible: u32,
     pub after_inaccessible: u32,
+    pub before_skipped_mounts: u32,
+    pub after_skipped_mounts: u32,
     pub before_is_dir: Option<bool>,
     pub after_is_dir: Option<bool>,
 }
 
 impl ChildChange {
+    pub fn complete(&self) -> bool {
+        self.before_inaccessible == 0
+            && self.after_inaccessible == 0
+            && self.before_skipped_mounts == 0
+            && self.after_skipped_mounts == 0
+    }
     pub fn delta_allocated(&self) -> i128 {
         i128::from(self.after.map(|s| s.allocated).unwrap_or(0))
             - i128::from(self.before.map(|s| s.allocated).unwrap_or(0))
@@ -98,12 +112,20 @@ pub struct DiffReport {
     /// being non-zero means the totals and deltas are lower bounds.
     pub baseline_inaccessible: u32,
     pub current_inaccessible: u32,
+    pub baseline_skipped_mounts: u32,
+    pub current_skipped_mounts: u32,
     /// Children whose size changed, plus additions and removals, sorted by the
     /// magnitude of the allocated-size delta (largest movers first).
     pub changes: Vec<ChildChange>,
 }
 
 impl DiffReport {
+    pub fn complete(&self) -> bool {
+        self.baseline_inaccessible == 0
+            && self.current_inaccessible == 0
+            && self.baseline_skipped_mounts == 0
+            && self.current_skipped_mounts == 0
+    }
     pub fn total_delta_allocated(&self) -> i128 {
         i128::from(self.after_total.allocated) - i128::from(self.before_total.allocated)
     }
@@ -183,12 +205,15 @@ pub fn diff_records(before: &ScanRecord, after: &ScanRecord) -> DiffReport {
                 .map(|c| c.inaccessible)
                 .unwrap_or(before.enumeration_errors),
             after_inaccessible: child.inaccessible,
+            before_skipped_mounts: prior.map(|c| c.skipped_mounts).unwrap_or(0),
+            after_skipped_mounts: child.skipped_mounts,
             before_is_dir: prior.map(|c| c.is_dir),
             after_is_dir: Some(child.is_dir),
         };
         if prior.is_none()
             || change.before_is_dir != change.after_is_dir
             || change.before_inaccessible != change.after_inaccessible
+            || change.before_skipped_mounts != change.after_skipped_mounts
             || change.delta_allocated() != 0
             || change.delta_logical() != 0
         {
@@ -205,6 +230,8 @@ pub fn diff_records(before: &ScanRecord, after: &ScanRecord) -> DiffReport {
                 after: None,
                 before_inaccessible: child.inaccessible,
                 after_inaccessible: after.enumeration_errors,
+                before_skipped_mounts: child.skipped_mounts,
+                after_skipped_mounts: 0,
                 before_is_dir: Some(child.is_dir),
                 after_is_dir: None,
             });
@@ -226,6 +253,8 @@ pub fn diff_records(before: &ScanRecord, after: &ScanRecord) -> DiffReport {
         after_total: after.total(),
         baseline_inaccessible: before.inaccessible(),
         current_inaccessible: after.inaccessible(),
+        baseline_skipped_mounts: before.skipped_mounts(),
+        current_skipped_mounts: after.skipped_mounts(),
         changes,
     }
 }
@@ -267,10 +296,13 @@ pub(crate) fn scan_record_with_cancellation(
     let canonical = path
         .canonicalize()
         .with_context(|| format!("resolve {}", path.display()))?;
+    let scope = bulkstat::ScanScope::new(&canonical)?;
     let mut children = Vec::new();
     let mut enumeration_errors = 0u32;
     let read =
         std::fs::read_dir(&canonical).with_context(|| format!("read {}", canonical.display()))?;
+    let mut read: Vec<_> = read.collect();
+    read.sort_by_key(|entry| entry.as_ref().ok().map(|e| e.file_name()));
     for entry in read {
         if cancellation.is_cancelled() {
             return Ok(None);
@@ -296,19 +328,17 @@ pub(crate) fn scan_record_with_cancellation(
         if file_type.is_symlink() {
             continue;
         }
-        let (is_dir, size, inaccessible) = if file_type.is_dir() {
-            let Some(scan) = bulkstat::scan_dir_with_cancellation(&entry.path(), 0, cancellation)
+        let (is_dir, size, inaccessible, skipped_mounts) = if !scope.accepts(&entry.path(), &meta) {
+            (file_type.is_dir(), SizeInfo::default(), 0, 1)
+        } else if file_type.is_dir() {
+            let Some(scan) =
+                bulkstat::scan_dir_in_scope(&entry.path(), 0, cancellation, Some(&scope))
             else {
                 return Ok(None);
             };
-            (true, scan.size, scan.inaccessible)
+            (true, scan.size, scan.inaccessible, scan.skipped_mounts)
         } else if file_type.is_file() {
-            use std::os::unix::fs::MetadataExt;
-            (
-                false,
-                SizeInfo::new(meta.len(), meta.blocks().saturating_mul(512)),
-                0,
-            )
+            (false, scope.file_size(&meta), 0, 0)
         } else {
             continue;
         };
@@ -317,6 +347,7 @@ pub(crate) fn scan_record_with_cancellation(
             is_dir,
             size,
             inaccessible,
+            skipped_mounts,
         });
     }
     children.sort_by(|a, b| a.name.cmp(&b.name));
@@ -530,6 +561,7 @@ fn record_to_json(record: &ScanRecord) -> serde_json::Value {
                 "logical": child.size.logical,
                 "allocated": child.size.allocated,
                 "inaccessible": child.inaccessible,
+                "skipped_mounts": child.skipped_mounts,
             })
         })
         .collect();
@@ -579,11 +611,13 @@ fn record_from_json(path: &Path, value: &serde_json::Value) -> Result<ScanRecord
                 .and_then(|v| v.as_u64())
                 .context("child missing allocated bytes")?;
             let inaccessible = optional_count(item, "inaccessible")?;
+            let skipped_mounts = optional_count(item, "skipped_mounts")?;
             Ok(ChildSize {
                 name,
                 is_dir,
                 size: SizeInfo::new(logical, allocated),
                 inaccessible,
+                skipped_mounts,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -616,6 +650,17 @@ fn optional_count(value: &serde_json::Value, key: &str) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn baseline_children_share_root_unique_hardlink_accounting() {
+        let root = state::state_dir().join("hardlinked-baseline");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/data"), vec![1u8; 8192]).unwrap();
+        std::fs::hard_link(root.join("a/data"), root.join("b/link")).unwrap();
+        let record = scan_record(&root).unwrap();
+        assert_eq!(record.total(), bulkstat::scan_dir(&root, 0).size);
+    }
 
     #[test]
     fn stale_same_path_save_is_rejected_inside_the_lock() {
@@ -705,6 +750,7 @@ mod tests {
             is_dir: true,
             size: SizeInfo::new(allocated, allocated),
             inaccessible: 0,
+            skipped_mounts: 0,
         }
     }
 
@@ -769,12 +815,14 @@ mod tests {
                     is_dir: true,
                     size: SizeInfo::new(10, 20),
                     inaccessible: 3,
+                    skipped_mounts: 0,
                 },
                 ChildSize {
                     name: "file".to_string(),
                     is_dir: false,
                     size: SizeInfo::new(30, 40),
                     inaccessible: 0,
+                    skipped_mounts: 0,
                 },
             ],
         };

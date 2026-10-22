@@ -6,7 +6,8 @@
 //! files, this is 3-10x faster than stat-per-file because each syscall has a
 //! fixed kernel-mode overhead that dominates when files are small.
 //!
-//! Layout of each returned entry (with our attrlist + FSOPT_PACK_INVAL_ATTRS):
+//! Layout of a fully valid entry. Invalid attributes have no physical slot;
+//! the parser advances only over returned bits (PACK_INVAL_ATTRS is not used).
 //!   [ 0.. 4] length          u32   — total length of this entry including padding
 //!   [ 4..24] returned_attrs  5*u32 — bitmap of which attrs the kernel filled in
 //!   [24..28] per-entry error u32   — present when returned_attrs says so
@@ -20,7 +21,7 @@
 //!   [..    ] name bytes + padding
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -43,7 +44,6 @@ const ATTR_CMN_RETURNED_ATTRS: u32 = 0x80000000;
 const ATTR_FILE_LINKCOUNT: u32 = 0x00000001;
 const ATTR_FILE_TOTALSIZE: u32 = 0x00000002;
 const ATTR_FILE_ALLOCSIZE: u32 = 0x00000004;
-const FSOPT_PACK_INVAL_ATTRS: u64 = 0x00000008;
 const FSOPT_RETURN_REALDEV: u64 = 0x00000200;
 const ATTRIBUTE_SET_LEN: usize = 20;
 const ATTR_REFERENCE_LEN: usize = 8;
@@ -87,6 +87,27 @@ pub struct DirScan {
     /// scan root (external/network/FUSE mounts and APFS helper volumes such as
     /// Preboot/VM/Update), to avoid counting another filesystem's bytes.
     pub skipped_mounts: u32,
+    pub hard_links: Vec<(u64, u64, SizeInfo)>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiscoveryCoverage {
+    pub depth_limit: usize,
+    pub depth_limited: u32,
+    pub skipped_mounts: u32,
+    pub excluded_policy: u32,
+}
+
+impl DiscoveryCoverage {
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({ "policy": "same selected filesystem; no symlinks; tool-specific hidden/cache exclusions", "depth_limit": self.depth_limit, "depth_limited": self.depth_limited, "skipped_mounts": self.skipped_mounts, "excluded_policy": self.excluded_policy })
+    }
+    pub fn summary(&self) -> String {
+        format!(
+            "scope: depth {} · {} depth-limited · {} mounts skipped · {} policy exclusions",
+            self.depth_limit, self.depth_limited, self.skipped_mounts, self.excluded_policy
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +163,15 @@ pub fn scan_dir_with_cancellation(
     top_file_limit: usize,
     cancellation: &ScanCancellation,
 ) -> Option<DirScan> {
+    scan_dir_in_scope(root, top_file_limit, cancellation, None)
+}
+
+pub(crate) fn scan_dir_in_scope(
+    root: &Path,
+    top_file_limit: usize,
+    cancellation: &ScanCancellation,
+    scope: Option<&ScanScope>,
+) -> Option<DirScan> {
     if cancellation.is_cancelled() {
         return None;
     }
@@ -162,11 +192,15 @@ pub fn scan_dir_with_cancellation(
     }
 
     let policy_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let state = Arc::new(WalkState::new(
+    let mut walk = WalkState::new(
         ScanPolicy::new(&policy_root, meta.dev()),
         top_file_limit,
         cancellation.clone(),
-    ));
+    );
+    if let Some(scope) = scope {
+        walk.context = Arc::clone(&scope.context);
+    }
+    let state = Arc::new(walk);
     let group = TaskGroup::new();
     spawn_walk(root.to_path_buf(), Arc::clone(&state), &group);
     group.wait();
@@ -247,7 +281,7 @@ pub fn scan_dir_async(
 /// largest-files heap keeps a mutex but is only touched when a top-files
 /// report was requested.
 struct WalkState {
-    context: ScanContext,
+    context: Arc<ScanContext>,
     top_file_limit: usize,
     cancellation: ScanCancellation,
     logical: AtomicU64,
@@ -260,10 +294,10 @@ struct WalkState {
 impl WalkState {
     fn new(policy: ScanPolicy, top_file_limit: usize, cancellation: ScanCancellation) -> Self {
         Self {
-            context: ScanContext {
+            context: Arc::new(ScanContext {
                 policy,
-                seen_hard_links: Mutex::new(HashSet::new()),
-            },
+                seen_hard_links: Mutex::new(HashMap::new()),
+            }),
             top_file_limit,
             cancellation,
             logical: AtomicU64::new(0),
@@ -314,6 +348,14 @@ impl WalkState {
             largest_files: sorted_largest_files(heap),
             inaccessible: self.inaccessible.load(Ordering::Relaxed),
             skipped_mounts: self.skipped_mounts.load(Ordering::Relaxed),
+            hard_links: self
+                .context
+                .seen_hard_links
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(&(dev, ino), &size)| (dev, ino, size))
+                .collect(),
         }
     }
 }
@@ -327,9 +369,63 @@ struct DirectoryScan {
     skipped_mounts: u32,
 }
 
+impl DirectoryScan {
+    fn merge(&mut self, other: Self, limit: usize) {
+        self.size.add_file(other.size);
+        self.inaccessible = self.inaccessible.saturating_add(other.inaccessible);
+        self.skipped_mounts = self.skipped_mounts.saturating_add(other.skipped_mounts);
+        self.subdirs.extend(other.subdirs);
+        for Reverse(candidate) in other.largest_files {
+            push_file_candidate(&mut self.largest_files, limit, candidate);
+        }
+    }
+}
+
 struct ScanContext {
     policy: ScanPolicy,
-    seen_hard_links: Mutex<HashSet<FileIdentity>>,
+    seen_hard_links: Mutex<HashMap<FileIdentity, SizeInfo>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ScanScope {
+    context: Arc<ScanContext>,
+}
+
+impl ScanScope {
+    pub(crate) fn new(root: &Path) -> std::io::Result<Self> {
+        let meta = std::fs::symlink_metadata(root)?;
+        Ok(Self {
+            context: Arc::new(ScanContext {
+                policy: ScanPolicy::new(root, meta.dev()),
+                seen_hard_links: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+    pub(crate) fn fresh(&self) -> Self {
+        Self {
+            context: Arc::new(ScanContext {
+                policy: self.context.policy,
+                seen_hard_links: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+    pub(crate) fn accepts(&self, path: &Path, meta: &std::fs::Metadata) -> bool {
+        !should_skip_subdir(path, Some(meta.dev()), &self.context.policy)
+    }
+    pub(crate) fn file_size(&self, meta: &std::fs::Metadata) -> SizeInfo {
+        let size = SizeInfo::new(meta.len(), meta.blocks().saturating_mul(512));
+        if should_count_file(
+            Some(meta.dev()),
+            Some(meta.ino()),
+            meta.nlink() as u32,
+            &self.context,
+            size,
+        ) {
+            size
+        } else {
+            SizeInfo::default()
+        }
+    }
 }
 
 type FileIdentity = (u64, u64);
@@ -394,6 +490,20 @@ fn walk_task(mut dir: PathBuf, state: Arc<WalkState>, group: Arc<TaskGroup>) {
     while let Some(current) = fd.take() {
         if state.cancellation.is_cancelled() {
             return;
+        }
+        let mut opened = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(current.0, opened.as_mut_ptr()) } != 0 {
+            chain.inaccessible = chain.inaccessible.saturating_add(1);
+            break;
+        }
+        let opened = unsafe { opened.assume_init() };
+        if should_skip_subdir(
+            &dir,
+            Some(opened.st_dev as u32 as u64),
+            &state.context.policy,
+        ) {
+            chain.skipped_mounts = chain.skipped_mounts.saturating_add(1);
+            break;
         }
         let mut partial = scan_open_dir(
             &current,
@@ -472,7 +582,7 @@ fn open_dir_c(path: &CString, dirfd: libc::c_int) -> Result<DirFd, Option<i32>> 
         libc::openat(
             dirfd,
             path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         )
     };
     if fd < 0 {
@@ -526,7 +636,7 @@ fn scan_open_dir(
                     &mut attrlist as *mut _ as *mut libc::c_void,
                     buf.as_mut_ptr() as *mut libc::c_void,
                     buf.len(),
-                    FSOPT_PACK_INVAL_ATTRS | FSOPT_RETURN_REALDEV,
+                    FSOPT_RETURN_REALDEV,
                 )
             };
             if n == 0 {
@@ -548,173 +658,10 @@ fn scan_open_dir(
             }
             saw_bulk_entries = true;
 
-            let mut offset: usize = 0;
-            for _ in 0..n {
-                macro_rules! malformed_entry {
-                    () => {{
-                        partial.inaccessible = partial.inaccessible.saturating_add(1);
-                        break;
-                    }};
-                }
-                let entry_start = offset;
-                if entry_start + 4 + ATTRIBUTE_SET_LEN > buf.len() {
-                    malformed_entry!();
-                }
-                let Some(length) = read_u32(buf, buf.len(), entry_start).map(|n| n as usize) else {
-                    malformed_entry!();
-                };
-                if length == 0 || entry_start + length > buf.len() {
-                    malformed_entry!();
-                }
-                let entry_end = entry_start + length;
-                let Some(returned_common) = read_u32(buf, entry_end, entry_start + 4) else {
-                    malformed_entry!();
-                };
-                let Some(returned_file) = read_u32(buf, entry_end, entry_start + 16) else {
-                    malformed_entry!();
-                };
-                let mut field = entry_start + 4 + ATTRIBUTE_SET_LEN;
-
-                let err = if returned_common & ATTR_CMN_ERROR != 0 {
-                    let Some(err) = read_u32(buf, entry_end, field) else {
-                        malformed_entry!();
-                    };
-                    field += 4;
-                    err
-                } else {
-                    0
-                };
-
-                let name_ref = if returned_common & ATTR_CMN_NAME != 0 {
-                    let attr_ref_start = field;
-                    let Some(name_off) = read_i32(buf, entry_end, field).map(|n| n as isize) else {
-                        malformed_entry!();
-                    };
-                    let Some(name_len) = read_u32(buf, entry_end, field + 4).map(|n| n as usize)
-                    else {
-                        malformed_entry!();
-                    };
-                    field += ATTR_REFERENCE_LEN;
-                    Some((attr_ref_start, name_off, name_len))
-                } else {
-                    None
-                };
-
-                let devid = if returned_common & ATTR_CMN_DEVID != 0 {
-                    let Some(devid) = read_i32(buf, entry_end, field) else {
-                        malformed_entry!();
-                    };
-                    field += 4;
-                    Some(devid as u32 as u64)
-                } else {
-                    None
-                };
-
-                let objtype = if returned_common & ATTR_CMN_OBJTYPE != 0 {
-                    let Some(objtype) = read_u32(buf, entry_end, field) else {
-                        malformed_entry!();
-                    };
-                    field += 4;
-                    objtype
-                } else {
-                    0
-                };
-                let fileid = if returned_common & ATTR_CMN_FILEID != 0 {
-                    let value = read_u64(buf, entry_end, field);
-                    field += 8;
-                    value
-                } else {
-                    None
-                };
-
-                let linkcount = if returned_file & ATTR_FILE_LINKCOUNT != 0 {
-                    let Some(value) = read_u32(buf, entry_end, field) else {
-                        malformed_entry!();
-                    };
-                    field += 4;
-                    value
-                } else {
-                    1
-                };
-                let totalsize = if returned_file & ATTR_FILE_TOTALSIZE != 0 {
-                    let Some(value) = read_u64(buf, entry_end, field) else {
-                        malformed_entry!();
-                    };
-                    field += 8;
-                    value
-                } else {
-                    0
-                };
-                let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
-                    let Some(value) = read_u64(buf, entry_end, field) else {
-                        malformed_entry!();
-                    };
-                    value
-                } else {
-                    0
-                };
-                offset += length;
-
-                // A per-entry error means the kernel could not read this
-                // entry's attributes (transient race, ACL, or unsupported
-                // attribute). Count it so the total stays an honest lower bound
-                // instead of silently dropping the entry's bytes.
-                if err != 0 {
-                    partial.inaccessible = partial.inaccessible.saturating_add(1);
-                    continue;
-                }
-                match objtype {
-                    VREG => {
-                        if !should_count_file(devid, fileid, linkcount, context) {
-                            continue;
-                        }
-                        let size = SizeInfo::new(totalsize, allocsize);
-                        partial.size.add_file(size);
-                        if top_file_limit == 0 {
-                            continue;
-                        }
-                        if let Some((attr_ref_start, name_off, name_len)) = name_ref {
-                            let Some(name_bytes) = read_attr_reference(
-                                buf,
-                                entry_end,
-                                attr_ref_start,
-                                name_off,
-                                name_len,
-                            ) else {
-                                partial.inaccessible = partial.inaccessible.saturating_add(1);
-                                continue;
-                            };
-                            push_largest_file(
-                                &mut partial.largest_files,
-                                top_file_limit,
-                                dir.join(OsStr::from_bytes(name_bytes)),
-                                size,
-                            );
-                        }
-                    }
-                    VDIR => {
-                        let Some((attr_ref_start, name_off, name_len)) = name_ref else {
-                            continue;
-                        };
-                        let Some(name_bytes) =
-                            read_attr_reference(buf, entry_end, attr_ref_start, name_off, name_len)
-                        else {
-                            partial.inaccessible = partial.inaccessible.saturating_add(1);
-                            continue;
-                        };
-                        if matches!(name_bytes, b"." | b"..") {
-                            continue;
-                        }
-                        let subdir = dir.join(OsStr::from_bytes(name_bytes));
-                        if should_skip_subdir(&subdir, devid, &context.policy) {
-                            partial.skipped_mounts = partial.skipped_mounts.saturating_add(1);
-                            continue;
-                        }
-                        partial.subdirs.push(subdir);
-                    }
-                    _ => {} // VLNK, VSOCK, VBLK, VCHR, VFIFO: ignore
-                }
-            }
+            partial.merge(
+                parse_bulk_batch(buf, n, dir, top_file_limit, context),
+                top_file_limit,
+            );
         }
     });
 
@@ -723,6 +670,190 @@ fn scan_open_dir(
     } else {
         partial
     }
+}
+
+fn parse_bulk_batch(
+    buf: &[u8],
+    n: i32,
+    dir: &Path,
+    top_file_limit: usize,
+    context: &ScanContext,
+) -> DirectoryScan {
+    let mut partial = DirectoryScan::default();
+    let mut offset: usize = 0;
+    for _ in 0..n {
+        macro_rules! malformed_entry {
+            () => {{
+                partial.inaccessible = partial.inaccessible.saturating_add(1);
+                break;
+            }};
+        }
+        let entry_start = offset;
+        if entry_start + 4 + ATTRIBUTE_SET_LEN > buf.len() {
+            malformed_entry!();
+        }
+        let Some(length) = read_u32(buf, buf.len(), entry_start).map(|n| n as usize) else {
+            malformed_entry!();
+        };
+        if length == 0 || entry_start + length > buf.len() {
+            malformed_entry!();
+        }
+        let entry_end = entry_start + length;
+        let Some(returned_common) = read_u32(buf, entry_end, entry_start + 4) else {
+            malformed_entry!();
+        };
+        let Some(returned_file) = read_u32(buf, entry_end, entry_start + 16) else {
+            malformed_entry!();
+        };
+        let mut field = entry_start + 4 + ATTRIBUTE_SET_LEN;
+
+        let err = if returned_common & ATTR_CMN_ERROR != 0 {
+            let Some(err) = read_u32(buf, entry_end, field) else {
+                malformed_entry!();
+            };
+            field += 4;
+            err
+        } else {
+            0
+        };
+
+        let name_ref = if returned_common & ATTR_CMN_NAME != 0 {
+            let attr_ref_start = field;
+            let Some(name_off) = read_i32(buf, entry_end, field).map(|n| n as isize) else {
+                malformed_entry!();
+            };
+            let Some(name_len) = read_u32(buf, entry_end, field + 4).map(|n| n as usize) else {
+                malformed_entry!();
+            };
+            field += ATTR_REFERENCE_LEN;
+            Some((attr_ref_start, name_off, name_len))
+        } else {
+            None
+        };
+
+        let devid = if returned_common & ATTR_CMN_DEVID != 0 {
+            let Some(devid) = read_i32(buf, entry_end, field) else {
+                malformed_entry!();
+            };
+            field += 4;
+            Some(devid as u32 as u64)
+        } else {
+            None
+        };
+
+        let objtype = if returned_common & ATTR_CMN_OBJTYPE != 0 {
+            let Some(objtype) = read_u32(buf, entry_end, field) else {
+                malformed_entry!();
+            };
+            field += 4;
+            objtype
+        } else {
+            0
+        };
+        let fileid = if returned_common & ATTR_CMN_FILEID != 0 {
+            let value = read_u64(buf, entry_end, field);
+            field += 8;
+            value
+        } else {
+            None
+        };
+
+        let linkcount = if returned_file & ATTR_FILE_LINKCOUNT != 0 {
+            let Some(value) = read_u32(buf, entry_end, field) else {
+                malformed_entry!();
+            };
+            field += 4;
+            value
+        } else {
+            1
+        };
+        let totalsize = if returned_file & ATTR_FILE_TOTALSIZE != 0 {
+            let Some(value) = read_u64(buf, entry_end, field) else {
+                malformed_entry!();
+            };
+            field += 8;
+            value
+        } else {
+            0
+        };
+        let allocsize = if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
+            let Some(value) = read_u64(buf, entry_end, field) else {
+                malformed_entry!();
+            };
+            value
+        } else {
+            0
+        };
+        offset += length;
+
+        // A per-entry error means the kernel could not read this
+        // entry's attributes (transient race, ACL, or unsupported
+        // attribute). Count it so the total stays an honest lower bound
+        // instead of silently dropping the entry's bytes.
+        if err != 0 {
+            partial.inaccessible = partial.inaccessible.saturating_add(1);
+            continue;
+        }
+        match objtype {
+            VREG => {
+                if returned_file & (ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE)
+                    != (ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE)
+                    || (linkcount > 1 && (devid.is_none() || fileid.is_none()))
+                {
+                    partial.inaccessible = partial.inaccessible.saturating_add(1);
+                    continue;
+                }
+                let size = SizeInfo::new(totalsize, allocsize);
+                if !should_count_file(devid, fileid, linkcount, context, size) {
+                    continue;
+                }
+                partial.size.add_file(size);
+                if top_file_limit == 0 {
+                    continue;
+                }
+                if let Some((attr_ref_start, name_off, name_len)) = name_ref {
+                    let Some(name_bytes) =
+                        read_attr_reference(buf, entry_end, attr_ref_start, name_off, name_len)
+                    else {
+                        partial.inaccessible = partial.inaccessible.saturating_add(1);
+                        continue;
+                    };
+                    push_largest_file(
+                        &mut partial.largest_files,
+                        top_file_limit,
+                        dir.join(OsStr::from_bytes(name_bytes)),
+                        size,
+                    );
+                }
+            }
+            VDIR => {
+                let Some((attr_ref_start, name_off, name_len)) = name_ref else {
+                    partial.inaccessible = partial.inaccessible.saturating_add(1);
+                    continue;
+                };
+                let Some(name_bytes) =
+                    read_attr_reference(buf, entry_end, attr_ref_start, name_off, name_len)
+                else {
+                    partial.inaccessible = partial.inaccessible.saturating_add(1);
+                    continue;
+                };
+                if matches!(name_bytes, b"." | b"..") {
+                    continue;
+                }
+                let subdir = dir.join(OsStr::from_bytes(name_bytes));
+                if should_skip_subdir(&subdir, devid, &context.policy) {
+                    partial.skipped_mounts = partial.skipped_mounts.saturating_add(1);
+                    continue;
+                }
+                partial.subdirs.push(subdir);
+            }
+            0 => {
+                partial.inaccessible = partial.inaccessible.saturating_add(1);
+            }
+            _ => {} // VLNK, VSOCK, VBLK, VCHR, VFIFO: ignore
+        }
+    }
+    partial
 }
 
 /// Compatibility path for filesystems that do not implement
@@ -768,15 +899,16 @@ fn scan_open_dir_fallback(
         };
 
         if metadata.is_file() {
+            let size = SizeInfo::new(metadata.len(), metadata.blocks().saturating_mul(512));
             if !should_count_file(
                 Some(metadata.dev()),
                 Some(metadata.ino()),
                 metadata.nlink() as u32,
                 context,
+                size,
             ) {
                 continue;
             }
-            let size = SizeInfo::new(metadata.len(), metadata.blocks().saturating_mul(512));
             partial.size.add_file(size);
             if top_file_limit > 0 {
                 push_largest_file(&mut partial.largest_files, top_file_limit, path, size);
@@ -798,6 +930,7 @@ fn should_count_file(
     fileid: Option<u64>,
     linkcount: u32,
     context: &ScanContext,
+    size: SizeInfo,
 ) -> bool {
     if linkcount <= 1 {
         return true;
@@ -806,11 +939,16 @@ fn should_count_file(
         return true;
     };
     let identity = (devid.unwrap_or(context.policy.root_dev), fileid);
-    context
+    let mut seen = context
         .seen_hard_links
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(identity)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let std::collections::hash_map::Entry::Vacant(entry) = seen.entry(identity) {
+        entry.insert(size);
+        true
+    } else {
+        false
+    }
 }
 
 /// A subdirectory is skipped when it lives on a different volume than the scan
@@ -964,6 +1102,81 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     #[test]
+    fn variable_layout_keeps_fields_aligned_when_attributes_are_absent() {
+        fn record(with_total: bool) -> Vec<u8> {
+            let mut bytes = vec![0u8; 24];
+            let common = ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FILEID;
+            let file = ATTR_FILE_LINKCOUNT
+                | ATTR_FILE_ALLOCSIZE
+                | if with_total { ATTR_FILE_TOTALSIZE } else { 0 };
+            bytes[4..8].copy_from_slice(&common.to_ne_bytes());
+            bytes[16..20].copy_from_slice(&file.to_ne_bytes());
+            bytes.extend(5i32.to_ne_bytes());
+            bytes.extend(VREG.to_ne_bytes());
+            bytes.extend(7u64.to_ne_bytes());
+            bytes.extend(1u32.to_ne_bytes());
+            if with_total {
+                bytes.extend(123u64.to_ne_bytes());
+            }
+            bytes.extend(4096u64.to_ne_bytes());
+            let len = bytes.len() as u32;
+            bytes[..4].copy_from_slice(&len.to_ne_bytes());
+            bytes
+        }
+        let context = ScanContext {
+            policy: ScanPolicy::with_devices(Path::new("/tmp"), 5, None),
+            seen_hard_links: Mutex::new(HashMap::new()),
+        };
+        let mut bytes = record(true);
+        bytes.extend(record(false));
+        let scan = parse_bulk_batch(&bytes, 2, Path::new("/tmp"), 0, &context);
+        assert_eq!(scan.size, SizeInfo::new(123, 4096));
+        assert_eq!(scan.inaccessible, 1);
+    }
+
+    #[test]
+    fn opened_descriptor_policy_rejects_a_foreign_device_before_reading_files() {
+        let root = test_root("descriptor_policy");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("data"), b"data").unwrap();
+        let dev = fs::metadata(&root).unwrap().dev();
+        let state = Arc::new(WalkState::new(
+            ScanPolicy::with_devices(&root, dev.wrapping_add(1), None),
+            0,
+            ScanCancellation::never(),
+        ));
+        let group = TaskGroup::new();
+        spawn_walk(root.clone(), Arc::clone(&state), &group);
+        group.wait();
+        let result = state.finish();
+        assert_eq!(result.skipped_mounts, 1);
+        assert_eq!(result.size.logical, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn actual_apfs_helper_mount_obeys_the_selected_root_policy() {
+        let root = std::env::temp_dir();
+        let scope = ScanScope::new(&root).unwrap();
+        for mount in ["/System/Volumes/VM", "/System/Volumes/Preboot"] {
+            let path = Path::new(mount);
+            let Ok(meta) = std::fs::symlink_metadata(path) else {
+                continue;
+            };
+            if scope.accepts(path, &meta) {
+                continue;
+            }
+            // The descriptor is checked before enumeration: no VM or user files are read.
+            let scan =
+                scan_dir_in_scope(path, 0, &ScanCancellation::never(), Some(&scope)).unwrap();
+            if scan.inaccessible == 0 {
+                assert_eq!(scan.skipped_mounts, 1);
+                assert_eq!(scan.size, SizeInfo::default());
+            }
+        }
+    }
+
+    #[test]
     fn matches_stat_sum_on_known_tree() {
         let root = test_root("bulkstat");
         let _ = fs::remove_dir_all(&root);
@@ -1054,7 +1267,7 @@ mod tests {
         let metadata = fs::metadata(&root).unwrap();
         let context = ScanContext {
             policy: ScanPolicy::with_devices(&root, metadata.dev(), None),
-            seen_hard_links: Mutex::new(HashSet::new()),
+            seen_hard_links: Mutex::new(HashMap::new()),
         };
 
         let scan = scan_open_dir_fallback(&root, 10, &context, &ScanCancellation::never());

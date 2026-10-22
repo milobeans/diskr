@@ -21,14 +21,19 @@ pub(crate) fn next_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0);
-    LAST.fetch_update(
-        std::sync::atomic::Ordering::SeqCst,
-        std::sync::atomic::Ordering::SeqCst,
-        |last| Some(clock.max(last.saturating_add(1))),
-    )
-    .unwrap()
-    .saturating_add(1)
-    .max(clock)
+    let mut last = LAST.load(std::sync::atomic::Ordering::SeqCst);
+    loop {
+        let next = clock.max(last.saturating_add(1));
+        match LAST.compare_exchange_weak(
+            last,
+            next,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return next,
+            Err(current) => last = current,
+        }
+    }
 }
 
 pub(crate) fn encode_path(path: &Path) -> String {
@@ -528,6 +533,32 @@ mod tests {
             decode_path(&encode_path(Path::new("@unix:ff"))),
             Some(PathBuf::from("@unix:ff"))
         );
+    }
+
+    #[test]
+    fn raw_name_fixture_preserves_identity_when_the_filesystem_supports_it() {
+        let dir = temp_file("raw_name_fixture");
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = std::ffi::OsString::from_vec(b"raw-\xff".to_vec());
+        let path = dir.join(name);
+        match std::fs::write(&path, b"fixture") {
+            Ok(()) => {
+                let actual = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                assert_eq!(decode_path(&encode_path(&actual)), Some(path));
+            }
+            Err(error) => {
+                assert!(
+                    matches!(error.raw_os_error(), Some(libc::EILSEQ | libc::EINVAL)),
+                    "unexpected fixture failure: {error}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

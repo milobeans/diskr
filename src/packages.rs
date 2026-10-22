@@ -217,6 +217,7 @@ pub struct ProjectDeps {
 pub struct ProjectDepsReport {
     pub projects: Vec<ProjectDeps>,
     pub inaccessible: u32,
+    pub scope: bulkstat::DiscoveryCoverage,
 }
 
 pub fn scan_managers() -> Vec<ManagerReport> {
@@ -974,8 +975,21 @@ pub fn find_project_deps(root: &Path, max_depth: usize) -> Vec<ProjectDeps> {
 pub fn scan_project_deps(root: &Path, max_depth: usize) -> ProjectDepsReport {
     let results = std::sync::Mutex::new(Vec::new());
     let inaccessible = AtomicU32::new(0);
+    let scope = bulkstat::ScanScope::new(root).ok();
+    let coverage = std::sync::Mutex::new(bulkstat::DiscoveryCoverage {
+        depth_limit: max_depth,
+        ..Default::default()
+    });
     pool::par_drain(vec![(root.to_path_buf(), 0usize)], |(dir, depth), queue| {
-        scan_project_dir(&dir, depth, max_depth, &results, &inaccessible, queue);
+        scan_project_dir(
+            &dir,
+            depth,
+            max_depth,
+            &results,
+            &inaccessible,
+            queue,
+            (scope.as_ref(), &coverage),
+        );
     });
     let mut results = results.into_inner().unwrap_or_default();
     results.sort_by(|a, b| {
@@ -989,6 +1003,7 @@ pub fn scan_project_deps(root: &Path, max_depth: usize) -> ProjectDepsReport {
     ProjectDepsReport {
         projects: results,
         inaccessible: inaccessible.load(Ordering::Relaxed),
+        scope: coverage.into_inner().unwrap_or_default(),
     }
 }
 
@@ -1037,7 +1052,18 @@ fn scan_project_dir(
     results: &std::sync::Mutex<Vec<ProjectDeps>>,
     inaccessible: &AtomicU32,
     queue: &pool::WorkQueue<(PathBuf, usize)>,
+    policy: (
+        Option<&bulkstat::ScanScope>,
+        &std::sync::Mutex<bulkstat::DiscoveryCoverage>,
+    ),
 ) {
+    let (scope, coverage) = policy;
+    if let (Some(policy), Ok(meta)) = (scope, std::fs::symlink_metadata(dir)) {
+        if !policy.accepts(dir, &meta) {
+            coverage.lock().unwrap().skipped_mounts += 1;
+            return;
+        }
+    }
     let read = match std::fs::read_dir(dir) {
         Ok(read) => read,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
@@ -1085,6 +1111,8 @@ fn scan_project_dir(
             && name_str != "vendor"
         {
             children.push(entry.path());
+        } else if file_type.is_dir() {
+            coverage.lock().unwrap().excluded_policy += 1;
         }
     }
 
@@ -1111,7 +1139,16 @@ fn scan_project_dir(
             .sum();
         let (deps_size, deps_dir) = match group.deps_path {
             Some(deps_path) if deps_path.is_dir() => (
-                Some(bulkstat::scan_dir(&deps_path, 0).size),
+                Some(
+                    bulkstat::scan_dir_in_scope(
+                        &deps_path,
+                        0,
+                        &bulkstat::ScanCancellation::never(),
+                        scope.map(|s| s.fresh()).as_ref(),
+                    )
+                    .unwrap_or_default()
+                    .size,
+                ),
                 Some(deps_path),
             ),
             _ => (None, None),
@@ -1134,6 +1171,8 @@ fn scan_project_dir(
         for child in children {
             queue.push((child, depth + 1));
         }
+    } else {
+        coverage.lock().unwrap().depth_limited += children.len() as u32;
     }
 }
 
