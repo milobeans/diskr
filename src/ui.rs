@@ -15,8 +15,8 @@ use ratatui_widgets::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{
-    format_elapsed, format_full_timestamp, format_modified_time, human, size_sort_key, App, Focus,
-    InputMode, PkgView, SortMode,
+    format_elapsed, format_full_timestamp, format_modified_time, human, size_sort_key, ActiveModal,
+    App, Focus, ListingState, PkgView, SortMode,
 };
 use crate::bulkstat::SizeInfo;
 use crate::keymap::{self, KeySection};
@@ -73,38 +73,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.focus == Focus::Reclaim && !app.reclaim_paths_open() {
         draw_reclaim_panel(f, app);
     }
-    if app.top_files_open() {
-        draw_top_files(f, app);
-    }
-    if app.reclaim_paths_open() {
-        draw_reclaim_paths(f, app);
-    }
-    if app.disk_info_open() {
-        draw_disk_info_modal(f, app);
-    }
-    if app.confirming_delete {
-        draw_confirm(f, app);
-    }
-    if app.confirming_uninstall {
-        draw_uninstall_confirm(f, app);
-    }
-    if app.confirming_empty_trash {
-        draw_empty_trash_confirm(f, app);
-    }
-    if app.pkg_detail {
-        match app.pkg_view {
+    match app.active_modal() {
+        ActiveModal::Help => draw_help_overlay(f, app),
+        ActiveModal::Delete => draw_confirm(f, app),
+        ActiveModal::Uninstall => draw_uninstall_confirm(f, app),
+        ActiveModal::EmptyTrash => draw_empty_trash_confirm(f, app),
+        ActiveModal::TopFiles => draw_top_files(f, app),
+        ActiveModal::ReclaimPaths => draw_reclaim_paths(f, app),
+        ActiveModal::DiskInfo => draw_disk_info_modal(f, app),
+        ActiveModal::Package => match app.pkg_view {
             PkgView::SystemManagers => draw_pkg_detail(f, app),
             PkgView::ProjectDeps => draw_project_dep_detail(f, app),
-        }
-    }
-    if app.file_info_open {
-        draw_file_info(f, app);
-    }
-    if app.input_mode != InputMode::None {
-        draw_input_overlay(f, app);
-    }
-    if app.show_help {
-        draw_help_overlay(f, app);
+        },
+        ActiveModal::FileInfo => draw_file_info(f, app),
+        ActiveModal::Input => draw_input_overlay(f, app),
+        ActiveModal::None => {}
     }
 }
 
@@ -185,10 +168,13 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
             .borders(Borders::ALL)
             .title("files · 0 items")
             .border_style(Style::default().fg(border_color));
-        let message = if app.entries.is_empty() {
-            "empty directory"
-        } else {
-            "no matching entries"
+        let message = match &app.listing_state {
+            ListingState::Unreadable(message) => format!("{message} · r retry · Backspace parent"),
+            ListingState::Ready if app.entries.is_empty() && app.hidden_entry_count > 0 => {
+                String::from("no visible files · . shows hidden")
+            }
+            ListingState::Ready if app.entries.is_empty() => String::from("empty directory"),
+            ListingState::Ready => String::from("no matching entries"),
         };
         f.render_widget(
             Paragraph::new(message)
@@ -1094,6 +1080,14 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
 
 fn draw_file_info(f: &mut Frame, app: &App) {
     let Some(info) = app.file_info.as_ref() else {
+        let area = detail_modal_area(f);
+        render_detail_modal(
+            f,
+            area,
+            " file info ",
+            Color::DarkGray,
+            vec![Line::from("Loading file info…"), Line::from("Esc cancels")],
+        );
         return;
     };
 
@@ -1631,6 +1625,27 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ),
         ]);
         f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
+        return;
+    }
+    if !app.status.is_empty() {
+        let important = app.status.contains("failed") || app.status.starts_with("cannot read");
+        let mut spans = vec![Span::styled(
+            truncate(&app.status, area.width as usize),
+            Style::default().fg(if important {
+                Color::Yellow
+            } else {
+                Color::White
+            }),
+        )];
+        if app.focus == Focus::Files && app.search_filter_active() {
+            spans.push(Span::raw(format!(" · /{} · Esc clear", app.search_query)));
+        } else if app.focus == Focus::Packages && app.pkg_filter_active() {
+            spans.push(Span::raw(format!(
+                " · /{} · Esc clear",
+                app.pkg_search_query
+            )));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
     if app.focus == Focus::Files && app.search_filter_active() {
@@ -2987,6 +3002,74 @@ fn file_size_bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_app(app: &mut App, width: u16, height: u16) -> String {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn filtered_views_keep_action_failures_visible() {
+        let root =
+            std::env::temp_dir().join(format!("diskr_feedback_render_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("name"), b"x").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.enter_search();
+        app.search_push('n');
+        app.keep_search();
+        for focus in [Focus::Files, Focus::Packages] {
+            app.focus = focus;
+            if focus == Focus::Packages {
+                app.enter_pkg_search();
+                app.pkg_search_push('n');
+                app.keep_pkg_search();
+            }
+            app.status = String::from("Trash failed: permission denied");
+            for width in [40, 80, 120] {
+                let frame = render_app(&mut app, width, 24);
+                assert!(frame.contains("Trash failed: permission denied"));
+                assert_eq!(app.status, "Trash failed: permission denied");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_rendering_matches_keyboard_modal_priority() {
+        let root =
+            std::env::temp_dir().join(format!("diskr_modal_priority_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("name"), b"x").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.request_delete();
+        app.file_info_open = true;
+        let frame = render_app(&mut app, 120, 40);
+        assert_eq!(app.active_modal(), ActiveModal::Delete);
+        assert!(frame.contains("Move to Trash"));
+        assert!(!frame.contains("Loading file info"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_views_explain_hidden_entries_and_read_failures() {
+        let root = std::env::temp_dir().join(format!("diskr_empty_render_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".hidden"), b"x").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        assert!(render_app(&mut app, 80, 24).contains("no visible files"));
+        app.listing_state = ListingState::Unreadable(String::from("cannot read: denied"));
+        assert!(render_app(&mut app, 80, 24).contains("cannot read: denied"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn render_help(width: u16, height: u16, scroll: usize) -> (String, usize) {
         use ratatui_core::{backend::TestBackend, terminal::Terminal};

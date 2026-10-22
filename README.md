@@ -91,7 +91,7 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | O | Open selected item with the default app |
 | y | Copy selected item path to clipboard |
 | s | Open selected item location in Terminal |
-| p | Open packages pane or switch package view |
+| p | Open packages; press again while focused to switch package view |
 | u | Toggle the dependency-leaf filter in the packages pane |
 | x | Uninstall the selected package |
 | R | Re-scan the Reclaim pane |

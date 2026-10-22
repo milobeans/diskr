@@ -6,6 +6,20 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.71] - 2026-10-22
+
+### Fixed
+
+- File details open a cancellable loading panel and retain their original action
+  target. Delayed metadata can no longer cover a confirmation or reopen after
+  cancellation or navigation; drawing and keyboard dispatch share modal priority.
+- Kept filters survive refresh with the correct rows and selected path; refresh
+  and scan-all honor the visible filter. Esc clears the active filter, Growth
+  sorting updates as scans complete, and repeated `p` switches package views.
+- Failed Trash batches no longer restore invisible marks from another directory,
+  and their results retain failure reasons. Action feedback remains visible under
+  kept filters; unreadable and hidden-only directories have distinct states.
+
 ## [0.1.70] - 2026-08-06
 
 ### Added

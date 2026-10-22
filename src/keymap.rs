@@ -209,7 +209,7 @@ const EXTERNAL_ACTIONS: &[KeyBinding] = &[
 const PACKAGES: &[KeyBinding] = &[
     KeyBinding {
         key: "p",
-        action: "Open packages pane / switch view",
+        action: "Open packages; press again to switch view",
         footer: Some(FooterBinding {
             key: "p",
             action: "packages",

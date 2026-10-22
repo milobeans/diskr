@@ -48,6 +48,26 @@ pub enum InputMode {
     Mkdir,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ActiveModal {
+    Help,
+    Delete,
+    Uninstall,
+    EmptyTrash,
+    Package,
+    TopFiles,
+    ReclaimPaths,
+    DiskInfo,
+    FileInfo,
+    Input,
+    None,
+}
+
+pub enum ListingState {
+    Ready,
+    Unreadable(String),
+}
+
 impl SortMode {
     pub fn label(self) -> &'static str {
         match self {
@@ -120,6 +140,12 @@ struct TopFilesMsg {
 struct DiskInfoMsg {
     scan_id: ScanId,
     result: Result<space::SpaceReport, String>,
+}
+
+struct FileInfoMsg {
+    request_id: u64,
+    cwd: PathBuf,
+    result: Result<FileInfo, String>,
 }
 
 struct HistoryMsg {
@@ -369,6 +395,8 @@ pub struct App {
     pub disks: Vec<DiskInfo>,
     pub status: String,
     pub cwd_enumeration_errors: u32,
+    pub listing_state: ListingState,
+    pub hidden_entry_count: usize,
     pub show_help: bool,
     pub help_scroll: usize,
     pub confirming_delete: bool,
@@ -468,7 +496,9 @@ pub struct App {
     pub disk_info_report: Option<space::SpaceReport>,
     pub file_info: Option<FileInfo>,
     pub file_info_open: bool,
-    file_info_rx: Option<Receiver<Result<FileInfo, String>>>,
+    file_info_rx: Option<Receiver<FileInfoMsg>>,
+    file_info_request_id: u64,
+    file_info_target: Option<Entry>,
 
     pub history_baseline: Option<history::ScanRecord>,
     pub history_diff: Option<history::DiffReport>,
@@ -533,12 +563,39 @@ struct UninstallResult {
 }
 
 struct DeleteJobMsg {
+    cwd: PathBuf,
     target: DeleteTarget,
     deleted: Vec<PathBuf>,
     failures: Vec<(PathBuf, String)>,
 }
 
 impl App {
+    pub fn active_modal(&self) -> ActiveModal {
+        if self.show_help {
+            ActiveModal::Help
+        } else if self.confirming_delete {
+            ActiveModal::Delete
+        } else if self.confirming_uninstall {
+            ActiveModal::Uninstall
+        } else if self.confirming_empty_trash {
+            ActiveModal::EmptyTrash
+        } else if self.pkg_detail {
+            ActiveModal::Package
+        } else if self.top_files_open {
+            ActiveModal::TopFiles
+        } else if self.reclaim_paths_open {
+            ActiveModal::ReclaimPaths
+        } else if self.disk_info_open {
+            ActiveModal::DiskInfo
+        } else if self.file_info_open {
+            ActiveModal::FileInfo
+        } else if self.input_mode != InputMode::None {
+            ActiveModal::Input
+        } else {
+            ActiveModal::None
+        }
+    }
+
     pub fn new(cwd: PathBuf) -> Result<Self> {
         let (mut size_cache, mut inaccessible_cache, mut cache_age, mut stale_size_cache) = (
             HashMap::new(),
@@ -595,6 +652,8 @@ impl App {
             disks: Vec::new(),
             status: String::from("i info · f Finder · O open"),
             cwd_enumeration_errors: 0,
+            listing_state: ListingState::Ready,
+            hidden_entry_count: 0,
             show_help: false,
             help_scroll: 0,
             confirming_delete: false,
@@ -676,6 +735,8 @@ impl App {
             file_info: None,
             file_info_open: false,
             file_info_rx: None,
+            file_info_request_id: 0,
+            file_info_target: None,
             history_baseline: None,
             history_diff: None,
             history_records,
@@ -772,8 +833,7 @@ impl App {
 
     pub fn reload(&mut self) -> Result<()> {
         let previous_selected = self
-            .entries
-            .get(self.selected)
+            .visible_entry(self.selected)
             .map(|entry| entry.path.clone());
         let previous_index = self.selected;
         self.reload_with_selection(previous_selected, previous_index)
@@ -785,6 +845,16 @@ impl App {
         previous_index: usize,
     ) -> Result<()> {
         self.rebuild_entries()?;
+        self.restore_visible_selection(previous_selected, previous_index);
+        self.auto_scan();
+        Ok(())
+    }
+
+    fn restore_visible_selection(
+        &mut self,
+        previous_selected: Option<PathBuf>,
+        previous_index: usize,
+    ) {
         if self.search_filter_active() {
             self.update_search();
             self.selected = previous_selected
@@ -797,20 +867,22 @@ impl App {
         } else {
             self.restore_selection(previous_selected, previous_index);
         }
-        self.auto_scan();
-        Ok(())
     }
 
     fn rebuild_entries(&mut self) -> Result<()> {
         self.entries.clear();
         self.entry_index.clear();
         self.cwd_enumeration_errors = 0;
+        self.hidden_entry_count = 0;
+        self.listing_state = ListingState::Ready;
         // The scan queue holds paths from the directory being left behind.
         self.pending_scan_dirs.clear();
         let read = match std::fs::read_dir(&self.cwd) {
             Ok(r) => r,
             Err(e) => {
                 self.status = format!("cannot read {}: {e}", self.cwd.display());
+                self.cwd_enumeration_errors = 1;
+                self.listing_state = ListingState::Unreadable(self.status.clone());
                 return Ok(());
             }
         };
@@ -825,6 +897,7 @@ impl App {
             };
             let name = dirent.file_name().to_string_lossy().into_owned();
             if !self.show_hidden && name.starts_with('.') {
+                self.hidden_entry_count += 1;
                 continue;
             }
             let path = dirent.path();
@@ -1106,6 +1179,10 @@ impl App {
             .and_then(|idx| self.entries.get(idx))
     }
 
+    fn visible_entries(&self) -> impl Iterator<Item = &Entry> {
+        (0..self.visible_entry_count()).filter_map(|index| self.visible_entry(index))
+    }
+
     pub fn enter(&mut self) -> Result<()> {
         if self.confirming_delete {
             return Ok(());
@@ -1169,9 +1246,12 @@ impl App {
     /// Scan only a small batch of nearby directories. Starting at `/` or other broad
     /// roots should not recursively walk every child before the user asks for it.
     fn auto_scan(&mut self) {
+        if let ListingState::Unreadable(message) = &self.listing_state {
+            self.status = message.clone();
+            return;
+        }
         let missing: Vec<PathBuf> = self
-            .entries
-            .iter()
+            .visible_entries()
             .filter(|e| e.is_dir && e.size.is_none())
             .map(|e| e.path.clone())
             .collect();
@@ -1213,8 +1293,7 @@ impl App {
     /// gating on it would leave grown trees stale forever.
     fn stale_revalidation_candidates(&self, limit: usize) -> Vec<PathBuf> {
         let mut stale: Vec<(u64, PathBuf)> = self
-            .entries
-            .iter()
+            .visible_entries()
             .filter(|e| e.is_dir && e.size_stale && !e.scanning)
             .map(|e| (e.cached_at.unwrap_or(0), e.path.clone()))
             .collect();
@@ -1275,13 +1354,11 @@ impl App {
         self.fda_limited = full_disk_access_missing();
         self.invalidate_pending_scan_results();
         let previous_selected = self
-            .entries
-            .get(self.selected)
+            .visible_entry(self.selected)
             .map(|entry| entry.path.clone());
         let previous_index = self.selected;
         let cached_dirs: Vec<PathBuf> = self
-            .entries
-            .iter()
+            .visible_entries()
             .filter(|e| e.is_dir)
             .map(|e| e.path.clone())
             .collect();
@@ -1292,18 +1369,25 @@ impl App {
         if self.rebuild_entries().is_err() {
             return;
         }
-        self.restore_selection(previous_selected, previous_index);
-        for e in self.entries.iter_mut().filter(|entry| entry.is_dir) {
+        self.restore_visible_selection(previous_selected, previous_index);
+        if matches!(self.listing_state, ListingState::Unreadable(_)) {
+            return;
+        }
+        let missing: Vec<PathBuf> = self
+            .visible_entries()
+            .filter(|e| e.is_dir)
+            .map(|e| e.path.clone())
+            .collect();
+        let visible_dirs: HashSet<&Path> = missing.iter().map(PathBuf::as_path).collect();
+        for e in self
+            .entries
+            .iter_mut()
+            .filter(|entry| visible_dirs.contains(entry.path.as_path()))
+        {
             e.size = None;
             e.size_stale = false;
             e.cached_at = None;
         }
-        let missing: Vec<PathBuf> = self
-            .entries
-            .iter()
-            .filter(|e| e.is_dir)
-            .map(|e| e.path.clone())
-            .collect();
         if missing.is_empty() {
             self.status = String::from("refresh complete · no directories to rescan");
             return;
@@ -1319,8 +1403,7 @@ impl App {
             return;
         }
         let missing: Vec<PathBuf> = self
-            .entries
-            .iter()
+            .visible_entries()
             .filter(|e| entry_needs_scan(e))
             .map(|e| e.path.clone())
             .collect();
@@ -1377,7 +1460,7 @@ impl App {
                             changed = true;
                         }
                     }
-                    if self.sort == SortMode::SizeDesc {
+                    if matches!(self.sort, SortMode::SizeDesc | SortMode::Growth) {
                         self.sort_dirty = true;
                     }
                     if is_active_scan {
@@ -1459,16 +1542,8 @@ impl App {
         self.status = String::from("saving baseline...");
     }
 
-    pub fn top_files_open(&self) -> bool {
-        self.top_files_open
-    }
-
     pub fn reclaim_paths_open(&self) -> bool {
         self.reclaim_paths_open
-    }
-
-    pub fn disk_info_open(&self) -> bool {
-        self.disk_info_open
     }
 
     pub fn open_help(&mut self) {
@@ -2001,16 +2076,52 @@ impl App {
         };
         let (tx, rx) = channel();
         self.file_info = None;
+        self.file_info_target = Some(entry.clone());
+        self.file_info_request_id = self.file_info_request_id.wrapping_add(1);
+        let request_id = self.file_info_request_id;
+        let cwd = self.cwd.clone();
+        self.file_info_open = true;
         self.file_info_rx = Some(rx);
         self.status = String::from("loading file info…");
         thread::spawn(move || {
             let result = collect_file_info(&entry).map_err(|err| err.to_string());
-            let _ = tx.send(result);
+            let _ = tx.send(FileInfoMsg {
+                request_id,
+                cwd,
+                result,
+            });
         });
     }
 
     pub fn close_file_info(&mut self) {
         self.file_info_open = false;
+        self.file_info_request_id = self.file_info_request_id.wrapping_add(1);
+        self.file_info_rx = None;
+        self.file_info_target = None;
+        self.file_info = None;
+    }
+
+    pub fn file_info_action_target(&self) -> Option<(PathBuf, String)> {
+        self.file_info
+            .as_ref()
+            .map(|info| (info.path.clone(), info.name.clone()))
+    }
+
+    pub fn request_delete_file_info(&mut self) {
+        let entry = self.file_info_target.clone().filter(|entry| {
+            self.file_info
+                .as_ref()
+                .is_some_and(|info| info.path == entry.path)
+        });
+        if let Some(entry) = entry {
+            self.close_file_info();
+            if self.batch_delete_rx.is_some() {
+                self.status = String::from("another Trash operation is already in progress");
+            } else {
+                self.pending_delete = Some(DeleteTarget::FileEntry(entry));
+                self.confirming_delete = true;
+            }
+        }
     }
 
     fn drain_file_info_results(&mut self) -> bool {
@@ -2019,21 +2130,30 @@ impl App {
             None => return false,
         };
         match recv {
-            Ok(Ok(info)) => {
+            Ok(msg) => {
                 self.file_info_rx = None;
-                self.file_info = Some(info);
-                self.file_info_open = true;
-                self.status.clear();
-                true
-            }
-            Ok(Err(err)) => {
-                self.file_info_rx = None;
-                self.status = format!("file info failed: {err}");
+                if msg.request_id != self.file_info_request_id
+                    || msg.cwd != self.cwd
+                    || self.active_modal() != ActiveModal::FileInfo
+                {
+                    self.close_file_info();
+                    return true;
+                }
+                match msg.result {
+                    Ok(info) => {
+                        self.file_info = Some(info);
+                        self.status.clear();
+                    }
+                    Err(err) => {
+                        self.close_file_info();
+                        self.status = format!("file info failed: {err}");
+                    }
+                }
                 true
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
-                self.file_info_rx = None;
+                self.close_file_info();
                 self.status = String::from("file info worker failed");
                 true
             }
@@ -2321,6 +2441,7 @@ impl App {
         }
 
         let total = paths.len();
+        let cwd = self.cwd.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.batch_delete_rx = Some(rx);
         self.status = if matches!(target, DeleteTarget::Batch) {
@@ -2339,6 +2460,7 @@ impl App {
                 }
             }
             let _ = tx.send(DeleteJobMsg {
+                cwd,
                 target,
                 deleted,
                 failures,
@@ -2368,16 +2490,19 @@ impl App {
                     if matches!(&msg.target, DeleteTarget::Batch) && !msg.deleted.is_empty() {
                         let _ = self.reload();
                     }
-                    if matches!(&msg.target, DeleteTarget::Batch) {
-                        self.marked
-                            .extend(msg.failures.iter().map(|(path, _)| path.clone()));
+                    if matches!(&msg.target, DeleteTarget::Batch) && msg.cwd == self.cwd {
+                        self.marked.extend(
+                            msg.failures
+                                .iter()
+                                .map(|(path, _)| path)
+                                .filter(|path| self.entry_index.contains_key(*path))
+                                .cloned(),
+                        );
                     }
                     let names: Vec<String> = msg
                         .failures
                         .iter()
-                        .filter_map(|(p, _)| {
-                            p.file_name().map(|n| n.to_string_lossy().into_owned())
-                        })
+                        .map(|(path, error)| format!("{}: {error}", path.display()))
                         .collect();
                     self.status = format!("Trash failed for: {}", names.join(", "));
                     return true;
@@ -2637,14 +2762,11 @@ impl App {
             }
         };
 
-        if let Some(entry) = self.entries.get(self.selected) {
-            push_if_missing(entry);
-        }
-        for entry in self.entries.iter().skip(self.selected.saturating_add(1)) {
-            push_if_missing(entry);
-        }
-        for entry in self.entries.iter().take(self.selected) {
-            push_if_missing(entry);
+        let count = self.visible_entry_count();
+        for index in (self.selected.min(count)..count).chain(0..self.selected.min(count)) {
+            if let Some(entry) = self.visible_entry(index) {
+                push_if_missing(entry);
+            }
         }
         dirs
     }
@@ -3541,6 +3663,9 @@ impl App {
     }
 
     pub fn request_batch_delete(&mut self) {
+        self.marked.retain(|path| {
+            self.entry_index.contains_key(path) && path.parent() == Some(self.cwd.as_path())
+        });
         if self.confirming_delete {
             return;
         }
@@ -4016,6 +4141,232 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn file_info_actions_remain_bound_to_the_displayed_entry() {
+        let root = test_root("info_target_binding");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["a", "b"] {
+            fs::write(root.join(name), b"x").unwrap();
+        }
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        let entry = app.entries[0].clone();
+        let info = collect_file_info(&entry).unwrap();
+        let (tx, rx) = channel();
+        app.file_info_rx = Some(rx);
+        app.file_info_open = true;
+        app.file_info_target = Some(entry);
+        app.file_info_request_id = 7;
+        app.selected = 1;
+        tx.send(FileInfoMsg {
+            request_id: 7,
+            cwd: root.clone(),
+            result: Ok(info),
+        })
+        .unwrap();
+        assert!(app.drain_file_info_results());
+        assert_eq!(app.file_info_action_target().unwrap().0, root.join("a"));
+        app.request_delete_file_info();
+        assert!(
+            matches!(app.pending_delete.as_ref(), Some(DeleteTarget::FileEntry(entry)) if entry.path == root.join("a"))
+        );
+        assert!(!app.file_info_open);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_info_completion_cannot_cover_another_modal_or_cwd() {
+        for change_cwd in [false, true] {
+            let root = test_root(if change_cwd {
+                "info_old_cwd"
+            } else {
+                "info_modal_priority"
+            });
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("a"), b"x").unwrap();
+            let mut app = App::new(root.clone()).unwrap();
+            let info = collect_file_info(&app.entries[0]).unwrap();
+            let (tx, rx) = channel();
+            app.file_info_rx = Some(rx);
+            app.file_info_open = true;
+            if change_cwd {
+                app.cwd = root.join("other");
+            } else {
+                app.request_delete();
+            }
+            tx.send(FileInfoMsg {
+                request_id: 0,
+                cwd: root.clone(),
+                result: Ok(info),
+            })
+            .unwrap();
+            assert!(app.drain_file_info_results());
+            assert!(!app.file_info_open);
+            if !change_cwd {
+                assert_eq!(app.active_modal(), ActiveModal::Delete);
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn closing_file_info_cancels_loading_and_allows_a_new_request() {
+        let root = test_root("cancel_info_loading");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a"), b"x").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.open_file_info();
+        assert_eq!(app.active_modal(), ActiveModal::FileInfo);
+        app.close_file_info();
+        assert!(app.file_info_rx.is_none());
+        assert!(!app.drain_file_info_results());
+        app.open_file_info();
+        assert_eq!(app.active_modal(), ActiveModal::FileInfo);
+        app.close_file_info();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filtered_refresh_rebuilds_matches_and_preserves_selected_path() {
+        let root = test_root("filtered_refresh_mapping");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["a", "beta", "bravo"] {
+            fs::write(root.join(name), b"x").unwrap();
+        }
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        app.enter_search();
+        app.search_push('b');
+        app.keep_search();
+        app.selected = 1;
+        fs::write(root.join("aa"), b"x").unwrap();
+        app.force_rescan();
+        assert_eq!(
+            app.visible_entries()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["beta", "bravo"]
+        );
+        assert_eq!(app.visible_entry(app.selected).unwrap().name, "bravo");
+        app.reload().unwrap();
+        assert_eq!(app.visible_entry(app.selected).unwrap().name, "bravo");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_all_and_refresh_respect_the_kept_filter() {
+        let root = test_root("filtered_scan_scope");
+        for name in ["a", "b"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let mut app = App::new(root.clone()).unwrap();
+        app.enter_search();
+        app.search_push('b');
+        app.keep_search();
+        for entry in &mut app.entries {
+            entry.size = None;
+            entry.scanning = false;
+        }
+        app.scan_all_missing_visible();
+        assert_eq!(app.scan_total, 1);
+        assert_eq!(app.active_scan_paths, HashSet::from([root.join("b")]));
+        app.force_rescan();
+        assert_eq!(app.active_scan_paths, HashSet::from([root.join("b")]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn growth_sort_updates_as_results_arrive_and_keeps_selection() {
+        let root = test_root("growth_scan_reorder");
+        for name in ["a", "b"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let mut app = App::new(root.clone()).unwrap();
+        app.sort = SortMode::Name;
+        app.apply_sort();
+        app.sort = SortMode::Growth;
+        app.selected = 0;
+        for name in ["a", "b"] {
+            app.size_cache
+                .insert(root.join(name), SizeInfo::new(100, 100));
+        }
+        let (tx, rx) = channel();
+        app.scan_rx = rx;
+        app.active_scan_id = 77;
+        app.scan_total = 2;
+        for (name, size) in [("a", 101), ("b", 500)] {
+            tx.send(ScanMsg::DirSize {
+                scan_id: 77,
+                path: root.join(name),
+                size: SizeInfo::new(size, size),
+                inaccessible: 0,
+                skipped_mounts: 0,
+            })
+            .unwrap();
+        }
+        tx.send(ScanMsg::AllDone { scan_id: 77 }).unwrap();
+        app.drain_scan_results();
+        assert_eq!(
+            app.entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        assert_eq!(app.visible_entry(app.selected).unwrap().name, "a");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_failures_after_navigation_do_not_restore_invisible_marks() {
+        let root = test_root("batch_failure_other_cwd");
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("failed"), b"x").unwrap();
+        fs::write(b.join("current"), b"x").unwrap();
+        let mut app = App::new(a.clone()).unwrap();
+        let (tx, rx) = channel();
+        app.batch_delete_rx = Some(rx);
+        app.cwd = b.clone();
+        app.reload().unwrap();
+        tx.send(DeleteJobMsg {
+            cwd: a.clone(),
+            target: DeleteTarget::Batch,
+            deleted: vec![],
+            failures: vec![(a.join("failed"), "permission denied".into())],
+        })
+        .unwrap();
+        assert!(app.drain_batch_delete_results());
+        assert!(app.marked.is_empty());
+        assert!(app.status.contains("permission denied"));
+        app.request_delete();
+        assert!(
+            matches!(app.pending_delete.as_ref(), Some(DeleteTarget::FileEntry(entry)) if entry.path == b.join("current"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_listing_retains_failure_and_hidden_only_is_distinct() {
+        let root = test_root("listing_error_state");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        fs::write(root.join(".hidden"), b"x").unwrap();
+        app.reload().unwrap();
+        assert!(matches!(app.listing_state, ListingState::Ready));
+        assert_eq!(app.hidden_entry_count, 1);
+        fs::remove_file(root.join(".hidden")).unwrap();
+        fs::remove_dir(&root).unwrap();
+        app.reload().unwrap();
+        assert!(matches!(app.listing_state, ListingState::Unreadable(_)));
+        assert_eq!(app.cwd_enumeration_errors, 1);
+        assert!(app.status.starts_with("cannot read"));
+    }
+
+    #[test]
     fn empty_trash_does_not_arm_without_trash_finding() {
         let root = test_root("empty_trash_no_trash_finding");
         fs::create_dir_all(&root).unwrap();
@@ -4307,6 +4658,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.batch_delete_rx = Some(rx);
         tx.send(DeleteJobMsg {
+            cwd: root.clone(),
             target: DeleteTarget::Batch,
             deleted: vec![path.clone()],
             failures: Vec::new(),
@@ -4331,6 +4683,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.batch_delete_rx = Some(rx);
         tx.send(DeleteJobMsg {
+            cwd: root.clone(),
             target: DeleteTarget::Batch,
             deleted: Vec::new(),
             failures: vec![(path.clone(), String::from("denied"))],

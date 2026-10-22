@@ -32,6 +32,21 @@ struct SizeCacheState {
     invalidations: Vec<CacheInvalidation>,
 }
 
+#[cfg(test)]
+pub(crate) fn state_dir() -> PathBuf {
+    static SESSION: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    SESSION
+        .get_or_init(|| {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            std::env::temp_dir().join(format!("diskr-tests-{}-{stamp}", std::process::id()))
+        })
+        .join(std::thread::current().name().unwrap_or("worker"))
+}
+
+#[cfg(not(test))]
 pub(crate) fn state_dir() -> PathBuf {
     let base = std::env::var_os("HOME")
         .map(PathBuf::from)

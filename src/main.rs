@@ -29,7 +29,7 @@ use std::{
     time::Duration,
 };
 
-use app::{format_elapsed, human, App, Focus};
+use app::{format_elapsed, human, ActiveModal, App, Focus};
 use terminal_backend::CrosstermBackend;
 use terminal_text::SafePath;
 
@@ -919,6 +919,10 @@ fn launch_external_action(app: &mut App, action: ExternalAction) {
         return;
     };
 
+    launch_external_action_at(app, action, path, label);
+}
+
+fn launch_external_action_at(app: &mut App, action: ExternalAction, path: PathBuf, label: String) {
     let result = match action {
         ExternalAction::RevealInFinder => spawn_reveal_in_finder(&path),
         ExternalAction::Open => spawn_open(&path),
@@ -1056,10 +1060,7 @@ where
                         continue;
                     }
                     // Ctrl+C cancels the active mode/modal like Esc in every state.
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        cancel_active_state(app);
+                    if handle_cancel_key(app, &key) {
                         needs_draw = true;
                         continue;
                     }
@@ -1068,7 +1069,7 @@ where
                     if char_modifier_inhibited(&key) {
                         continue;
                     }
-                    if app.show_help {
+                    if app.active_modal() == ActiveModal::Help {
                         let handled = match key.code {
                             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
                                 app.close_help();
@@ -1105,7 +1106,7 @@ where
                         }
                         continue;
                     }
-                    if app.confirming_delete {
+                    if app.active_modal() == ActiveModal::Delete {
                         let handled = match key.code {
                             KeyCode::Char('y') => {
                                 app.confirm_delete()?;
@@ -1122,7 +1123,7 @@ where
                         }
                         continue;
                     }
-                    if app.confirming_uninstall {
+                    if app.active_modal() == ActiveModal::Uninstall {
                         let handled = match key.code {
                             KeyCode::Char('y') => {
                                 app.confirm_uninstall();
@@ -1139,7 +1140,7 @@ where
                         }
                         continue;
                     }
-                    if app.confirming_empty_trash {
+                    if app.active_modal() == ActiveModal::EmptyTrash {
                         let handled = match key.code {
                             KeyCode::Char('y') => {
                                 app.confirm_empty_trash();
@@ -1156,7 +1157,7 @@ where
                         }
                         continue;
                     }
-                    if app.pkg_detail {
+                    if app.active_modal() == ActiveModal::Package {
                         let handled = match key.code {
                             KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
                                 app.close_pkg_detail();
@@ -1179,7 +1180,7 @@ where
                         }
                         continue;
                     }
-                    if app.top_files_open() {
+                    if app.active_modal() == ActiveModal::TopFiles {
                         let handled = match key.code {
                             KeyCode::Esc => {
                                 app.close_top_files();
@@ -1240,7 +1241,7 @@ where
                         }
                         continue;
                     }
-                    if app.reclaim_paths_open() {
+                    if app.active_modal() == ActiveModal::ReclaimPaths {
                         let handled = match key.code {
                             KeyCode::Esc => {
                                 app.close_reclaim_paths();
@@ -1303,7 +1304,7 @@ where
                         }
                         continue;
                     }
-                    if app.disk_info_open() {
+                    if app.active_modal() == ActiveModal::DiskInfo {
                         let handled = match key.code {
                             KeyCode::Esc => {
                                 app.close_disk_info();
@@ -1316,25 +1317,38 @@ where
                         }
                         continue;
                     }
-                    if app.file_info_open {
+                    if app.active_modal() == ActiveModal::FileInfo {
                         let handled = match key.code {
                             KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
                                 app.close_file_info();
                                 true
                             }
                             KeyCode::Char('f') => {
-                                app.close_file_info();
-                                launch_external_action(app, ExternalAction::RevealInFinder);
+                                if let Some((path, label)) = app.file_info_action_target() {
+                                    app.close_file_info();
+                                    launch_external_action_at(
+                                        app,
+                                        ExternalAction::RevealInFinder,
+                                        path,
+                                        label,
+                                    );
+                                }
                                 true
                             }
                             KeyCode::Char('O') => {
-                                app.close_file_info();
-                                launch_external_action(app, ExternalAction::Open);
+                                if let Some((path, label)) = app.file_info_action_target() {
+                                    app.close_file_info();
+                                    launch_external_action_at(
+                                        app,
+                                        ExternalAction::Open,
+                                        path,
+                                        label,
+                                    );
+                                }
                                 true
                             }
                             KeyCode::Char('d') => {
-                                app.close_file_info();
-                                app.request_delete();
+                                app.request_delete_file_info();
                                 true
                             }
                             _ => false,
@@ -1344,7 +1358,7 @@ where
                         }
                         continue;
                     }
-                    if app.input_mode != app::InputMode::None {
+                    if app.active_modal() == ActiveModal::Input {
                         let handled = match key.code {
                             KeyCode::Esc => {
                                 app.exit_input_mode();
@@ -1576,8 +1590,7 @@ where
                             }
                         }
                         KeyCode::Char('p') => {
-                            set_focus(app, Focus::Packages);
-                            app.load_packages();
+                            open_packages(app);
                             true
                         }
                         KeyCode::Char('/') if app.focus == Focus::Files => {
@@ -1678,6 +1691,26 @@ fn focus_next(app: &mut App) {
     set_focus(app, next);
 }
 
+fn open_packages(app: &mut App) {
+    let switch_view = app.focus == Focus::Packages;
+    set_focus(app, Focus::Packages);
+    if switch_view {
+        app.toggle_pkg_view();
+    }
+    app.load_packages();
+}
+
+fn handle_cancel_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
+    if key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        cancel_active_state(app);
+        true
+    } else {
+        false
+    }
+}
+
 fn focus_previous(app: &mut App) {
     let previous = match app.focus {
         Focus::Files => Focus::Reclaim,
@@ -1708,37 +1741,31 @@ fn char_modifier_inhibited(key: &crossterm::event::KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(_)) && key.modifiers.intersects(INHIBIT)
 }
 
-// Cancel whatever active state the app is in, mirroring Esc in each mode.
-// Used by Ctrl+C so it always acts as a safe "get me out of here" chord.
+// Rendering and keyboard dispatch use the same modal priority.
 fn cancel_active_state(app: &mut App) {
-    if app.show_help {
-        app.close_help();
-    } else if app.confirming_delete {
-        app.cancel_delete();
-    } else if app.confirming_uninstall {
-        app.cancel_uninstall();
-    } else if app.confirming_empty_trash {
-        app.cancel_empty_trash();
-    } else if app.pkg_detail {
-        app.close_pkg_detail();
-    } else if app.top_files_open() {
-        app.close_top_files();
-    } else if app.reclaim_paths_open() {
-        app.close_reclaim_paths();
-    } else if app.disk_info_open() {
-        app.close_disk_info();
-    } else if app.file_info_open {
-        app.close_file_info();
-    } else if app.input_mode != app::InputMode::None {
-        app.exit_input_mode();
-    } else if app.search_mode || app.search_filter_active() {
-        app.clear_search();
-    } else if app.pkg_search_mode || app.pkg_filter_active() {
-        app.clear_pkg_search();
-    } else if app.focus != Focus::Files {
-        app.focus = Focus::Files;
+    match app.active_modal() {
+        ActiveModal::Help => app.close_help(),
+        ActiveModal::Delete => app.cancel_delete(),
+        ActiveModal::Uninstall => app.cancel_uninstall(),
+        ActiveModal::EmptyTrash => app.cancel_empty_trash(),
+        ActiveModal::Package => app.close_pkg_detail(),
+        ActiveModal::TopFiles => app.close_top_files(),
+        ActiveModal::ReclaimPaths => app.close_reclaim_paths(),
+        ActiveModal::DiskInfo => app.close_disk_info(),
+        ActiveModal::FileInfo => app.close_file_info(),
+        ActiveModal::Input => app.exit_input_mode(),
+        ActiveModal::None => {
+            if app.focus == Focus::Packages && (app.pkg_search_mode || app.pkg_filter_active()) {
+                app.clear_pkg_search();
+            } else if app.search_mode || app.search_filter_active() {
+                app.clear_search();
+            } else if app.pkg_search_mode || app.pkg_filter_active() {
+                app.clear_pkg_search();
+            } else if app.focus != Focus::Files {
+                app.focus = Focus::Files;
+            }
+        }
     }
-    // In the base Files-focused state Esc is a no-op, so Ctrl+C is too.
 }
 
 fn handle_pkg_search_key(app: &mut App, code: KeyCode) -> bool {
@@ -1790,6 +1817,45 @@ fn handle_pkg_search_key(app: &mut App, code: KeyCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_key_clears_the_active_kept_filter() {
+        let root = test_root("escape_kept_filters");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a"), b"x").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.enter_search();
+        app.search_push('a');
+        app.keep_search();
+        app.focus = Focus::Packages;
+        app.enter_pkg_search();
+        app.pkg_search_push('a');
+        app.keep_pkg_search();
+        let escape = crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(handle_cancel_key(&mut app, &escape));
+        assert!(!app.pkg_filter_active());
+        assert!(app.search_filter_active());
+        app.focus = Focus::Files;
+        assert!(handle_cancel_key(&mut app, &escape));
+        assert!(!app.search_filter_active());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_shortcut_switches_view_only_after_focusing_packages() {
+        let root = test_root("package_shortcut_views");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.packages_loaded = true;
+        open_packages(&mut app);
+        assert_eq!(app.focus, Focus::Packages);
+        assert!(app.pkg_view == app::PkgView::SystemManagers);
+        open_packages(&mut app);
+        assert!(app.pkg_view == app::PkgView::ProjectDeps);
+        open_packages(&mut app);
+        assert!(app.pkg_view == app::PkgView::SystemManagers);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use std::fs;
 
     fn parse(parts: &[&str]) -> Result<CliAction> {
