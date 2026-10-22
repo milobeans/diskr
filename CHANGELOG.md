@@ -6,6 +6,19 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.78] - 2026-10-22
+
+### Fixed
+
+- Package and project footprints retain unreadable-path, skipped-mount and
+  missing-file counts through lists, totals, details and JSON. Reports label
+  directory trees, installed binaries, RECORD files and installer metadata
+  explicitly, and describe totals as known allocation.
+- Package scans retain the selected manager executable and effective roots.
+  Cargo honors configured install roots, Homebrew and Bun report their active
+  locations, and Python sizing follows each distribution's reported location.
+  Uninstall uses the same retained manager and installation scope.
+
 ## [0.1.77] - 2026-10-22
 
 ### Fixed

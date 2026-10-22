@@ -854,6 +854,7 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
                             "version": p.version,
                             "logical": p.size.map(|s| s.logical),
                             "allocated": p.size.map(|s| s.allocated),
+                            "footprint": p.coverage.json(),
                             "path": p.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
                             "metadata_path": p.metadata_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
                             "dependency_evidence": evidence,
@@ -866,9 +867,12 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
                     "manager": r.manager.label(),
                     "available": r.available,
                     "scan_state": r.state.label(),
+                    "environment": r.environment.as_ref().map(|environment| environment.json()),
                     "count": r.packages.len(),
                     "total_logical": r.total_size.logical,
                     "total_allocated": r.total_size.allocated,
+                    "total_basis": "sum of known package footprints",
+                    "size_coverage": {"unknown": r.unknown_sizes(), "partial": r.partial_sizes(), "scope_limited": r.limited_sizes()},
                     "packages": pkgs,
                 });
                 if let Some(w) = &r.warning {
@@ -887,6 +891,7 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
                     "dep_count": d.dep_count,
                     "deps_logical": d.deps_size.map(|s| s.logical),
                     "deps_allocated": d.deps_size.map(|s| s.allocated),
+                    "footprint": d.coverage.json(),
                 })
             })
             .collect();
@@ -919,16 +924,14 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
         }
         any_manager = true;
         cli_println!(
-            "{}: {} packages · {} · {}{}",
+            "{}: {} packages · {} · {} known allocated · {} unknown, {} partial, {} scoped footprints",
             report.manager.label(),
             report.packages.len(),
             report.state.label(),
             human(report.total_size.allocated),
-            if report.warning.is_some() {
-                " known allocated (incomplete)"
-            } else {
-                ""
-            }
+            report.unknown_sizes(),
+            report.partial_sizes(),
+            report.limited_sizes(),
         );
         if let Some(w) = &report.warning {
             cli_println!("  Warning: {}", terminal_text::sanitize(w));
@@ -942,13 +945,20 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
         for pkg in sorted.iter().take(10) {
             let size_str = pkg
                 .size
-                .map(|s| human(s.allocated))
+                .map(|s| {
+                    format!(
+                        "{}{}",
+                        if pkg.coverage.is_partial() { "≥" } else { "" },
+                        human(s.allocated)
+                    )
+                })
                 .unwrap_or_else(|| String::from("?"));
             cli_println!(
-                "  {:>10}  {} {}",
+                "  {:>10}  {} {} [{}]",
                 size_str,
                 terminal_text::sanitize(&pkg.name),
-                terminal_text::sanitize(&pkg.version)
+                terminal_text::sanitize(&pkg.version),
+                pkg.coverage.summary(),
             );
         }
         if report.packages.len() > 10 {
@@ -975,14 +985,21 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
         for dep in project_deps {
             let size_str = dep
                 .deps_size
-                .map(|s| human(s.allocated))
+                .map(|s| {
+                    format!(
+                        "{}{}",
+                        if dep.coverage.is_partial() { "≥" } else { "" },
+                        human(s.allocated)
+                    )
+                })
                 .unwrap_or_else(|| String::from("—"));
             cli_println!(
-                "  {:>10}  {} ({}, {} deps)",
+                "  {:>10}  {} ({}, {} deps) [{}]",
                 size_str,
                 SafePath(&dep.path),
                 dep.manager_label,
-                dep.dep_count
+                dep.dep_count,
+                dep.coverage.summary(),
             );
         }
     }
@@ -2327,11 +2344,13 @@ mod tests {
                 size: None,
                 path: Some(pkg_path.clone()),
                 metadata_path: None,
+                coverage: Default::default(),
             }],
             total_size: crate::bulkstat::SizeInfo::default(),
             available: true,
             warning: None,
             state: packages::ManagerScanState::Complete,
+            environment: None,
         }];
         app.project_deps = vec![packages::ProjectDeps {
             path: root.clone(),
@@ -2340,6 +2359,7 @@ mod tests {
             dep_count: 3,
             deps_size: None,
             deps_dir: Some(root.join("target")),
+            coverage: Default::default(),
         }];
         app.packages_loaded = true;
         app.rebuild_flat_packages();
@@ -2461,6 +2481,7 @@ mod tests {
                     size: Some(crate::bulkstat::SizeInfo::new(30, 30)),
                     path: None,
                     metadata_path: None,
+                    coverage: Default::default(),
                 },
                 packages::Package {
                     name: String::from("kubectl"),
@@ -2468,6 +2489,7 @@ mod tests {
                     size: Some(crate::bulkstat::SizeInfo::new(20, 20)),
                     path: None,
                     metadata_path: None,
+                    coverage: Default::default(),
                 },
                 packages::Package {
                     name: String::from("alpha"),
@@ -2475,12 +2497,14 @@ mod tests {
                     size: Some(crate::bulkstat::SizeInfo::new(10, 10)),
                     path: None,
                     metadata_path: None,
+                    coverage: Default::default(),
                 },
             ],
             total_size: crate::bulkstat::SizeInfo::new(60, 60),
             available: true,
             warning: None,
             state: packages::ManagerScanState::Complete,
+            environment: None,
         }];
         app.rebuild_flat_packages();
 

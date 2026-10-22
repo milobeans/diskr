@@ -19,6 +19,120 @@ pub struct Package {
     pub size: Option<SizeInfo>,
     pub path: Option<PathBuf>,
     pub metadata_path: Option<PathBuf>,
+    pub coverage: FootprintCoverage,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FootprintBasis {
+    #[default]
+    Unknown,
+    Tree,
+    AppAndMetadata,
+    InstallerMetadata,
+    KnownBinaries,
+    RecordFiles,
+}
+
+impl FootprintBasis {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Tree => "directory tree",
+            Self::AppAndMetadata => "app and manager metadata",
+            Self::InstallerMetadata => "installer metadata only",
+            Self::KnownBinaries => "known installed binaries",
+            Self::RecordFiles => "RECORD-listed files",
+        }
+    }
+
+    pub fn is_limited(self) -> bool {
+        matches!(
+            self,
+            Self::Unknown | Self::InstallerMetadata | Self::KnownBinaries | Self::RecordFiles
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FootprintCoverage {
+    pub basis: FootprintBasis,
+    pub inaccessible: u32,
+    pub skipped_mounts: u32,
+    pub missing_files: u32,
+}
+
+impl FootprintCoverage {
+    fn new(basis: FootprintBasis) -> Self {
+        Self {
+            basis,
+            ..Self::default()
+        }
+    }
+
+    fn add_scan(&mut self, scan: &bulkstat::DirScan) {
+        self.inaccessible = self.inaccessible.saturating_add(scan.inaccessible);
+        self.skipped_mounts = self.skipped_mounts.saturating_add(scan.skipped_mounts);
+    }
+
+    pub fn is_partial(self) -> bool {
+        self.inaccessible > 0 || self.skipped_mounts > 0 || self.missing_files > 0
+    }
+
+    pub fn json(self) -> serde_json::Value {
+        serde_json::json!({
+            "basis": self.basis.label(),
+            "scope_limited": self.basis.is_limited(),
+            "partial": self.is_partial(),
+            "inaccessible": self.inaccessible,
+            "skipped_mounts": self.skipped_mounts,
+            "missing_files": self.missing_files,
+        })
+    }
+
+    pub fn summary(self) -> String {
+        format!(
+            "{} · {} unreadable · {} mounts skipped · {} missing",
+            self.basis.label(),
+            self.inaccessible,
+            self.skipped_mounts,
+            self.missing_files
+        )
+    }
+}
+
+fn tree_footprint(
+    path: Option<&Path>,
+    scope: Option<&bulkstat::ScanScope>,
+) -> (Option<SizeInfo>, FootprintCoverage) {
+    let mut coverage = FootprintCoverage::new(FootprintBasis::Tree);
+    let Some(path) = path else {
+        coverage.missing_files = 1;
+        return (None, coverage);
+    };
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            coverage.inaccessible = 1;
+            return (None, coverage);
+        }
+        _ => {
+            coverage.missing_files = 1;
+            return (None, coverage);
+        }
+    }
+    let scan = match scope {
+        Some(scope) => {
+            bulkstat::scan_dir_in_scope(path, 0, &bulkstat::ScanCancellation::never(), Some(scope))
+        }
+        None => Some(bulkstat::scan_dir(path, 0)),
+    };
+    if let Some(scan) = scan {
+        coverage.add_scan(&scan);
+        (Some(scan.size), coverage)
+    } else {
+        coverage.inaccessible = 1;
+        (None, coverage)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -223,6 +337,110 @@ pub struct ManagerReport {
     pub available: bool,
     pub warning: Option<String>,
     pub state: ManagerScanState,
+    pub environment: Option<ManagerEnvironment>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ManagerEnvironment {
+    pub executable: PathBuf,
+    pub prefix_args: Vec<String>,
+    pub install_root: Option<PathBuf>,
+    pub package_roots: Vec<PathBuf>,
+    cwd: PathBuf,
+    manager: Manager,
+}
+
+impl ManagerEnvironment {
+    fn discover(manager: Manager) -> Option<Self> {
+        let (command, prefix_args) = if manager == Manager::Pip {
+            match pip_command()? {
+                PipCommand::Pip3 => ("pip3", Vec::new()),
+                PipCommand::Python3Module => {
+                    ("python3", vec![String::from("-m"), String::from("pip")])
+                }
+            }
+        } else {
+            (manager.command(), Vec::new())
+        };
+        Some(Self {
+            executable: command_path(command)?,
+            prefix_args,
+            install_root: None,
+            package_roots: Vec::new(),
+            cwd: std::env::current_dir().ok()?,
+            manager,
+        })
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(&self.executable);
+        command
+            .args(&self.prefix_args)
+            .args(args)
+            .current_dir(&self.cwd);
+        command.env("NO_COLOR", "1");
+        if matches!(self.manager, Manager::Brew | Manager::BrewCask) {
+            command.env("HOMEBREW_NO_AUTO_UPDATE", "1");
+        }
+        if self.manager == Manager::Bun {
+            if let Some(root) = &self.install_root {
+                command.env("BUN_INSTALL_GLOBAL_DIR", root);
+            }
+        }
+        command
+    }
+
+    fn run(&self, args: &[&str], timeout: Duration) -> CommandResult {
+        run_process(self.command(args), timeout)
+    }
+
+    fn query_path(&self, args: &[&str]) -> Result<PathBuf, String> {
+        let output = self.run(args, CMD_TIMEOUT);
+        if let Some(warning) = cmd_warning(&output, self.manager.label()) {
+            return Err(warning);
+        }
+        let value = output.stdout.trim();
+        let path = PathBuf::from(value);
+        if value.is_empty() || value.lines().count() != 1 || !path.is_absolute() {
+            return Err(format!(
+                "{}: installation path unavailable",
+                self.manager.label()
+            ));
+        }
+        Ok(path)
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "executable": self.executable.to_string_lossy(),
+            "prefix_args": self.prefix_args,
+            "install_root": self.install_root.as_ref().map(|path| path.to_string_lossy()),
+            "package_roots": self.package_roots.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+        })
+    }
+}
+
+impl ManagerReport {
+    pub fn unknown_sizes(&self) -> usize {
+        self.packages
+            .iter()
+            .filter(|package| package.size.is_none())
+            .count()
+    }
+
+    pub fn partial_sizes(&self) -> usize {
+        self.packages
+            .iter()
+            .filter(|package| package.coverage.is_partial())
+            .count()
+    }
+
+    pub fn limited_sizes(&self) -> usize {
+        self.packages
+            .iter()
+            .filter(|package| package.coverage.basis.is_limited())
+            .count()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,6 +505,7 @@ pub struct ProjectDeps {
     pub dep_count: usize,
     pub deps_size: Option<SizeInfo>,
     pub deps_dir: Option<PathBuf>,
+    pub coverage: FootprintCoverage,
 }
 
 pub struct ProjectDepsReport {
@@ -310,6 +529,7 @@ pub fn scan_managers() -> Vec<ManagerReport> {
             available: false,
             warning: Some("scan thread panicked".into()),
             state: ManagerScanState::Failed,
+            environment: None,
         });
         reports[index] = Some(report);
     }
@@ -331,11 +551,22 @@ pub fn scan_dep_graph(reports: &[ManagerReport]) -> DepGraph {
                 .collect()
         })
         .unwrap_or_default();
+    let brew_environment = reports
+        .iter()
+        .find(|report| report.manager == Manager::Brew)
+        .and_then(|report| report.environment.clone());
     let brew_handle = thread::spawn(move || {
-        if !brew_names.is_empty() && command_exists("brew") {
-            scan_brew_dep_graph(&brew_names)
-        } else {
+        if brew_names.is_empty() {
             (HashMap::new(), None)
+        } else if let Some(environment) = brew_environment {
+            scan_brew_dep_graph(&brew_names, &environment)
+        } else {
+            (
+                HashMap::new(),
+                Some(String::from(
+                    "brew dependency environment unavailable; rescan packages",
+                )),
+            )
         }
     });
 
@@ -344,11 +575,22 @@ pub fn scan_dep_graph(reports: &[ManagerReport]) -> DepGraph {
         .find(|r| r.manager == Manager::Pip && r.available)
         .map(|r| r.packages.iter().map(|p| p.name.clone()).collect())
         .unwrap_or_default();
+    let pip_environment = reports
+        .iter()
+        .find(|report| report.manager == Manager::Pip)
+        .and_then(|report| report.environment.clone());
     let pip_handle = thread::spawn(move || {
-        if pip_names.is_empty() || pip_command().is_none() {
+        if pip_names.is_empty() {
             (HashMap::new(), None)
+        } else if let Some(environment) = pip_environment {
+            scan_pip_dep_graph(&pip_names, &environment)
         } else {
-            scan_pip_dep_graph(&pip_names)
+            (
+                HashMap::new(),
+                Some(String::from(
+                    "pip dependency environment unavailable; rescan packages",
+                )),
+            )
         }
     });
 
@@ -403,8 +645,11 @@ fn package_dep_info(
     }
 }
 
-fn scan_brew_dep_graph(names: &[String]) -> (HashMap<String, DepInfo>, Option<String>) {
-    let result = run_command("brew", &["deps", "--installed", "--for-each"]);
+fn scan_brew_dep_graph(
+    names: &[String],
+    environment: &ManagerEnvironment,
+) -> (HashMap<String, DepInfo>, Option<String>) {
+    let result = environment.run(&["deps", "--installed", "--for-each"], CMD_TIMEOUT);
     brew_graph_from_result(&result, names)
 }
 
@@ -484,12 +729,15 @@ fn parse_brew_dep_graph(output: &str) -> HashMap<String, DepInfo> {
     result
 }
 
-fn scan_pip_dep_graph(names: &[String]) -> (HashMap<String, DepInfo>, Option<String>) {
+fn scan_pip_dep_graph(
+    names: &[String],
+    environment: &ManagerEnvironment,
+) -> (HashMap<String, DepInfo>, Option<String>) {
     let mut args: Vec<&str> = vec!["show"];
     for name in names {
         args.push(name);
     }
-    let result = run_pip_command(&args);
+    let result = environment.run(&args, CMD_TIMEOUT);
     pip_graph_from_result(&result, names)
 }
 
@@ -594,14 +842,16 @@ fn parse_pip_show_output(output: &str) -> HashMap<String, DepInfo> {
     result
 }
 
-pub fn run_uninstall(manager: Manager, name: &str) -> Result<String, String> {
-    let (cmd, args) = manager.uninstall_args(name);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let result = run_command_with_timeout(cmd, &arg_refs, UNINSTALL_TIMEOUT);
+pub fn run_uninstall(
+    manager: Manager,
+    name: &str,
+    environment: Option<&ManagerEnvironment>,
+) -> Result<String, String> {
+    let command = uninstall_command(manager, name, environment)?;
+    let result = run_process(command, UNINSTALL_TIMEOUT);
+    let cmd = manager.label();
     if result.timed_out {
-        Err(format!(
-            "{cmd} timed out after 5 minutes; installation state may have changed, so rescan before retrying"
-        ))
+        Err(format!("{cmd} timed out after 5 minutes; installation state may have changed, so rescan before retrying"))
     } else if result.success {
         Ok(result.stdout.trim().to_string())
     } else {
@@ -614,13 +864,46 @@ pub fn run_uninstall(manager: Manager, name: &str) -> Result<String, String> {
     }
 }
 
-fn scan_manager(manager: Manager) -> ManagerReport {
-    let available = if manager == Manager::Pip {
-        pip_command().is_some()
+fn uninstall_command(
+    manager: Manager,
+    name: &str,
+    environment: Option<&ManagerEnvironment>,
+) -> Result<Command, String> {
+    let environment = environment
+        .filter(|environment| environment.manager == manager)
+        .ok_or_else(|| {
+            String::from("package environment unavailable; rescan before uninstalling")
+        })?;
+    let args = if manager == Manager::Pip {
+        vec![
+            String::from("uninstall"),
+            String::from("-y"),
+            name.to_string(),
+        ]
     } else {
-        command_exists(manager.command())
+        manager.uninstall_args(name).1
     };
-    if !available {
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut command = environment.command(&arg_refs);
+    if matches!(manager, Manager::Cargo | Manager::Npm | Manager::Bun) {
+        let root = environment.install_root.as_ref().ok_or_else(|| {
+            String::from("package install root unavailable; rescan before uninstalling")
+        })?;
+        match manager {
+            Manager::Cargo => {
+                command.arg("--root").arg(root);
+            }
+            Manager::Npm => {
+                command.arg("--prefix").arg(root);
+            }
+            _ => {}
+        }
+    }
+    Ok(command)
+}
+
+fn scan_manager(manager: Manager) -> ManagerReport {
+    let Some(mut environment) = ManagerEnvironment::discover(manager) else {
         return ManagerReport {
             manager,
             packages: Vec::new(),
@@ -628,19 +911,20 @@ fn scan_manager(manager: Manager) -> ManagerReport {
             available: false,
             warning: None,
             state: ManagerScanState::Absent,
+            environment: None,
         };
-    }
+    };
 
     let (packages, warning, parse_failed) = match manager {
         Manager::Brew => {
-            let (packages, warning) = scan_brew_formulae();
+            let (packages, warning) = scan_brew_formulae(&mut environment);
             (packages, warning, false)
         }
-        Manager::BrewCask => scan_brew_casks(),
-        Manager::Npm => scan_npm_global(),
-        Manager::Pip => scan_pip(),
-        Manager::Cargo => scan_cargo(),
-        Manager::Bun => scan_bun_global(),
+        Manager::BrewCask => scan_brew_casks(&mut environment),
+        Manager::Npm => scan_npm_global(&mut environment),
+        Manager::Pip => scan_pip(&mut environment),
+        Manager::Cargo => scan_cargo(&mut environment),
+        Manager::Bun => scan_bun_global(&mut environment),
     };
 
     let mut total_size = SizeInfo::default();
@@ -659,6 +943,7 @@ fn scan_manager(manager: Manager) -> ManagerReport {
         available: true,
         warning,
         state,
+        environment: Some(environment),
     }
 }
 
@@ -684,18 +969,27 @@ fn add_warning(existing: Option<String>, detail: impl AsRef<str>) -> Option<Stri
     })
 }
 
-fn scan_brew_formulae() -> (Vec<Package>, Option<String>) {
-    let cellar = brew_prefix().join("Cellar");
+fn scan_brew_formulae(environment: &mut ManagerEnvironment) -> (Vec<Package>, Option<String>) {
+    let cellar = match environment.query_path(&["--cellar"]) {
+        Ok(path) => path,
+        Err(error) => return (Vec::new(), Some(error)),
+    };
+    environment.install_root = environment.query_path(&["--prefix"]).ok();
+    environment.package_roots = vec![cellar.clone()];
     scan_brew_dir(&cellar)
 }
 
-fn scan_brew_casks() -> (Vec<Package>, Option<String>, bool) {
-    let result = run_command_with_timeout(
-        "brew",
+fn scan_brew_casks(environment: &mut ManagerEnvironment) -> (Vec<Package>, Option<String>, bool) {
+    let caskroom = match environment.query_path(&["--caskroom"]) {
+        Ok(path) => path,
+        Err(error) => return (Vec::new(), Some(error), false),
+    };
+    environment.install_root = environment.query_path(&["--prefix"]).ok();
+    environment.package_roots = vec![caskroom.clone()];
+    let result = environment.run(
         &["info", "--cask", "--json=v2", "--installed"],
         CMD_TIMEOUT_SLOW,
     );
-    let caskroom = brew_prefix().join("Caskroom");
     brew_casks_from_result(&result, &caskroom)
 }
 
@@ -792,9 +1086,17 @@ fn parse_brew_cask_json_with_app_roots(
         }
 
         let pkg_path = caskroom.join(&token);
-        let mut size = if pkg_path.is_dir() {
-            bulkstat::scan_dir(&pkg_path, 0).size
+        let mut coverage = FootprintCoverage::new(if is_installer_based {
+            FootprintBasis::InstallerMetadata
         } else {
+            FootprintBasis::AppAndMetadata
+        });
+        let mut size = if pkg_path.is_dir() {
+            let scan = bulkstat::scan_dir(&pkg_path, 0);
+            coverage.add_scan(&scan);
+            scan.size
+        } else {
+            coverage.missing_files = 1;
             SizeInfo::default()
         };
         let mut primary_app_path = None;
@@ -802,12 +1104,16 @@ fn parse_brew_cask_json_with_app_roots(
         if !is_installer_based {
             for app_name in &app_names {
                 if let Some(app_path) = find_cask_app_path(app_name, app_roots) {
-                    let app_size = bulkstat::scan_dir(&app_path, 0).size;
+                    let scan = bulkstat::scan_dir(&app_path, 0);
+                    coverage.add_scan(&scan);
+                    let app_size = scan.size;
                     size.logical = size.logical.saturating_add(app_size.logical);
                     size.allocated = size.allocated.saturating_add(app_size.allocated);
                     if primary_app_path.is_none() && app_path != pkg_path {
                         primary_app_path = Some(app_path);
                     }
+                } else {
+                    coverage.missing_files = coverage.missing_files.saturating_add(1);
                 }
             }
         }
@@ -825,6 +1131,7 @@ fn parse_brew_cask_json_with_app_roots(
             size: Some(size),
             path: Some(action_path),
             metadata_path,
+            coverage,
         })
     })
     .into_iter()
@@ -873,13 +1180,17 @@ fn scan_brew_dir(install_dir: &Path) -> (Vec<Package>, Option<String>) {
 
     let packages = pool::par_map(entries, |(name, pkg_path)| {
         let version = latest_subdir_name(&pkg_path);
-        let size = Some(bulkstat::scan_dir(&pkg_path, 0).size);
+        let scan = bulkstat::scan_dir(&pkg_path, 0);
+        let mut coverage = FootprintCoverage::new(FootprintBasis::Tree);
+        coverage.add_scan(&scan);
+        let size = Some(scan.size);
         Package {
             name,
             version,
             size,
             path: Some(pkg_path),
             metadata_path: None,
+            coverage,
         }
     });
     let warning = (errors > 0).then(|| format!("brew cellar: {errors} entries unreadable"));
@@ -898,10 +1209,20 @@ fn latest_subdir_name(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn scan_npm_global() -> (Vec<Package>, Option<String>, bool) {
-    let result = run_command("npm", &["list", "-g", "--depth=0", "--json"]);
-    let global_root = find_npm_global_root();
-    npm_inventory_from_result(&result, global_root.as_deref())
+fn scan_npm_global(environment: &mut ManagerEnvironment) -> (Vec<Package>, Option<String>, bool) {
+    let result = environment.run(&["list", "-g", "--depth=0", "--json"], CMD_TIMEOUT);
+    let global_root = environment.query_path(&["root", "-g"]).ok();
+    environment.install_root = environment.query_path(&["prefix", "-g"]).ok();
+    environment.package_roots = global_root.iter().cloned().collect();
+    let (packages, mut warning, parse_failed) =
+        npm_inventory_from_result(&result, global_root.as_deref());
+    if environment.install_root.is_none() && !packages.is_empty() {
+        warning = add_warning(
+            warning,
+            "npm: install prefix unavailable; uninstall requires a rescan",
+        );
+    }
+    (packages, warning, parse_failed)
 }
 
 fn npm_inventory_from_result(
@@ -979,95 +1300,25 @@ fn npm_inventory_from_result(
 
     let packages = pool::par_map(entries, |(name, version)| {
         let pkg_path = global_root.as_ref().map(|root| root.join(&name));
-        let size = pkg_path
-            .as_ref()
-            .filter(|path| path.is_dir())
-            .map(|path| bulkstat::scan_dir(path, 0).size);
+        let (size, coverage) = tree_footprint(pkg_path.as_deref(), None);
         Package {
             name,
             version,
             size,
-            path: pkg_path.filter(|path| path.is_dir()),
+            path: pkg_path.filter(|_| size.is_some()),
             metadata_path: None,
+            coverage,
         }
     });
     (packages, warning, malformed > 0)
 }
 
-fn find_npm_global_root() -> Option<PathBuf> {
-    let known_root = if cfg!(target_arch = "aarch64") {
-        Some(PathBuf::from("/opt/homebrew/lib/node_modules"))
-    } else {
-        Some(PathBuf::from("/usr/local/lib/node_modules"))
-    };
-    find_npm_global_root_with(
-        |cmd, args| run_command(cmd, args).stdout,
-        std::env::var_os("HOME").map(PathBuf::from),
-        std::env::var_os("NVM_DIR").map(PathBuf::from),
-        known_root,
-    )
-}
-
-fn find_npm_global_root_with<F>(
-    mut run: F,
-    home: Option<PathBuf>,
-    nvm_dir: Option<PathBuf>,
-    known_root: Option<PathBuf>,
-) -> Option<PathBuf>
-where
-    F: FnMut(&str, &[&str]) -> String,
-{
-    let active_root = run("npm", &["root", "-g"]);
-    let active_root = active_root.trim();
-    if !active_root.is_empty() {
-        return Some(PathBuf::from(active_root));
-    }
-
-    if let Some(root) = nvm_dir
-        .as_ref()
-        .map(|dir| dir.join("versions/node"))
-        .and_then(|dir| single_version_node_modules_root(&dir, Path::new("lib/node_modules")))
-    {
-        return Some(root);
-    }
-
-    if let Some(root) = home
-        .as_ref()
-        .map(|home| home.join(".local/share/fnm/node-versions"))
-        .and_then(|dir| {
-            single_version_node_modules_root(&dir, Path::new("installation/lib/node_modules"))
-        })
-    {
-        return Some(root);
-    }
-
-    known_root.filter(|path| path.is_dir())
-}
-
-fn single_version_node_modules_root(base: &Path, suffix: &Path) -> Option<PathBuf> {
-    let mut roots = std::fs::read_dir(base)
-        .ok()?
-        .flatten()
-        .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-        .map(|entry| entry.path().join(suffix))
-        .filter(|path| path.is_dir());
-    let first = roots.next()?;
-    if roots.next().is_some() {
-        return None;
-    }
-    Some(first)
-}
-
-fn scan_pip() -> (Vec<Package>, Option<String>, bool) {
-    // Resolve the pip interpreter once so the package list and the
-    // site-packages lookup come from the *same* Python. Deriving the list from
-    // pip3 but site-packages from a different python3 (the previous behavior)
-    // mismatched sizes on Homebrew/CLT/pyenv splits.
-    let Some(cmd) = pip_command() else {
-        return (Vec::new(), Some(String::from("pip: not found")), false);
-    };
-    let result = run_pip_command_with(cmd, &["list", "--format=json"]);
-    let site_packages = find_pip_site_packages(cmd);
+fn scan_pip(environment: &mut ManagerEnvironment) -> (Vec<Package>, Option<String>, bool) {
+    // Verbose JSON identifies each distribution's actual location, including
+    // custom user bases and virtual environments, without guessing roots.
+    let result = environment.run(&["list", "--format=json", "--verbose"], CMD_TIMEOUT);
+    let site_packages = pip_locations(&result.stdout);
+    environment.package_roots = site_packages.clone();
     pip_inventory_from_result(&result, &site_packages)
 }
 
@@ -1134,7 +1385,12 @@ fn pip_inventory_from_result(
                 .as_str()
                 .filter(|version| !version.is_empty())?
                 .to_string();
-            Some((name, version))
+            let location = entry
+                .get("location")
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute());
+            Some((name, version, location))
         })
         .collect();
     let malformed = arr.len().saturating_sub(entries.len());
@@ -1145,9 +1401,22 @@ fn pip_inventory_from_result(
         );
     }
 
-    let measured = pool::par_map(entries, |(name, version)| {
-        let (size, path, problems) =
-            find_pip_package_size_and_path_in_indexes(&indexes, &name, &version);
+    let measured = pool::par_map(entries, |(name, version, location)| {
+        let (size, path, problems) = if let Some(index) = location
+            .as_ref()
+            .and_then(|location| indexes.iter().find(|index| &index.root == location))
+        {
+            find_pip_package_size_and_path_in_indexes(std::slice::from_ref(index), &name, &version)
+        } else {
+            (
+                None,
+                None,
+                PipRecordProblems {
+                    unreadable_manifests: 1,
+                    ..Default::default()
+                },
+            )
+        };
         (
             Package {
                 name,
@@ -1155,6 +1424,16 @@ fn pip_inventory_from_result(
                 size,
                 path,
                 metadata_path: None,
+                coverage: FootprintCoverage {
+                    basis: FootprintBasis::RecordFiles,
+                    inaccessible: problems
+                        .unreadable_files
+                        .saturating_add(problems.unreadable_manifests),
+                    missing_files: problems
+                        .missing_files
+                        .saturating_add(u32::from(size.is_none())),
+                    skipped_mounts: 0,
+                },
             },
             problems,
         )
@@ -1177,11 +1456,17 @@ fn pip_inventory_from_result(
     (packages, warning, malformed > 0)
 }
 
-fn scan_cargo() -> (Vec<Package>, Option<String>, bool) {
-    let result = run_command("cargo", &["install", "--list"]);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let cargo_bin = home.as_ref().map(|h| h.join(".cargo/bin"));
-    cargo_inventory_from_result(&result, cargo_bin.as_deref())
+fn scan_cargo(environment: &mut ManagerEnvironment) -> (Vec<Package>, Option<String>, bool) {
+    let root = match cargo_install_root() {
+        Ok(root) => root,
+        Err(error) => return (Vec::new(), Some(error), false),
+    };
+    environment.install_root = Some(root.clone());
+    environment.package_roots = vec![root.join("bin")];
+    let mut command = environment.command(&["install", "--list", "--root"]);
+    command.arg(&root);
+    let result = run_process(command, CMD_TIMEOUT);
+    cargo_inventory_from_result(&result, Some(&root.join("bin")))
 }
 
 fn cargo_inventory_from_result(
@@ -1217,24 +1502,30 @@ fn cargo_inventory_from_result(
         let mut size = SizeInfo::default();
         let mut path = None;
         let mut has_bin = false;
+        let mut coverage = FootprintCoverage::new(FootprintBasis::KnownBinaries);
 
         if let Some(bin_dir) = cargo_bin {
             for bin in bins.iter() {
                 let bin_path = bin_dir.join(bin);
-                if !bin_path.exists() {
-                    continue;
-                }
-                if path.is_none() {
-                    path = Some(bin_path.clone());
-                }
-                if let Ok(meta) = std::fs::symlink_metadata(&bin_path) {
-                    size.logical = size.logical.saturating_add(meta.len());
-                    size.allocated = size
-                        .allocated
-                        .saturating_add(allocated_size_from_metadata(&meta));
-                    has_bin = true;
+                match std::fs::symlink_metadata(&bin_path) {
+                    Ok(meta) => {
+                        if path.is_none() {
+                            path = Some(bin_path.clone());
+                        }
+                        size.logical = size.logical.saturating_add(meta.len());
+                        size.allocated = size
+                            .allocated
+                            .saturating_add(allocated_size_from_metadata(&meta));
+                        has_bin = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        coverage.missing_files = coverage.missing_files.saturating_add(1)
+                    }
+                    Err(_) => coverage.inaccessible = coverage.inaccessible.saturating_add(1),
                 }
             }
+        } else {
+            coverage.missing_files = bins.len().max(1).min(u32::MAX as usize) as u32;
         }
 
         packages.push(Package {
@@ -1243,6 +1534,7 @@ fn cargo_inventory_from_result(
             size: if has_bin { Some(size) } else { None },
             path,
             metadata_path: None,
+            coverage,
         });
     };
 
@@ -1303,13 +1595,37 @@ fn cargo_inventory_from_result(
     (packages, warning, malformed > 0)
 }
 
-fn scan_bun_global() -> (Vec<Package>, Option<String>, bool) {
-    let result = run_command("bun", &["pm", "ls", "-g"]);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let bun_global = home
+fn scan_bun_global(environment: &mut ManagerEnvironment) -> (Vec<Package>, Option<String>, bool) {
+    let result = environment.run(&["pm", "ls", "-g"], CMD_TIMEOUT);
+    environment.install_root = bun_root_from_output(&result.stdout);
+    let package_root = environment
+        .install_root
         .as_ref()
-        .map(|h| h.join(".bun/install/global/node_modules"));
-    bun_inventory_from_result(&result, bun_global.as_deref())
+        .map(|root| root.join("node_modules"));
+    environment.package_roots = package_root.iter().cloned().collect();
+    bun_inventory_from_result(&result, package_root.as_deref())
+}
+
+fn bun_root_from_output(output: &str) -> Option<PathBuf> {
+    output.lines().find_map(|line| {
+        let (root, suffix) = line.trim().rsplit_once(" node_modules")?;
+        let root = PathBuf::from(root);
+        (root.is_absolute() && (suffix.is_empty() || suffix.starts_with(" ("))).then_some(root)
+    })
+}
+
+fn pip_locations(output: &str) -> Vec<PathBuf> {
+    let Ok(serde_json::Value::Array(entries)) = serde_json::from_str(output) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let root = PathBuf::from(entry.get("location")?.as_str()?);
+            (root.is_absolute() && seen.insert(root.clone())).then_some(root)
+        })
+        .collect()
 }
 
 fn bun_inventory_from_result(
@@ -1327,7 +1643,7 @@ fn bun_inventory_from_result(
         .lines()
         .filter_map(|line| {
             let line = line.trim();
-            if line.is_empty() || !line.contains('@') {
+            if line.is_empty() || !line.contains('@') || line.contains(" node_modules") {
                 return None;
             }
             let cleaned = line.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '@');
@@ -1358,22 +1674,16 @@ fn bun_inventory_from_result(
     }
 
     let packages = pool::par_map(entries, |(name, version)| {
-        let (size, path) = if let Some(global_dir) = &bun_global {
-            let pkg_path = global_dir.join(&name);
-            if pkg_path.is_dir() {
-                (Some(bulkstat::scan_dir(&pkg_path, 0).size), Some(pkg_path))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
+        let path = bun_global.map(|root| root.join(&name));
+        let (size, coverage) = tree_footprint(path.as_deref(), None);
+        let path = path.filter(|_| size.is_some());
         Package {
             name,
             version,
             size,
             path,
             metadata_path: None,
+            coverage,
         }
     });
     (packages, warning, malformed > 0)
@@ -1549,21 +1859,13 @@ fn scan_project_dir(
             .iter()
             .map(|manifest| count_manifest_deps(dir, manifest))
             .sum();
-        let (deps_size, deps_dir) = match group.deps_path {
-            Some(deps_path) if deps_path.is_dir() => (
-                Some(
-                    bulkstat::scan_dir_in_scope(
-                        &deps_path,
-                        0,
-                        &bulkstat::ScanCancellation::never(),
-                        scope.map(|s| s.fresh()).as_ref(),
-                    )
-                    .unwrap_or_default()
-                    .size,
-                ),
-                Some(deps_path),
-            ),
-            _ => (None, None),
+        let (deps_size, deps_dir, coverage) = match group.deps_path {
+            Some(deps_path) => {
+                let (size, coverage) =
+                    tree_footprint(Some(&deps_path), scope.map(|scope| scope.fresh()).as_ref());
+                (size, size.map(|_| deps_path), coverage)
+            }
+            None => (None, None, FootprintCoverage::default()),
         };
         ProjectDeps {
             path: dir.to_path_buf(),
@@ -1572,6 +1874,7 @@ fn scan_project_dir(
             dep_count,
             deps_size,
             deps_dir,
+            coverage,
         }
     });
 
@@ -1772,11 +2075,143 @@ fn count_composer_deps(content: &str) -> usize {
 }
 
 fn command_exists(cmd: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
+    command_path(cmd).is_some()
+}
 
-    std::env::split_paths(&paths).any(|dir| is_executable(dir.join(cmd)))
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+fn bounded_text(path: &Path) -> Result<String, String> {
+    use io::Read;
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut text = String::new();
+    file.take(MAX_MANIFEST_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| error.to_string())?;
+    if text.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(String::from("file exceeds 1 MiB parser limit"));
+    }
+    Ok(text)
+}
+
+fn cargo_install_root() -> Result<PathBuf, String> {
+    cargo_install_root_with(
+        &std::env::current_dir().map_err(|error| error.to_string())?,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        std::env::var_os("CARGO_HOME").map(PathBuf::from).as_deref(),
+        std::env::var_os("CARGO_INSTALL_ROOT")
+            .map(PathBuf::from)
+            .as_deref(),
+    )
+}
+
+fn absolute_from(path: &Path, base: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+fn cargo_install_root_with(
+    cwd: &Path,
+    home: Option<&Path>,
+    cargo_home: Option<&Path>,
+    install_root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if let Some(root) = install_root.filter(|root| !root.as_os_str().is_empty()) {
+        return Ok(absolute_from(root, cwd));
+    }
+    let cargo_home = cargo_home
+        .filter(|root| !root.as_os_str().is_empty())
+        .map(|root| absolute_from(root, cwd))
+        .or_else(|| home.map(|home| home.join(".cargo")))
+        .ok_or_else(|| String::from("cargo: install root unavailable"))?;
+    let legacy = cargo_home.join("config");
+    let config = match std::fs::symlink_metadata(&legacy) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => cargo_home.join("config.toml"),
+        _ => legacy,
+    };
+    let root = cargo_config_install_root(&config, &mut HashSet::new(), 0)?;
+    Ok(root.unwrap_or(cargo_home))
+}
+
+fn cargo_config_install_root(
+    path: &Path,
+    visiting: &mut HashSet<PathBuf>,
+    depth: usize,
+) -> Result<Option<PathBuf>, String> {
+    if depth > 8 || !visiting.insert(path.to_path_buf()) {
+        return Err(String::from(
+            "cargo: cyclic or excessively nested config includes",
+        ));
+    }
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            visiting.remove(path);
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("cargo config unavailable: {error}")),
+        _ => {}
+    }
+    let text = bounded_text(path).map_err(|error| format!("cargo config unavailable: {error}"))?;
+    let config = text
+        .parse::<toml::Table>()
+        .map_err(|_| String::from("cargo config is malformed TOML"))?;
+    let mut root = None;
+    if let Some(includes) = config.get("include") {
+        let includes = includes
+            .as_array()
+            .ok_or_else(|| String::from("cargo config include must be an array"))?;
+        for include in includes {
+            let include_path = include
+                .as_str()
+                .or_else(|| include.get("path").and_then(toml::Value::as_str))
+                .ok_or_else(|| String::from("cargo config include has no path"))?;
+            let include_path = absolute_from(
+                Path::new(include_path),
+                path.parent().unwrap_or(Path::new(".")),
+            );
+            let optional = include
+                .get("optional")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            if !optional
+                && std::fs::symlink_metadata(&include_path)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            {
+                return Err(String::from("cargo config required include is missing"));
+            }
+            if let Some(included_root) =
+                cargo_config_install_root(&include_path, visiting, depth + 1)?
+            {
+                root = Some(included_root);
+            }
+        }
+    }
+    if let Some(value) = config.get("install").and_then(|value| value.get("root")) {
+        let value = value
+            .as_str()
+            .ok_or_else(|| String::from("cargo install.root must be a path string"))?;
+        let base = path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new("."));
+        root = Some(absolute_from(Path::new(value), base));
+    }
+    visiting.remove(path);
+    Ok(root)
+}
+
+fn command_path(cmd: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    let path = std::env::split_paths(&paths)
+        .map(|dir| dir.join(cmd))
+        .find(|path| is_executable(path.clone()))?;
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        Some(std::env::current_dir().ok()?.join(path))
+    }
 }
 
 fn is_executable(path: PathBuf) -> bool {
@@ -1952,29 +2387,6 @@ fn terminate_command(child: &mut std::process::Child) {
 
     if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
         let _ = child.kill();
-    }
-}
-
-fn run_pip_command(args: &[&str]) -> CommandResult {
-    match pip_command() {
-        Some(cmd) => run_pip_command_with(cmd, args),
-        None => CommandResult {
-            stdout: String::new(),
-            stderr: String::new(),
-            success: false,
-            timed_out: false,
-        },
-    }
-}
-
-fn run_pip_command_with(cmd: PipCommand, args: &[&str]) -> CommandResult {
-    match cmd {
-        PipCommand::Pip3 => run_command("pip3", args),
-        PipCommand::Python3Module => {
-            let mut pip_args: Vec<&str> = vec!["-m", "pip"];
-            pip_args.extend_from_slice(args);
-            run_command("python3", &pip_args)
-        }
     }
 }
 
@@ -2271,109 +2683,170 @@ fn allocated_size_from_metadata(meta: &std::fs::Metadata) -> u64 {
     }
 }
 
-fn brew_prefix() -> PathBuf {
-    brew_prefix_from_env(std::env::var_os("HOMEBREW_PREFIX"))
-}
-
-fn brew_prefix_from_env(prefix: Option<std::ffi::OsString>) -> PathBuf {
-    if let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty()) {
-        return PathBuf::from(prefix);
-    }
-    if cfg!(target_arch = "aarch64") {
-        PathBuf::from("/opt/homebrew")
-    } else {
-        PathBuf::from("/usr/local")
-    }
-}
-
-/// Resolve every site-packages root (global plus per-user) for the same
-/// interpreter that produced the package list.
-fn find_pip_site_packages(cmd: PipCommand) -> Vec<PathBuf> {
-    match cmd {
-        PipCommand::Python3Module => python_site_packages_roots("python3"),
-        PipCommand::Pip3 => pip3_site_packages_roots(),
-    }
-}
-
-/// Ask a Python interpreter for its global and user site-packages directories.
-fn python_site_packages_roots(python: &str) -> Vec<PathBuf> {
-    let result = run_command(
-        python,
-        &[
-            "-c",
-            "import site; print('\\n'.join(list(site.getsitepackages()) + ([site.getusersitepackages()] if site.ENABLE_USER_SITE else [])))",
-        ],
-    );
-    existing_dirs(result.stdout.lines().map(|line| PathBuf::from(line.trim())))
-}
-
-/// `pip3` is not a Python interpreter, so derive its global site-packages from
-/// `pip3 -V` ("pip X from <site-packages>/pip (python A.B)") and construct the
-/// standard per-user roots from the reported Python version.
-fn pip3_site_packages_roots() -> Vec<PathBuf> {
-    let line = run_command("pip3", &["-V"]).stdout;
-    let line = line.trim();
-    let mut roots = Vec::new();
-    if let Some(global) = parse_pip_global_site_packages(line) {
-        roots.push(global);
-    }
-    if let (Some(version), Some(home)) = (
-        parse_pip_python_version(line),
-        std::env::var_os("HOME").map(PathBuf::from),
-    ) {
-        roots.extend(user_site_candidates(&version, &home));
-    }
-    existing_dirs(roots.into_iter())
-}
-
-/// Parse the global site-packages directory out of `pip -V` output.
-fn parse_pip_global_site_packages(pip_version_line: &str) -> Option<PathBuf> {
-    let from = pip_version_line.split(" from ").nth(1)?;
-    let pip_dir = from.split(" (python").next()?.trim();
-    if pip_dir.is_empty() {
-        return None;
-    }
-    // `pip_dir` ends in `/pip`; its parent is the site-packages directory.
-    PathBuf::from(pip_dir).parent().map(Path::to_path_buf)
-}
-
-/// Parse the `X.Y` Python version out of `pip -V` output.
-fn parse_pip_python_version(pip_version_line: &str) -> Option<String> {
-    let after = pip_version_line.split("(python").nth(1)?;
-    let version = after.trim().trim_end_matches(')').trim();
-    if version.is_empty() {
-        None
-    } else {
-        Some(version.to_string())
-    }
-}
-
-/// Standard per-user site-packages locations for a Python `X.Y` version.
-fn user_site_candidates(version: &str, home: &Path) -> Vec<PathBuf> {
-    vec![
-        home.join(format!(".local/lib/python{version}/site-packages")),
-        home.join(format!("Library/Python/{version}/lib/python/site-packages")),
-    ]
-}
-
-/// Keep only existing directories, de-duplicated and order-preserving.
-fn existing_dirs(paths: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for path in paths {
-        if path.as_os_str().is_empty() {
-            continue;
-        }
-        if path.is_dir() && seen.insert(path.clone()) {
-            out.push(path);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_install_root_follows_environment_config_and_home_precedence() {
+        let root = test_root("cargo_root_precedence");
+        let home = root.join("home");
+        let cargo_home = root.join("custom-cargo");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            "[install]\nroot = 'configured-tools'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cargo_install_root_with(&root, Some(&home), Some(&cargo_home), None).unwrap(),
+            root.join("configured-tools")
+        );
+        assert_eq!(
+            cargo_install_root_with(
+                &root,
+                Some(&home),
+                Some(&cargo_home),
+                Some(Path::new("explicit-tools"))
+            )
+            .unwrap(),
+            root.join("explicit-tools")
+        );
+        std::fs::write(
+            cargo_home.join("config"),
+            "[install]\nroot = 'legacy-tools'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cargo_install_root_with(&root, Some(&home), Some(&cargo_home), None).unwrap(),
+            root.join("legacy-tools")
+        );
+        assert_eq!(
+            cargo_install_root_with(&root, Some(&home), None, None).unwrap(),
+            home.join(".cargo")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cargo_config_includes_preserve_root_origin_and_reject_cycles() {
+        let root = test_root("cargo_root_includes");
+        let cargo_home = root.join("cargo-home");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            "include = ['included.toml']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cargo_home.join("included.toml"),
+            "[install]\nroot = 'included-tools'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cargo_install_root_with(&root, None, Some(&cargo_home), None).unwrap(),
+            root.join("included-tools")
+        );
+        std::fs::write(
+            cargo_home.join("included.toml"),
+            "include = ['config.toml']\n",
+        )
+        .unwrap();
+        assert!(cargo_install_root_with(&root, None, Some(&cargo_home), None).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pip_inventory_sizes_only_the_reported_distribution_location() {
+        let root = test_root("pip_location_identity");
+        let first = root.join("first/site-packages");
+        let selected = root.join("custom-user-base/site-packages");
+        for (site, bytes) in [(&first, 4), (&selected, 40)] {
+            std::fs::create_dir_all(site.join("example-1.0.dist-info")).unwrap();
+            std::fs::write(site.join("example.py"), vec![b'x'; bytes]).unwrap();
+            std::fs::write(site.join("example-1.0.dist-info/RECORD"), "example.py,,\n").unwrap();
+        }
+        let result = CommandResult {
+            stdout: serde_json::json!([{"name":"example","version":"1.0","location":selected}])
+                .to_string(),
+            stderr: String::new(),
+            success: true,
+            timed_out: false,
+        };
+        assert_eq!(pip_locations(&result.stdout), vec![selected.clone()]);
+        let (packages, _, _) = pip_inventory_from_result(&result, &[first, selected]);
+        assert_eq!(packages[0].size.unwrap().logical, 40);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uninstall_commands_retain_the_scanned_manager_and_root() {
+        let environment = |manager, executable: &str, root: &str| ManagerEnvironment {
+            executable: PathBuf::from(executable),
+            prefix_args: Vec::new(),
+            install_root: Some(PathBuf::from(root)),
+            package_roots: Vec::new(),
+            cwd: PathBuf::from("/fixture"),
+            manager,
+        };
+        let cargo = environment(
+            Manager::Cargo,
+            "/fixture/custom/bin/cargo",
+            "/fixture/custom install",
+        );
+        let command = uninstall_command(Manager::Cargo, "tool", Some(&cargo)).unwrap();
+        assert_eq!(command.get_program(), "/fixture/custom/bin/cargo");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["uninstall", "tool", "--root", "/fixture/custom install"]
+        );
+        let bun = environment(Manager::Bun, "/fixture/bun", "/fixture/bun global");
+        let command = uninstall_command(Manager::Bun, "@scope/tool", Some(&bun)).unwrap();
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "BUN_INSTALL_GLOBAL_DIR"
+                && value == Some(std::ffi::OsStr::new("/fixture/bun global"))));
+        let mut pip = environment(Manager::Pip, "/fixture/venv/bin/python3", "/fixture/venv");
+        pip.prefix_args = vec![String::from("-m"), String::from("pip")];
+        let command = uninstall_command(Manager::Pip, "example", Some(&pip)).unwrap();
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["-m", "pip", "uninstall", "-y", "example"]
+        );
+        for prefix in ["/opt/homebrew", "/usr/local"] {
+            let brew = environment(Manager::Brew, &format!("{prefix}/bin/brew"), prefix);
+            assert_eq!(
+                uninstall_command(Manager::Brew, "tool", Some(&brew))
+                    .unwrap()
+                    .get_program(),
+                std::ffi::OsStr::new(&format!("{prefix}/bin/brew"))
+            );
+        }
+        assert!(uninstall_command(Manager::Cargo, "tool", None).is_err());
+        assert!(uninstall_command(Manager::Cargo, "tool", Some(&pip)).is_err());
+    }
+
+    #[test]
+    fn bun_inventory_retains_the_effective_global_root_with_spaces() {
+        assert_eq!(
+            bun_root_from_output(
+                "/fixture/alternate bun/global node_modules (2 installed)\n├── one@1.0\n"
+            ),
+            Some(PathBuf::from("/fixture/alternate bun/global"))
+        );
+        assert!(bun_root_from_output("unexpected format\n").is_none());
+        let result = CommandResult {
+            stdout: String::from(
+                "/fixture/user@example/bun global node_modules (1 installed)\n└── one@1.0\n",
+            ),
+            stderr: String::new(),
+            success: true,
+            timed_out: false,
+        };
+        let (packages, _, _) = bun_inventory_from_result(&result, None);
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "one");
+    }
 
     #[test]
     fn count_package_json() {
@@ -2418,14 +2891,6 @@ dev = ["pytest", "ruff"]
 "#;
 
         assert_eq!(count_pyproject_deps(content), 4);
-    }
-
-    #[test]
-    fn brew_prefix_honors_homebrew_prefix_env_value() {
-        assert_eq!(
-            brew_prefix_from_env(Some(std::ffi::OsString::from("/custom/homebrew"))),
-            PathBuf::from("/custom/homebrew")
-        );
     }
 
     #[test]
@@ -2596,27 +3061,6 @@ dev = ["pytest", "ruff"]
     }
 
     #[test]
-    fn parses_pip_version_line_for_site_packages_and_version() {
-        let line = "pip 23.3.1 from /opt/homebrew/lib/python3.11/site-packages/pip (python 3.11)";
-        assert_eq!(
-            parse_pip_global_site_packages(line),
-            Some(PathBuf::from("/opt/homebrew/lib/python3.11/site-packages"))
-        );
-        assert_eq!(parse_pip_python_version(line), Some(String::from("3.11")));
-
-        assert_eq!(parse_pip_global_site_packages("garbage"), None);
-        assert_eq!(parse_pip_python_version("garbage"), None);
-    }
-
-    #[test]
-    fn user_site_candidates_cover_local_and_framework_layouts() {
-        let home = Path::new("/Users/example");
-        let candidates = user_site_candidates("3.11", home);
-        assert!(candidates.contains(&home.join(".local/lib/python3.11/site-packages")));
-        assert!(candidates.contains(&home.join("Library/Python/3.11/lib/python/site-packages")));
-    }
-
-    #[test]
     fn splits_csv_fields_with_quoted_values() {
         let fields = split_csv_row("path,to,script.py,sha256=abc,12");
         assert_eq!(fields, vec!["path", "to", "script.py", "sha256=abc", "12"]);
@@ -2655,6 +3099,33 @@ dev = ["pytest", "ruff"]
         assert!(size.allocated > 0);
         assert_eq!(problems.missing_files, 1);
         assert_eq!(problems.unreadable_files, 0);
+
+        let inventory = CommandResult {
+            stdout: serde_json::json!([{"name":"requests","version":"2.32.0","location":root}])
+                .to_string(),
+            stderr: String::new(),
+            success: true,
+            timed_out: false,
+        };
+        let (packages, warning, parse_failed) =
+            pip_inventory_from_result(&inventory, std::slice::from_ref(&root));
+        assert!(!parse_failed);
+        assert!(warning.is_some());
+        assert_eq!(packages[0].coverage.basis, FootprintBasis::RecordFiles);
+        assert_eq!(packages[0].coverage.missing_files, 1);
+        assert_eq!(packages[0].coverage.json()["partial"], true);
+        let report = ManagerReport {
+            manager: Manager::Pip,
+            packages,
+            total_size: size,
+            available: true,
+            warning,
+            state: ManagerScanState::Partial,
+            environment: None,
+        };
+        assert_eq!(report.partial_sizes(), 1);
+        assert_eq!(report.limited_sizes(), 1);
+        assert_eq!(report.unknown_sizes(), 0);
 
         std::fs::remove_file(dist_info.join("RECORD")).unwrap();
         let (size, problems) = parse_pip_record_size(&root, &dist_info);
@@ -2699,6 +3170,21 @@ dev = ["pytest", "ruff"]
         assert_eq!(graph["requests"].dependents, vec!["my-tool"]);
         assert_eq!(graph["urllib3"].dependencies, Vec::<String>::new());
         assert_eq!(graph["urllib3"].dependents, vec!["requests"]);
+    }
+
+    #[test]
+    fn footprint_coverage_preserves_scanner_uncertainty() {
+        let scan = bulkstat::DirScan {
+            inaccessible: 2,
+            skipped_mounts: 3,
+            ..Default::default()
+        };
+        let mut coverage = FootprintCoverage::new(FootprintBasis::Tree);
+        coverage.add_scan(&scan);
+        assert!(coverage.is_partial());
+        assert_eq!(coverage.json()["inaccessible"], 2);
+        assert_eq!(coverage.json()["skipped_mounts"], 3);
+        assert!(!coverage.basis.is_limited());
     }
 
     #[test]
@@ -2755,6 +3241,8 @@ dev = ["pytest", "ruff"]
         assert_eq!(cargo.len(), 1);
         assert_eq!(cargo[0].name, "local-tool");
         assert_eq!(cargo[0].version, "1.2.3");
+        assert_eq!(cargo[0].coverage.basis, FootprintBasis::KnownBinaries);
+        assert!(cargo[0].coverage.is_partial());
         assert!(malformed);
         assert!(warning.unwrap().contains("malformed install rows"));
         let (bun, warning, malformed) = bun_inventory_from_result(
@@ -2845,52 +3333,6 @@ dev = ["pytest", "ruff"]
             assert!(info.dependents.is_empty());
             assert!(manager.is_global_leaf_manager());
         }
-    }
-
-    #[test]
-    fn npm_global_root_prefers_active_npm_over_version_probes() {
-        let root = test_root("npm_root_prefers_active");
-        let active_root = root.join("active/lib/node_modules");
-        let nvm_root = root.join("nvm/versions/node/v22.0.0/lib/node_modules");
-        let fnm_root =
-            root.join("home/.local/share/fnm/node-versions/v24.0.0/installation/lib/node_modules");
-        std::fs::create_dir_all(&active_root).unwrap();
-        std::fs::create_dir_all(&nvm_root).unwrap();
-        std::fs::create_dir_all(&fnm_root).unwrap();
-
-        let resolved = find_npm_global_root_with(
-            |cmd, args| {
-                assert_eq!(cmd, "npm");
-                assert_eq!(args, ["root", "-g"]);
-                format!("{}\n", active_root.display())
-            },
-            Some(root.join("home")),
-            Some(root.join("nvm")),
-            None,
-        );
-
-        assert_eq!(resolved, Some(active_root.clone()));
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn npm_global_root_does_not_guess_across_multiple_nvm_versions() {
-        let root = test_root("npm_root_ambiguous_nvm");
-        let nvm_versions = root.join("nvm/versions/node");
-        std::fs::create_dir_all(nvm_versions.join("v20.0.0/lib/node_modules")).unwrap();
-        std::fs::create_dir_all(nvm_versions.join("v22.0.0/lib/node_modules")).unwrap();
-
-        let resolved = find_npm_global_root_with(
-            |_cmd, _args| String::new(),
-            None,
-            Some(root.join("nvm")),
-            None,
-        );
-
-        assert_eq!(resolved, None);
-
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2985,6 +3427,7 @@ dev = ["pytest", "ruff"]
         assert_eq!(packages.len(), 2);
 
         let pdf = packages.iter().find(|p| p.name == "pdfextractor").unwrap();
+        assert_eq!(pdf.coverage.basis, FootprintBasis::AppAndMetadata);
         assert_eq!(pdf.version, "1.5");
         assert_eq!(
             pdf.path.as_ref().unwrap(),
@@ -2996,6 +3439,8 @@ dev = ["pytest", "ruff"]
         );
 
         let pkgs = packages.iter().find(|p| p.name == "packages").unwrap();
+        assert_eq!(pkgs.coverage.basis, FootprintBasis::InstallerMetadata);
+        assert!(pkgs.coverage.basis.is_limited());
         assert_eq!(pkgs.version, "1.2.10 (installer-based)");
         assert_eq!(pkgs.path.as_ref().unwrap(), &temp_caskroom.join("packages"));
         assert!(pkgs.metadata_path.is_none());
@@ -3155,6 +3600,7 @@ dev = ["pytest", "ruff"]
             available: true,
             warning: Some("brew cask: timed out".into()),
             state: ManagerScanState::Failed,
+            environment: None,
         };
         assert_eq!(report.warning.as_deref(), Some("brew cask: timed out"));
     }

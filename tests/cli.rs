@@ -11,6 +11,56 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 #[test]
+fn package_json_retains_custom_manager_root_and_footprint_scope() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = fixture("package_environment");
+    let tools = root.join("tools");
+    let install = root.join("custom install");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::create_dir_all(install.join("bin")).unwrap();
+    std::fs::write(install.join("bin/example"), b"fixture-tool").unwrap();
+    let cargo = tools.join("cargo");
+    std::fs::write(&cargo, "#!/bin/sh\n[ \"$1\" = install ] && [ \"$2\" = --list ] && [ \"$3\" = --root ] && [ \"$4\" = \"$CARGO_INSTALL_ROOT\" ] || exit 42\nprintf 'example v1.0.0:\\n    example\\n'\n").unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_diskr"))
+        .args(["--packages", "--json"])
+        .arg(&root)
+        .env("PATH", &tools)
+        .env("HOME", root.join("home"))
+        .env("CARGO_HOME", root.join("cargo-home"))
+        .env("CARGO_INSTALL_ROOT", &install)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let cargo = report["system_packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|manager| manager["manager"] == "cargo")
+        .unwrap();
+    assert_eq!(cargo["scan_state"], "complete");
+    assert_eq!(
+        cargo["environment"]["install_root"],
+        install.to_string_lossy().as_ref()
+    );
+    assert_eq!(cargo["packages"][0]["logical"], 12);
+    assert_eq!(
+        cargo["packages"][0]["footprint"]["basis"],
+        "known installed binaries"
+    );
+    assert_eq!(cargo["size_coverage"]["scope_limited"], 1);
+    assert_eq!(cargo["size_coverage"]["unknown"], 0);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn human_report_escapes_terminal_controls_in_filenames() {
     let root = fixture("terminal_controls");
     std::fs::create_dir_all(&root).unwrap();

@@ -22,6 +22,15 @@ Package reports distinguish empty inventories from unavailable managers, command
 failures, malformed output, and partial results. Package details retain inventory
 and dependency-graph warnings. JSON includes every manager's `scan_state` and
 each package's dependency evidence; incomplete graphs have unknown leaf status.
+Sizes describe known allocation within their stated footprint: directory trees,
+app and manager metadata, installed binaries, RECORD-listed files, or installer
+metadata. Details and JSON retain unreadable, skipped-mount and missing-file
+counts. A `≥` marker denotes a partial measurement; manager totals also report
+unknown and limited-scope footprints.
+Manager details and JSON identify the executable and package roots used by the
+scan. Uninstall uses that retained installation scope. Cargo follows
+`CARGO_INSTALL_ROOT`, its user configuration and `CARGO_HOME`; Homebrew, Bun,
+npm and pip supply their active locations through their inventory commands.
 
 **macOS-native integration.** Reveal any file in Finder with `f`, open with the default app with `O`, and move files or project dependency directories to Trash with `d`. On an installed package, `d` runs that manager's uninstall flow after confirmation.
 
@@ -111,7 +120,7 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 
 ## How it works
 
-diskr uses `ratatui`, `crossterm`, `libc`, `anyhow`, `serde_json`, and the
+diskr uses `ratatui`, `crossterm`, `libc`, `anyhow`, `serde_json`, `toml`, and the
 Unicode segmentation/width crates. The size cache and history baselines are
 persisted as JSON through `serde_json`. The core scanner calls
 `getattrlistbulk(2)` with a packed attribute list requesting name, object type,

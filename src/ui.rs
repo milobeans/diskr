@@ -1419,16 +1419,32 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
         match app.pkg_view {
             PkgView::SystemManagers => {
                 let total = app.total_pkg_size();
-                if total > 0 {
-                    format!(" · {}", human(total))
+                let partial = app.pkg_reports.iter().any(|report| {
+                    report.warning.is_some()
+                        || report.unknown_sizes() > 0
+                        || report.partial_sizes() > 0
+                        || report.limited_sizes() > 0
+                });
+                if total > 0 || partial || !app.flat_packages().is_empty() {
+                    format!(
+                        " · {}{} known",
+                        if partial { "≥" } else { "" },
+                        human(total)
+                    )
                 } else {
                     String::new()
                 }
             }
             PkgView::ProjectDeps => {
                 let total = app.total_project_deps_size();
-                if total > 0 {
-                    format!(" · {}", human(total))
+                let partial = app.project_dep_errors > 0
+                    || app.project_deps.iter().any(|dep| dep.coverage.is_partial());
+                if total > 0 || partial || !app.project_deps.is_empty() {
+                    format!(
+                        " · {}{} known",
+                        if partial { "≥" } else { "" },
+                        human(total)
+                    )
                 } else {
                     String::new()
                 }
@@ -1570,7 +1586,17 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
                 let (package, manager) = app.flat_packages().get(real_i)?;
                 let size = package
                     .size
-                    .map(|s| human(s.allocated))
+                    .map(|s| {
+                        format!(
+                            "{}{}",
+                            if package.coverage.is_partial() {
+                                "≥"
+                            } else {
+                                ""
+                            },
+                            human(s.allocated)
+                        )
+                    })
                     .unwrap_or_else(|| String::from("?"));
                 let use_status = app
                     .dep_graph
@@ -1590,7 +1616,13 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
                 let dep = app.project_deps.get(real_i)?;
                 let size = dep
                     .deps_size
-                    .map(|s| human(s.allocated))
+                    .map(|s| {
+                        format!(
+                            "{}{}",
+                            if dep.coverage.is_partial() { "≥" } else { "" },
+                            human(s.allocated)
+                        )
+                    })
                     .unwrap_or_else(|| String::from("—"));
                 let label = format!(
                     "{} · {} deps · {}",
@@ -2101,7 +2133,7 @@ fn draw_empty_trash_confirm(f: &mut Frame, app: &App) {
 }
 
 fn draw_uninstall_confirm(f: &mut Frame, app: &App) {
-    let area = centered_rect(60, 20, 44, 6, f.area());
+    let area = centered_rect(60, 20, 44, 8, f.area());
     let text_width = area.width.saturating_sub(4) as usize;
     let name = app.pending_uninstall_name();
     let mut body = vec![
@@ -2115,6 +2147,12 @@ fn draw_uninstall_confirm(f: &mut Frame, app: &App) {
         body.push(Line::from(Span::styled(
             truncate_start(name, text_width),
             Style::default().fg(Color::Gray),
+        )));
+    }
+    if let Some(root) = app.pending_uninstall_root() {
+        body.push(Line::from(format!(
+            "Root: {}",
+            truncate_start(&root.display().to_string(), text_width.saturating_sub(6))
         )));
     }
     render_confirm_modal(f, area, "uninstall", body);
@@ -2157,12 +2195,34 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
             Span::styled(size_detail(size), Style::default().fg(Color::Green)),
         ]));
     }
+    lines.push(Line::from(format!(
+        "  Footprint: {}",
+        pkg.coverage.summary()
+    )));
     if let Some(report) = app
         .pkg_reports
         .iter()
         .find(|report| report.manager == manager)
     {
         lines.push(Line::from(format!("  Inventory: {}", report.state.label())));
+        if let Some(environment) = &report.environment {
+            lines.push(Line::from(format!(
+                "  Manager: {}",
+                terminal_text::sanitize(&environment.executable.display().to_string())
+            )));
+            for root in &environment.package_roots {
+                lines.push(Line::from(format!(
+                    "  Package root: {}",
+                    terminal_text::sanitize(&root.display().to_string())
+                )));
+            }
+        }
+        lines.push(Line::from(format!(
+            "  Manager footprints: {} unknown · {} partial · {} scoped",
+            report.unknown_sizes(),
+            report.partial_sizes(),
+            report.limited_sizes()
+        )));
         if let Some(warning) = &report.warning {
             lines.push(Line::from(Span::styled(
                 format!("  Warning: {}", terminal_text::sanitize(warning)),
@@ -2370,6 +2430,10 @@ fn draw_project_dep_detail(f: &mut Frame, app: &App) {
             Span::styled(size_detail(size), Style::default().fg(Color::Green)),
         ]));
     }
+    lines.push(Line::from(format!(
+        "  Footprint: {}",
+        dep.coverage.summary()
+    )));
 
     if let Some(deps_dir) = &dep.deps_dir {
         let max_path_len = area.width.saturating_sub(14) as usize;
@@ -2665,7 +2729,17 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                         Some((package, manager)) => {
                             let size = package
                                 .size
-                                .map(size_detail)
+                                .map(|size| {
+                                    format!(
+                                        "{}{}",
+                                        if package.coverage.is_partial() {
+                                            "≥"
+                                        } else {
+                                            ""
+                                        },
+                                        size_detail(size)
+                                    )
+                                })
                                 .unwrap_or_else(|| String::from("?"));
                             spans.push(Span::styled(
                                 format!("{} package ", manager.label()),
@@ -2695,7 +2769,13 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                     Some(dep) => {
                         let size = dep
                             .deps_size
-                            .map(size_detail)
+                            .map(|size| {
+                                format!(
+                                    "{}{}",
+                                    if dep.coverage.is_partial() { "≥" } else { "" },
+                                    size_detail(size)
+                                )
+                            })
                             .unwrap_or_else(|| String::from("—"));
                         spans.push(Span::styled(
                             format!("{} project · {} deps · ", dep.manager_label, dep.dep_count),

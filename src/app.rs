@@ -580,6 +580,7 @@ pub struct UninstallTarget {
     pub manager: packages::Manager,
     pub name: String,
     pub display_name: String,
+    pub environment: Option<packages::ManagerEnvironment>,
 }
 
 struct UninstallResult {
@@ -3596,6 +3597,11 @@ impl App {
             manager: *manager,
             name: pkg.name.clone(),
             display_name: format!("{} {}", manager.label(), pkg.name),
+            environment: self
+                .pkg_reports
+                .iter()
+                .find(|report| report.manager == *manager)
+                .and_then(|report| report.environment.clone()),
         });
         self.confirming_uninstall = true;
     }
@@ -3615,7 +3621,8 @@ impl App {
         self.status = format!("uninstalling {}…", target.display_name);
 
         thread::spawn(move || {
-            let result = packages::run_uninstall(target.manager, &target.name);
+            let result =
+                packages::run_uninstall(target.manager, &target.name, target.environment.as_ref());
             let _ = tx.send(UninstallResult {
                 display_name: target.display_name,
                 result,
@@ -3628,6 +3635,15 @@ impl App {
             Some(t) => &t.display_name,
             None => "?",
         }
+    }
+
+    pub fn pending_uninstall_root(&self) -> Option<&Path> {
+        self.pending_uninstall
+            .as_ref()?
+            .environment
+            .as_ref()?
+            .install_root
+            .as_deref()
     }
 
     pub fn selected_pkg_detail(
@@ -5458,6 +5474,7 @@ mod tests {
             dep_count: 5,
             deps_size: None,
             deps_dir: Some(root.join("target")),
+            coverage: Default::default(),
         }];
         app.focus = Focus::Packages;
         app.pkg_view = PkgView::ProjectDeps;
@@ -5504,6 +5521,7 @@ mod tests {
                     size: Some(SizeInfo::new(100, 100)),
                     path: Some(root.join("only-one-part")),
                     metadata_path: Some(root.join("other-parts")),
+                    coverage: Default::default(),
                 },
                 manager,
             )];
@@ -5532,6 +5550,7 @@ mod tests {
             available: true,
             warning: Some(String::from("missing RECORD files")),
             state: packages::ManagerScanState::Failed,
+            environment: None,
         }];
         let (tx, rx) = channel();
         app.dep_scan_rx = Some(rx);
@@ -5661,6 +5680,7 @@ mod tests {
                     size: None,
                     path: None,
                     metadata_path: None,
+                    coverage: Default::default(),
                 },
                 packages::Manager::Brew,
             ),
@@ -5671,6 +5691,7 @@ mod tests {
                     size: None,
                     path: None,
                     metadata_path: None,
+                    coverage: Default::default(),
                 },
                 packages::Manager::Brew,
             ),
@@ -5681,6 +5702,7 @@ mod tests {
                     size: None,
                     path: None,
                     metadata_path: None,
+                    coverage: Default::default(),
                 },
                 packages::Manager::BrewCask,
             ),
@@ -5740,6 +5762,7 @@ mod tests {
                 size: None,
                 path: None,
                 metadata_path: None,
+                coverage: Default::default(),
             },
             packages::Manager::Brew,
         )];
@@ -5799,6 +5822,7 @@ mod tests {
                     size: Some(SizeInfo::new(20, 20)),
                     path: None,
                     metadata_path: None,
+                    coverage: Default::default(),
                 },
                 packages::Package {
                     name: "beta".into(),
@@ -5806,12 +5830,14 @@ mod tests {
                     size: Some(SizeInfo::new(10, 10)),
                     path: None,
                     metadata_path: None,
+                    coverage: Default::default(),
                 },
             ],
             total_size: SizeInfo::new(30, 30),
             available: true,
             warning: None,
             state: packages::ManagerScanState::Complete,
+            environment: None,
         }];
         app.dep_graph = Some(DepGraph::from_entries(vec![
             (
@@ -5871,6 +5897,7 @@ mod tests {
                 dep_count: 4,
                 deps_size: Some(SizeInfo::new(100, 100)),
                 deps_dir: Some(root.join("target")),
+                coverage: Default::default(),
             },
             ProjectDeps {
                 path: root.join("package.json"),
@@ -5879,6 +5906,7 @@ mod tests {
                 dep_count: 8,
                 deps_size: Some(SizeInfo::new(200, 200)),
                 deps_dir: Some(root.join("node_modules")),
+                coverage: Default::default(),
             },
         ];
         app.rebuild_project_dep_search_text();
@@ -5911,6 +5939,7 @@ mod tests {
                     size: Some(SizeInfo::new(20, 20)),
                     path: None,
                     metadata_path: None,
+                    coverage: Default::default(),
                 },
                 packages::Package {
                     name: "beta".into(),
@@ -5918,12 +5947,14 @@ mod tests {
                     size: Some(SizeInfo::new(10, 10)),
                     path: None,
                     metadata_path: None,
+                    coverage: Default::default(),
                 },
             ],
             total_size: SizeInfo::new(30, 30),
             available: true,
             warning: None,
             state: packages::ManagerScanState::Complete,
+            environment: None,
         }];
         app.rebuild_flat_packages();
 
@@ -6350,6 +6381,7 @@ mod tests {
                 dep_count: 1,
                 deps_size: None,
                 deps_dir: Some(root_a.join("target")),
+                coverage: Default::default(),
             }],
             project_dep_errors: 0,
             project_scope: bulkstat::DiscoveryCoverage::default(),
@@ -7320,6 +7352,7 @@ mod tests {
                 size: None,
                 path: None,
                 metadata_path: None,
+                coverage: Default::default(),
             },
             packages::Manager::Brew,
         )
@@ -7341,6 +7374,7 @@ mod tests {
             dep_count: 3,
             deps_size: None,
             deps_dir: None,
+            coverage: Default::default(),
         }];
         app.rebuild_pkg_visible_indices();
         app.selected_pkg = 1;
@@ -7380,6 +7414,7 @@ mod tests {
                 dep_count: 3,
                 deps_size: None,
                 deps_dir: Some(root.join("target")),
+                coverage: Default::default(),
             },
             packages::ProjectDeps {
                 path: root.join("package.json"),
@@ -7388,6 +7423,7 @@ mod tests {
                 dep_count: 10,
                 deps_size: None,
                 deps_dir: Some(root.join("node_modules")),
+                coverage: Default::default(),
             },
         ];
         app.rebuild_project_dep_search_text();
@@ -7438,6 +7474,7 @@ mod tests {
             dep_count: 2,
             deps_size: None,
             deps_dir: None,
+            coverage: Default::default(),
         }];
         app.rebuild_project_dep_search_text();
         app.rebuild_pkg_visible_indices();
