@@ -1,8 +1,11 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
+
+use crate::packages;
 
 /// Delete by moving to the macOS Trash (reversible).
 pub fn delete_to_trash(path: &Path) -> Result<()> {
@@ -169,14 +172,17 @@ pub fn empty_trash_with(runner: fn(&str, &[&str]) -> Result<()>) -> Result<()> {
 
 /// Run an external command, returning an error if it exits non-zero.
 pub fn run_osascript(program: &str, args: &[&str]) -> Result<()> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to execute {program}"))?;
+    let mut command = Command::new(program);
+    command.args(args);
+    let output = packages::run_process(command, Duration::from_secs(300));
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("{program} failed: {}", stderr.trim()));
+    if output.timed_out {
+        return Err(anyhow!(
+            "{program} timed out; check the Trash before retrying"
+        ));
+    }
+    if !output.success {
+        return Err(anyhow!("{program} failed: {}", output.stderr.trim()));
     }
     Ok(())
 }

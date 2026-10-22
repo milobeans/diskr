@@ -1068,6 +1068,12 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
             ),
         ]));
     }
+    if let Some(error) = &report.apfs_error {
+        lines.push(Line::from(vec![
+            Span::styled("apfs container ", Style::default().fg(Color::DarkGray)),
+            Span::styled(error, Style::default().fg(Color::Red)),
+        ]));
+    }
     match report.local_snapshots.error.as_deref() {
         Some(err) => {
             lines.push(Line::from(vec![
@@ -2183,20 +2189,12 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled(
-            "  x",
+            "  x / d",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" uninstall", Style::default().fg(Color::Gray)),
-        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "d",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" trash dir", Style::default().fg(Color::Gray)),
         Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "Esc",

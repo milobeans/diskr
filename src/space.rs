@@ -3,6 +3,9 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+use crate::packages;
 
 #[derive(Clone, Debug)]
 pub struct SpaceReport {
@@ -16,6 +19,7 @@ pub struct SpaceReport {
     pub available: u64,
     pub local_snapshots: SnapshotListing,
     pub apfs_container: Option<ApfsContainer>,
+    pub apfs_error: Option<String>,
 }
 
 impl SpaceReport {
@@ -51,11 +55,14 @@ pub fn report_for_path(path: &Path) -> Result<SpaceReport> {
     }
 
     let stat = statfs_for_path(path)?;
-    let local_snapshots = list_local_snapshots(path);
-    let apfs_container = if stat.fs_type == "apfs" {
-        apfs_container_for_mount(&stat.mount).ok().flatten()
+    let local_snapshots = list_local_snapshots(&stat.mount);
+    let (apfs_container, apfs_error) = if stat.fs_type == "apfs" {
+        match apfs_container_for_mount(&stat.mount) {
+            Ok(container) => (Some(container), None),
+            Err(error) => (None, Some(error.to_string())),
+        }
     } else {
-        None
+        (None, None)
     };
 
     Ok(SpaceReport {
@@ -69,6 +76,7 @@ pub fn report_for_path(path: &Path) -> Result<SpaceReport> {
         available: stat.available,
         local_snapshots,
         apfs_container,
+        apfs_error,
     })
 }
 
@@ -76,17 +84,19 @@ pub fn thin_local_snapshots(path: &Path, bytes: u64) -> Result<ThinResult> {
     if bytes == 0 {
         bail!("snapshot thin amount must be greater than zero");
     }
-    let output = Command::new("tmutil")
+    let mut command = Command::new("tmutil");
+    command
         .arg("thinlocalsnapshots")
         .arg(path)
         .arg(bytes.to_string())
-        .arg("4")
-        .output()
-        .context("run tmutil thinlocalsnapshots")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
+        .arg("4");
+    let output = packages::run_process(command, Duration::from_secs(300));
+    let stdout = output.stdout.trim().to_string();
+    let stderr = output.stderr.trim().to_string();
+    if output.timed_out {
+        bail!("tmutil thinlocalsnapshots timed out; check snapshot state before retrying");
+    }
+    if !output.success {
         let message = if stderr.is_empty() { &stdout } else { &stderr };
         bail!("tmutil thinlocalsnapshots failed: {message}");
     }
@@ -191,42 +201,39 @@ fn statfs_for_path(path: &Path) -> Result<StatfsInfo> {
 }
 
 fn list_local_snapshots(path: &Path) -> SnapshotListing {
-    match Command::new("tmutil")
-        .arg("listlocalsnapshots")
-        .arg(path)
-        .output()
-    {
-        Ok(output) if output.status.success() => SnapshotListing {
-            names: parse_tmutil_snapshot_names(&String::from_utf8_lossy(&output.stdout)),
+    let mut command = Command::new("tmutil");
+    command.arg("listlocalsnapshots").arg(path);
+    let output = packages::run_process(command, Duration::from_secs(15));
+    match output {
+        output if output.success => SnapshotListing {
+            names: parse_tmutil_snapshot_names(&output.stdout),
             error: None,
         },
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            SnapshotListing {
-                names: Vec::new(),
-                error: Some(if stderr.is_empty() { stdout } else { stderr }),
-            }
-        }
-        Err(err) => SnapshotListing {
+        output => SnapshotListing {
             names: Vec::new(),
-            error: Some(err.to_string()),
+            error: Some(if output.timed_out {
+                String::from("tmutil timed out; retry snapshot discovery")
+            } else if output.stderr.trim().is_empty() {
+                output.stdout.trim().to_string()
+            } else {
+                output.stderr.trim().to_string()
+            }),
         },
     }
 }
 
-fn apfs_container_for_mount(mount: &Path) -> Result<Option<ApfsContainer>> {
-    let output = Command::new("diskutil")
-        .arg("info")
-        .arg("-plist")
-        .arg(mount)
-        .output()
-        .context("run diskutil info -plist")?;
-    if !output.status.success() {
-        return Ok(None);
+fn apfs_container_for_mount(mount: &Path) -> Result<ApfsContainer> {
+    let mut command = Command::new("diskutil");
+    command.arg("info").arg("-plist").arg(mount);
+    let output = packages::run_process(command, Duration::from_secs(15));
+    if output.timed_out {
+        bail!("diskutil info timed out; retry APFS container discovery");
+    }
+    if !output.success {
+        bail!("diskutil info failed: {}", output.stderr.trim());
     }
 
-    parse_apfs_container_plist(&output.stdout)
+    parse_apfs_container_plist(output.stdout.as_bytes())
 }
 
 fn parse_tmutil_snapshot_names(output: &str) -> Vec<String> {
@@ -248,23 +255,20 @@ fn c_char_array_to_string(chars: &[libc::c_char]) -> String {
         .into_owned()
 }
 
-fn parse_apfs_container_plist(plist: &[u8]) -> Result<Option<ApfsContainer>> {
+fn parse_apfs_container_plist(plist: &[u8]) -> Result<ApfsContainer> {
     let plist = std::str::from_utf8(plist).context("diskutil plist was not utf-8")?;
-    let Some(reference) = extract_plist_string(plist, "APFSContainerReference") else {
-        return Ok(None);
-    };
-    let Some(size) = extract_plist_u64(plist, "APFSContainerSize")? else {
-        return Ok(None);
-    };
-    let Some(free) = extract_plist_u64(plist, "APFSContainerFree")? else {
-        return Ok(None);
-    };
+    let reference = extract_plist_string(plist, "APFSContainerReference")
+        .context("diskutil plist lacks APFSContainerReference")?;
+    let size = extract_plist_u64(plist, "APFSContainerSize")?
+        .context("diskutil plist lacks APFSContainerSize")?;
+    let free = extract_plist_u64(plist, "APFSContainerFree")?
+        .context("diskutil plist lacks APFSContainerFree")?;
 
-    Ok(Some(ApfsContainer {
+    Ok(ApfsContainer {
         reference,
         size,
         free,
-    }))
+    })
 }
 
 fn extract_plist_string(plist: &str, key: &str) -> Option<String> {
@@ -360,14 +364,14 @@ com.apple.os.update-MSUPrepareUpdate
 </plist>
 "#;
 
-        let container = parse_apfs_container_plist(plist).unwrap().unwrap();
+        let container = parse_apfs_container_plist(plist).unwrap();
         assert_eq!(container.reference, "disk3");
         assert_eq!(container.free, 123);
         assert_eq!(container.size, 456);
     }
 
     #[test]
-    fn parse_apfs_container_plist_returns_none_when_fields_are_missing() {
+    fn parse_apfs_container_plist_reports_missing_fields() {
         let plist = br#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
 <dict>
@@ -377,7 +381,10 @@ com.apple.os.update-MSUPrepareUpdate
 </plist>
 "#;
 
-        assert!(parse_apfs_container_plist(plist).unwrap().is_none());
+        assert!(parse_apfs_container_plist(plist)
+            .unwrap_err()
+            .to_string()
+            .contains("APFSContainerReference"));
     }
 
     #[test]

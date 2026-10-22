@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Read as _;
+use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -197,11 +198,11 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(10);
 const CMD_TIMEOUT_SLOW: Duration = Duration::from_secs(30);
 const UNINSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 
-struct CommandResult {
-    stdout: String,
-    stderr: String,
-    success: bool,
-    timed_out: bool,
+pub(crate) struct CommandResult {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) success: bool,
+    pub(crate) timed_out: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -416,7 +417,9 @@ pub fn run_uninstall(manager: Manager, name: &str) -> Result<String, String> {
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let result = run_command_with_timeout(cmd, &arg_refs, UNINSTALL_TIMEOUT);
     if result.timed_out {
-        Err(format!("{cmd} timed out after 5 minutes"))
+        Err(format!(
+            "{cmd} timed out after 5 minutes; installation state may have changed, so rescan before retrying"
+        ))
     } else if result.success {
         Ok(result.stdout.trim().to_string())
     } else {
@@ -1392,11 +1395,18 @@ fn run_command(cmd: &str, args: &[&str]) -> CommandResult {
 fn run_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> CommandResult {
     let mut command = Command::new(cmd);
     command.args(args);
-    command.process_group(0);
     if cmd == "brew" {
         command.env("HOMEBREW_NO_AUTO_UPDATE", "1");
     }
+    run_process(command, timeout)
+}
+
+const MAX_COMMAND_OUTPUT: usize = 16 * 1024 * 1024;
+
+pub(crate) fn run_process(mut command: Command, timeout: Duration) -> CommandResult {
+    command.process_group(0);
     let mut child = match command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1412,59 +1422,116 @@ fn run_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Comm
         }
     };
 
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-
-    let stdout_handle = thread::spawn(move || {
-        let mut buf = String::new();
-        if let Some(mut pipe) = stdout_pipe {
-            let _ = pipe.read_to_string(&mut buf);
-        }
-        buf
-    });
-    let stderr_handle = thread::spawn(move || {
-        let mut buf = String::new();
-        if let Some(mut pipe) = stderr_pipe {
-            let _ = pipe.read_to_string(&mut buf);
-        }
-        buf
-    });
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    if let Err(err) = stdout_pipe
+        .as_ref()
+        .map(set_nonblocking)
+        .transpose()
+        .and_then(|_| stderr_pipe.as_ref().map(set_nonblocking).transpose())
+    {
+        terminate_command(&mut child);
+        reap_command(child);
+        return CommandResult {
+            stdout: String::new(),
+            stderr: err.to_string(),
+            success: false,
+            timed_out: false,
+        };
+    }
 
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) if Instant::now() >= deadline => {
-                terminate_command(&mut child);
-                let _ = child.wait();
-                break None;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(_) => {
-                terminate_command(&mut child);
-                let _ = child.wait();
-                break None;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut status = None;
+    let mut failed = None;
+    let mut timed_out = false;
+    loop {
+        if let Err(err) = drain_pipe(&mut stdout_pipe, &mut stdout)
+            .and_then(|_| drain_pipe(&mut stderr_pipe, &mut stderr))
+        {
+            failed = Some(err.to_string());
+            break;
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(result) => status = result,
+                Err(err) => {
+                    failed = Some(err.to_string());
+                    break;
+                }
             }
         }
-    };
-
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
-
-    match status {
-        Some(s) => CommandResult {
-            stdout,
-            stderr,
-            success: s.success(),
-            timed_out: false,
-        },
-        None => CommandResult {
-            stdout: String::new(),
-            stderr: String::new(),
-            success: false,
-            timed_out: true,
-        },
+        if status.is_some() && stdout_pipe.is_none() && stderr_pipe.is_none() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
+    if timed_out || failed.is_some() {
+        // Descendants may inherit either pipe after their direct parent exits.
+        terminate_command(&mut child);
+    }
+    if status.is_none() {
+        reap_command(child);
+    }
+    let command_failed = failed.is_some();
+    let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
+    if let Some(err) = failed {
+        stderr = if stderr.is_empty() {
+            err
+        } else {
+            format!("{err}\n{stderr}")
+        };
+    }
+    CommandResult {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr,
+        success: !timed_out && status.is_some_and(|s| s.success()) && !command_failed,
+        timed_out,
+    }
+}
+
+fn set_nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_pipe<R: io::Read>(pipe: &mut Option<R>, output: &mut Vec<u8>) -> io::Result<()> {
+    let Some(reader) = pipe.as_mut() else {
+        return Ok(());
+    };
+    let mut buf = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                *pipe = None;
+                return Ok(());
+            }
+            Ok(n) => {
+                if output.len().saturating_add(n) > MAX_COMMAND_OUTPUT {
+                    return Err(io::Error::other("command output exceeds 16 MiB"));
+                }
+                output.extend_from_slice(&buf[..n]);
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn reap_command(mut child: std::process::Child) {
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 fn terminate_command(child: &mut std::process::Child) {
@@ -2280,6 +2347,29 @@ dev = ["pytest", "ruff"]
             .expect("timed-out command should return even when a grandchild inherits stdout");
         assert!(result.timed_out);
         assert!(!result.success);
+    }
+
+    #[test]
+    fn run_command_deadline_includes_pipe_drain_after_parent_exits() {
+        let started = Instant::now();
+        let result = run_command_with_timeout(
+            "sh",
+            &["-c", "sleep 5 & printf 'parent exited\\n'"],
+            Duration::from_millis(200),
+        );
+        assert!(result.timed_out);
+        assert!(!result.success);
+        assert!(result.stdout.contains("parent exited"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn run_command_bounds_output_from_chatty_process() {
+        let result = run_command_with_timeout("yes", &["x"], Duration::from_secs(2));
+        assert!(!result.success);
+        assert!(!result.timed_out);
+        assert!(result.stderr.starts_with("command output exceeds 16 MiB"));
+        assert!(result.stdout.len() <= MAX_COMMAND_OUTPUT);
     }
 
     #[test]

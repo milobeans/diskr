@@ -18,7 +18,7 @@ Most disk usage tools show you a tree of sizes and leave you to figure out the r
 
 **Package and dependency inspection.** The TUI has a dedicated packages pane showing Homebrew, Cargo, pip, npm, and other package managers with per-package sizes. It also finds project dependency directories (`node_modules`, `target`, `.venv`) under the current path and shows how much space each one takes.
 
-**macOS-native integration.** Reveal any file in Finder with `f`, open with the default app with `O`, and delete to Trash (never permanent removal) with `d`.
+**macOS-native integration.** Reveal any file in Finder with `f`, open with the default app with `O`, and move files or project dependency directories to Trash with `d`. On an installed package, `d` runs that manager's uninstall flow after confirmation.
 
 ## Install
 
@@ -44,6 +44,8 @@ diskr ~/Downloads   # starts in a specific directory
 ### CLI reports
 
 All report modes support `--json` for scripting and automation.
+Follow-up commands printed by reports quote paths for macOS `zsh`; paths
+containing control or non-UTF-8 bytes use `$'\\xNN'` byte escapes.
 
 ```sh
 diskr --top 20 ~/Downloads        # largest files by allocated size
@@ -86,7 +88,7 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | n | Create a directory |
 | v | Toggle a mark on the selected file |
 | a | Mark all visible files |
-| d | Move the selected item (or all marks) to Trash |
+| d | Trash file/project dependency (or marks); uninstall installed package |
 | f | Reveal selected item in Finder |
 | O | Open selected item with the default app |
 | y | Copy selected item path to clipboard |

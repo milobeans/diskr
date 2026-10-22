@@ -172,7 +172,7 @@ const FILES: &[KeyBinding] = &[
     },
     KeyBinding {
         key: "d",
-        action: "Move selected item (or marks) to Trash",
+        action: "Trash file/project dependency (or marks); uninstall installed package",
         footer: Some(FooterBinding {
             key: "d",
             action: "trash",

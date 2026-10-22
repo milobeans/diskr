@@ -22,10 +22,12 @@ use crossterm::{
 };
 use ratatui_core::terminal::Terminal;
 use std::{
+    cell::RefCell,
     ffi::OsString,
-    io::{self, IsTerminal},
+    fmt,
+    io::{self, IsTerminal, Write as _},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -33,21 +35,57 @@ use app::{format_elapsed, human, ActiveModal, App, Focus};
 use terminal_backend::CrosstermBackend;
 use terminal_text::SafePath;
 
+thread_local! {
+    static CLI_OUTPUT: RefCell<io::BufWriter<io::Stdout>> =
+        RefCell::new(io::BufWriter::new(io::stdout()));
+}
+
+fn write_cli(args: fmt::Arguments<'_>) -> io::Result<()> {
+    CLI_OUTPUT.with(|output| output.borrow_mut().write_fmt(args))
+}
+
+fn flush_cli() -> io::Result<()> {
+    CLI_OUTPUT.with(|output| output.borrow_mut().flush())
+}
+
+macro_rules! cli_print {
+    ($($arg:tt)*) => {{
+        if let Err(error) = write_cli(format_args!($($arg)*)) {
+            return Err(error.into());
+        }
+    }};
+}
+
+macro_rules! cli_println {
+    () => {{
+        cli_print!("\n");
+    }};
+    ($($arg:tt)*) => {{
+        if let Err(error) = write_cli(format_args!("{}\n", format_args!($($arg)*))) {
+            return Err(error.into());
+        }
+    }};
+}
+
 fn main() {
     if let Err(err) = run_main() {
+        if err
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<io::Error>())
+            .any(|cause| cause.kind() == io::ErrorKind::BrokenPipe)
+        {
+            return;
+        }
         eprintln!("error: {}", terminal_text::sanitize(&format!("{err:#}")));
         std::process::exit(1);
     }
 }
 
 fn run_main() -> Result<()> {
-    match parse_args(std::env::args_os().skip(1))? {
-        CliAction::Help => {
-            print_help();
-            Ok(())
-        }
+    let result = match parse_args(std::env::args_os().skip(1))? {
+        CliAction::Help => print_help(),
         CliAction::Version => {
-            println!("diskr {}", env!("CARGO_PKG_VERSION"));
+            cli_println!("diskr {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         CliAction::Top { path, limit, json } => print_top(path, limit, json),
@@ -62,7 +100,10 @@ fn run_main() -> Result<()> {
             confirmed,
         } => thin_snapshots(path, bytes, confirmed),
         CliAction::Run(start) => run_app(start),
-    }
+    };
+    result?;
+    flush_cli()?;
+    Ok(())
 }
 
 fn run_app(start: PathBuf) -> Result<()> {
@@ -107,6 +148,22 @@ fn canonical_dir(path: PathBuf) -> Result<PathBuf> {
     }
     path.canonicalize()
         .with_context(|| format!("resolve {}", path.display()))
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let bytes = path.as_os_str().as_bytes();
+    if let Ok(utf8) = std::str::from_utf8(bytes) {
+        if !utf8.chars().any(char::is_control) {
+            return format!("'{}'", utf8.replace('\'', "'\\''"));
+        }
+    }
+    let mut quoted = String::from("$'");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(quoted, "\\x{byte:02x}");
+    }
+    quoted.push('\'');
+    quoted
 }
 
 enum CliAction {
@@ -213,6 +270,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
                 let limit = arg_text.trim_start_matches("--top=");
                 top_limit = Some(parse_top_limit(limit)?);
             }
+            _ if arg_text.starts_with('-') => {
+                bail!("unknown option {arg_text}; use -- before a path beginning with -");
+            }
             _ => {
                 set_cli_path(&mut path, arg)?;
             }
@@ -298,8 +358,8 @@ fn parse_top_limit(value: &str) -> Result<usize> {
     Ok(limit)
 }
 
-fn print_help() {
-    print!(
+fn print_help() -> Result<()> {
+    cli_print!(
         "\
 diskr {}
 
@@ -320,16 +380,17 @@ Keys:
 ",
         env!("CARGO_PKG_VERSION")
     );
-    print_key_help();
+    print_key_help()
 }
 
-fn print_key_help() {
+fn print_key_help() -> Result<()> {
     for section in keymap::HELP_SECTIONS {
-        println!("\n{}:", section.title);
+        cli_println!("\n{}:", section.title);
         for binding in section.bindings {
-            println!("  {:<16} {}", binding.key, binding.action);
+            cli_println!("  {:<16} {}", binding.key, binding.action);
         }
     }
+    Ok(())
 }
 
 fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
@@ -357,38 +418,38 @@ fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
             "skipped_mounts": scan.skipped_mounts,
             "files": files,
         });
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        cli_println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
-    println!(
+    cli_println!(
         "Top {} files by allocated size under {}",
         limit,
         SafePath(&path)
     );
-    println!(
+    cli_println!(
         "Total: {} disk / {} apparent",
         human(scan.size.allocated),
         human(scan.size.logical)
     );
     if scan.inaccessible > 0 {
-        println!(
+        cli_println!(
             "Warning: {} directories were unreadable; totals are lower bounds.",
             scan.inaccessible
         );
     }
     if scan.skipped_mounts > 0 {
-        println!(
+        cli_println!(
             "Note: skipped {} mounted volumes on other devices.",
             scan.skipped_mounts
         );
     }
     if scan.largest_files.is_empty() {
-        println!("No regular files found.");
+        cli_println!("No regular files found.");
         return Ok(());
     }
     for (index, file) in scan.largest_files.iter().enumerate() {
-        println!(
+        cli_println!(
             "{:>2}. {:>22}  {}",
             index + 1,
             top_size_label(file.size),
@@ -457,34 +518,34 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
             "measurement": "candidate allocated bytes, not guaranteed freed space",
             "estimated_freed_bytes": null,
         });
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        cli_println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
 
-    println!("Cleanup candidates under {}", SafePath(&report.root));
-    println!(
+    cli_println!("Cleanup candidates under {}", SafePath(&report.root));
+    cli_println!(
         "Total: {} disk / {} apparent",
         human(report.total.allocated),
         human(report.total.logical)
     );
     if report.inaccessible > 0 {
-        println!(
+        cli_println!(
             "Warning: {} directories were unreadable; totals are lower bounds.",
             report.inaccessible
         );
     }
     if report.skipped_mounts > 0 {
-        println!(
+        cli_println!(
             "Note: skipped {} mounted volumes on other devices.",
             report.skipped_mounts
         );
     }
-    println!("{}", report.scope.summary());
+    cli_println!("{}", report.scope.summary());
     if report.findings.is_empty() {
-        println!("No known cleanup candidates found within the searched scope.");
+        cli_println!("No known cleanup candidates found within the searched scope.");
         return Ok(());
     }
-    println!("Allocated candidate bytes are not guaranteed freed space: hardlinks, APFS clones and snapshots can retain blocks. Moving items to Trash does not free space until Trash is emptied.");
+    cli_println!("Allocated candidate bytes are not guaranteed freed space: hardlinks, APFS clones and snapshots can retain blocks. Moving items to Trash does not free space until Trash is emptied.");
     for finding in &report.findings {
         let count = if finding.count > 1 {
             format!(" (x{})", finding.count)
@@ -495,7 +556,7 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
         // counted inside the child findings; mark them so readers are not
         // misled into thinking they add to the total.
         let rollup_suffix = if finding.rollup { " [subtotal]" } else { "" };
-        println!(
+        cli_println!(
             "{:>22}  [{:^11}]  {}{}{}",
             reclaim_size_label(finding),
             finding.class.label(),
@@ -503,9 +564,9 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
             count,
             rollup_suffix
         );
-        println!("                          {}", finding.note);
+        cli_println!("                          {}", finding.note);
     }
-    println!("\nThis is a report only; diskr does not delete anything here.");
+    cli_println!("\nThis is a report only; diskr does not delete anything here.");
     Ok(())
 }
 
@@ -534,26 +595,26 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
             "inaccessible": record.inaccessible(),
             "children": children,
         });
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        cli_println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
 
-    println!("Saved baseline for {}", SafePath(&record.path));
-    println!(
+    cli_println!("Saved baseline for {}", SafePath(&record.path));
+    cli_println!(
         "Total: {} disk / {} apparent across {} entries",
         human(total.allocated),
         human(total.logical),
         record.children.len()
     );
     if record.inaccessible() > 0 {
-        println!(
+        cli_println!(
             "Warning: {} directories were unreadable; totals are lower bounds.",
             record.inaccessible()
         );
     }
-    println!(
-        "Compare later with `diskr --diff {}`.",
-        SafePath(&record.path)
+    cli_println!(
+        "Compare later with: diskr --diff {}",
+        shell_quote_path(&record.path)
     );
     Ok(())
 }
@@ -602,12 +663,12 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
             "total_delta_allocated": report.total_delta_allocated().to_string(),
             "changes": changes,
         });
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        cli_println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
 
-    println!("Diff for {}", SafePath(&report.path));
-    println!(
+    cli_println!("Diff for {}", SafePath(&report.path));
+    cli_println!(
         "Baseline captured {}",
         format_elapsed(
             report
@@ -615,28 +676,28 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
                 .saturating_sub(report.baseline_timestamp)
         )
     );
-    println!(
+    cli_println!(
         "Total: {} disk → {} disk  ({})",
         human(report.before_total.allocated),
         human(report.after_total.allocated),
         format_signed_bytes(report.total_delta_allocated())
     );
     if !report.complete() {
-        println!(
+        cli_println!(
             "Warning: unreadable paths (baseline {}, current {}), skipped mounts (baseline {}, current {}); totals are lower bounds and deltas are indeterminate.",
             report.baseline_inaccessible, report.current_inaccessible, report.baseline_skipped_mounts, report.current_skipped_mounts
         );
     }
     if report.changes.is_empty() {
         if !report.complete() {
-            println!("No observed changes; comparison incomplete.");
+            cli_println!("No observed changes; comparison incomplete.");
         } else {
-            println!("No changes since the baseline.");
+            cli_println!("No changes since the baseline.");
         }
         return Ok(());
     }
     for change in &report.changes {
-        println!(
+        cli_println!(
             "{:>12}  {:<9}  {}",
             format_signed_bytes(change.delta_allocated()),
             change_status(change),
@@ -702,54 +763,61 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
             "available": report.available,
             "free_not_user_available": report.unavailable_free(),
             "apfs_container": apfs_container,
+            "apfs_error": report.apfs_error,
             "local_snapshots": snapshots,
             "local_snapshot_error": report.local_snapshots.error,
         });
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        cli_println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
 
-    println!("Space report for {}", SafePath(&report.path));
-    println!(
+    cli_println!("Space report for {}", SafePath(&report.path));
+    cli_println!(
         "Mount: {} ({}, {})",
         SafePath(&report.mount),
         terminal_text::sanitize(&report.fs_type),
         terminal_text::sanitize(&report.device)
     );
-    println!("Total: {}", human(report.total));
-    println!("Used: {}", human(report.used));
-    println!("Free blocks: {}", human(report.free));
-    println!("Available to user: {}", human(report.available));
+    cli_println!("Total: {}", human(report.total));
+    cli_println!("Used: {}", human(report.used));
+    cli_println!("Free blocks: {}", human(report.free));
+    cli_println!("Available to user: {}", human(report.available));
     let unavailable = report.unavailable_free();
     if unavailable > 0 {
-        println!("Free but not user-available: {}", human(unavailable));
+        cli_println!("Free but not user-available: {}", human(unavailable));
     }
     if let Some(container) = &report.apfs_container {
-        println!(
+        cli_println!(
             "APFS container {}: {} total / {} free",
             terminal_text::sanitize(&container.reference),
             human(container.size),
             human(container.free)
         );
     }
+    if let Some(error) = &report.apfs_error {
+        cli_println!(
+            "APFS container: unavailable ({})",
+            terminal_text::sanitize(error)
+        );
+    }
     match &report.local_snapshots.error {
         Some(error) if !error.is_empty() => {
-            println!(
+            cli_println!(
                 "Local snapshots: unavailable ({})",
                 terminal_text::sanitize(error)
             );
         }
         _ if report.local_snapshots.names.is_empty() => {
-            println!("Local snapshots: none reported by tmutil");
+            cli_println!("Local snapshots: none reported by tmutil");
         }
         _ => {
-            println!("Local snapshots: {}", report.local_snapshots.names.len());
+            cli_println!("Local snapshots: {}", report.local_snapshots.names.len());
             for name in &report.local_snapshots.names {
-                println!("  {}", terminal_text::sanitize(name));
+                cli_println!("  {}", terminal_text::sanitize(name));
             }
-            println!(
-                "Snapshot sizes are not reported by tmutil. To request reclamation, first preview with `diskr --thin-snapshots 10G {}`.",
-                SafePath(&report.path)
+            cli_println!(
+                "Snapshot sizes are not reported by tmutil. To request reclamation, first preview with: diskr --thin-snapshots 10G {}",
+                shell_quote_path(&report.path)
             );
         }
     }
@@ -814,12 +882,12 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             "system_packages": managers,
             "project_dependencies": projects,
         });
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        cli_println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
 
-    println!("Package report");
-    println!();
+    cli_println!("Package report");
+    cli_println!();
 
     let mut any_manager = false;
     for report in &reports {
@@ -828,11 +896,11 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
         }
         any_manager = true;
         if let Some(w) = &report.warning {
-            println!("{}: {}", report.manager.label(), terminal_text::sanitize(w));
-            println!();
+            cli_println!("{}: {}", report.manager.label(), terminal_text::sanitize(w));
+            cli_println!();
             continue;
         }
-        println!(
+        cli_println!(
             "{}: {} packages · {}",
             report.manager.label(),
             report.packages.len(),
@@ -849,7 +917,7 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
                 .size
                 .map(|s| human(s.allocated))
                 .unwrap_or_else(|| String::from("?"));
-            println!(
+            cli_println!(
                 "  {:>10}  {} {}",
                 size_str,
                 terminal_text::sanitize(&pkg.name),
@@ -857,24 +925,24 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             );
         }
         if report.packages.len() > 10 {
-            println!("  … and {} more", report.packages.len() - 10);
+            cli_println!("  … and {} more", report.packages.len() - 10);
         }
-        println!();
+        cli_println!();
     }
 
     if !any_manager {
-        println!("No supported package managers found.");
-        println!();
+        cli_println!("No supported package managers found.");
+        cli_println!();
     }
 
     if !project_deps.is_empty() {
-        println!("Project dependencies under {}", SafePath(&path));
+        cli_println!("Project dependencies under {}", SafePath(&path));
         for dep in project_deps {
             let size_str = dep
                 .deps_size
                 .map(|s| human(s.allocated))
                 .unwrap_or_else(|| String::from("—"));
-            println!(
+            cli_println!(
                 "  {:>10}  {} ({}, {} deps)",
                 size_str,
                 SafePath(&dep.path),
@@ -883,9 +951,9 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             );
         }
     }
-    println!("{}", project_scan.scope.summary());
+    cli_println!("{}", project_scan.scope.summary());
     if project_scan.inaccessible > 0 {
-        println!(
+        cli_println!(
             "Warning: {} project paths were unreadable; dependency results are incomplete.",
             project_scan.inaccessible
         );
@@ -901,12 +969,12 @@ fn thin_snapshots(path: PathBuf, bytes: u64, confirmed: bool) -> Result<()> {
     let path = canonical_dir(path)?;
     let mount = space::report_for_path(&path)?.mount;
     if !confirmed {
-        println!(
+        cli_println!(
             "Would run: tmutil thinlocalsnapshots {} {} 4",
-            SafePath(&mount),
+            shell_quote_path(&mount),
             bytes
         );
-        println!(
+        cli_println!(
             "Re-run with --yes to request {} of local snapshot reclamation.",
             human(bytes)
         );
@@ -914,13 +982,13 @@ fn thin_snapshots(path: PathBuf, bytes: u64, confirmed: bool) -> Result<()> {
     }
 
     let result = space::thin_local_snapshots(&mount, bytes)?;
-    println!(
+    cli_println!(
         "Requested {} of local snapshot reclamation for {}.",
         human(result.requested_bytes),
         SafePath(&result.path)
     );
     if !result.stdout.is_empty() {
-        println!("{}", terminal_text::sanitize(&result.stdout));
+        cli_println!("{}", terminal_text::sanitize(&result.stdout));
     }
     if !result.stderr.is_empty() {
         eprintln!("{}", terminal_text::sanitize(&result.stderr));
@@ -934,15 +1002,6 @@ enum ExternalAction {
     Open,
 }
 
-impl ExternalAction {
-    fn status_label(self) -> &'static str {
-        match self {
-            ExternalAction::RevealInFinder => "reveal in Finder",
-            ExternalAction::Open => "open",
-        }
-    }
-}
-
 fn launch_external_action(app: &mut App, action: ExternalAction) {
     let Some((path, label)) = selected_action_target(app) else {
         app.status = String::from("nothing selected");
@@ -953,15 +1012,11 @@ fn launch_external_action(app: &mut App, action: ExternalAction) {
 }
 
 fn launch_external_action_at(app: &mut App, action: ExternalAction, path: PathBuf, label: String) {
-    let result = match action {
-        ExternalAction::RevealInFinder => spawn_reveal_in_finder(&path),
-        ExternalAction::Open => spawn_open(&path),
-    };
-
-    app.status = match result {
-        Ok(()) => format!("{}: {label}", action.status_label()),
-        Err(err) => format!("{} failed: {err}", action.status_label()),
-    };
+    app.start_external_open(
+        path,
+        label,
+        matches!(action, ExternalAction::RevealInFinder),
+    );
 }
 
 fn selected_action_target(app: &App) -> Option<(PathBuf, String)> {
@@ -1001,28 +1056,6 @@ fn selected_action_target(app: &App) -> Option<(PathBuf, String)> {
         }
         Focus::Reclaim => app.selected_reclaim_path().map(|(name, path)| (path, name)),
     }
-}
-
-fn spawn_reveal_in_finder(path: &Path) -> Result<()> {
-    let mut command = Command::new("open");
-    command.arg("-R").arg(path);
-    spawn_detached(&mut command)
-}
-
-fn spawn_open(path: &Path) -> Result<()> {
-    let mut command = Command::new("open");
-    command.arg(path);
-    spawn_detached(&mut command)
-}
-
-fn spawn_detached(command: &mut Command) -> Result<()> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawn macOS command")?;
-    Ok(())
 }
 
 /// Restore the terminal to its normal state. Safe to call more than once:
@@ -1242,21 +1275,29 @@ where
                             }
                             KeyCode::Enter | KeyCode::Char('f') => {
                                 if let Some(path) = app.selected_top_file_path() {
-                                    let result = spawn_reveal_in_finder(&path);
-                                    app.status = match result {
-                                        Ok(()) => String::from("revealed top file in Finder"),
-                                        Err(err) => format!("reveal failed: {err}"),
-                                    };
+                                    let label =
+                                        terminal_text::sanitize(&path.display().to_string())
+                                            .into_owned();
+                                    launch_external_action_at(
+                                        app,
+                                        ExternalAction::RevealInFinder,
+                                        path,
+                                        label,
+                                    );
                                 }
                                 true
                             }
                             KeyCode::Char('O') => {
                                 if let Some(path) = app.selected_top_file_path() {
-                                    let result = spawn_open(&path);
-                                    app.status = match result {
-                                        Ok(()) => String::from("opened top file"),
-                                        Err(err) => format!("open failed: {err}"),
-                                    };
+                                    let label =
+                                        terminal_text::sanitize(&path.display().to_string())
+                                            .into_owned();
+                                    launch_external_action_at(
+                                        app,
+                                        ExternalAction::Open,
+                                        path,
+                                        label,
+                                    );
                                 }
                                 true
                             }
@@ -1304,22 +1345,24 @@ where
                                 true
                             }
                             KeyCode::Enter | KeyCode::Char('f') => {
-                                if let Some((_, path)) = app.selected_reclaim_path() {
-                                    let result = spawn_reveal_in_finder(&path);
-                                    app.status = match result {
-                                        Ok(()) => String::from("revealed reclaim path in Finder"),
-                                        Err(err) => format!("reveal failed: {err}"),
-                                    };
+                                if let Some((name, path)) = app.selected_reclaim_path() {
+                                    launch_external_action_at(
+                                        app,
+                                        ExternalAction::RevealInFinder,
+                                        path,
+                                        terminal_text::sanitize(&name).into_owned(),
+                                    );
                                 }
                                 true
                             }
                             KeyCode::Char('O') => {
-                                if let Some((_, path)) = app.selected_reclaim_path() {
-                                    let result = spawn_open(&path);
-                                    app.status = match result {
-                                        Ok(()) => String::from("opened reclaim path"),
-                                        Err(err) => format!("open failed: {err}"),
-                                    };
+                                if let Some((name, path)) = app.selected_reclaim_path() {
+                                    launch_external_action_at(
+                                        app,
+                                        ExternalAction::Open,
+                                        path,
+                                        terminal_text::sanitize(&name).into_owned(),
+                                    );
                                 }
                                 true
                             }
@@ -1951,6 +1994,41 @@ mod tests {
     fn accepts_dash_prefixed_path_after_separator() {
         let action = parse(&["--", "-cache"]).unwrap();
         assert!(matches!(action, CliAction::Run(path) if path == std::path::Path::new("-cache")));
+    }
+
+    #[test]
+    fn suggested_shell_paths_round_trip_in_zsh() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::process::Command;
+
+        for bytes in [
+            b"/tmp/space and 'apostrophe'".to_vec(),
+            "/tmp/résumé".as_bytes().to_vec(),
+            b"/tmp/control\nline".to_vec(),
+            b"/tmp/raw-\xff".to_vec(),
+        ] {
+            let path = PathBuf::from(OsString::from_vec(bytes.clone()));
+            let expression = shell_quote_path(&path);
+            let output = Command::new("zsh")
+                .arg("-c")
+                .arg(format!("printf %s {expression}"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "zsh rejected {}: {}",
+                expression,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, bytes);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_option_before_separator() {
+        let error = parse(&["--tops"]).err().unwrap();
+        assert!(error.to_string().contains("unknown option --tops"));
+        assert!(error.to_string().contains("use --"));
     }
 
     #[test]

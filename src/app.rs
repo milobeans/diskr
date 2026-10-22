@@ -548,6 +548,7 @@ pub struct App {
     pub confirming_empty_trash: bool,
     empty_trash_rx: Option<Receiver<Result<(), String>>>,
     batch_delete_rx: Option<Receiver<DeleteJobMsg>>,
+    external_action_rxs: Vec<Receiver<ExternalActionResult>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -586,6 +587,30 @@ struct DeleteJobMsg {
     target: DeleteTarget,
     deleted: Vec<PathBuf>,
     failures: Vec<(PathBuf, String)>,
+}
+
+struct ExternalActionResult {
+    label: String,
+    action: &'static str,
+    result: Result<(), String>,
+}
+
+fn run_external_open(path: &Path, reveal: bool) -> Result<(), String> {
+    let mut command = Command::new("open");
+    if reveal {
+        command.arg("-R");
+    }
+    command.arg(path);
+    let output = packages::run_process(command, Duration::from_secs(15));
+    if output.timed_out {
+        Err(String::from("open timed out; check Finder before retrying"))
+    } else if output.success {
+        Ok(())
+    } else if output.stderr.trim().is_empty() {
+        Err(String::from("open exited with an error"))
+    } else {
+        Err(output.stderr.trim().to_string())
+    }
 }
 
 impl App {
@@ -792,6 +817,7 @@ impl App {
             confirming_empty_trash: false,
             empty_trash_rx: None,
             batch_delete_rx: None,
+            external_action_rxs: Vec::new(),
         };
         app.fda_limited = full_disk_access_missing();
         app.refresh_disks();
@@ -1583,6 +1609,7 @@ impl App {
         changed |= self.drain_disk_info_results();
         changed |= self.drain_file_info_results();
         changed |= self.drain_history_results();
+        changed |= self.drain_external_action_results();
         changed |= self.drain_empty_trash_results();
         changed |= self.drain_batch_delete_results();
         changed
@@ -2407,6 +2434,53 @@ impl App {
             || self.uninstall_rx.is_some()
             || self.empty_trash_rx.is_some()
             || self.batch_delete_rx.is_some()
+            || !self.external_action_rxs.is_empty()
+    }
+
+    pub fn start_external_open(&mut self, path: PathBuf, label: String, reveal: bool) {
+        self.start_external_open_with(path, label, reveal, run_external_open);
+    }
+
+    fn start_external_open_with(
+        &mut self,
+        path: PathBuf,
+        label: String,
+        reveal: bool,
+        runner: fn(&Path, bool) -> Result<(), String>,
+    ) {
+        let (tx, rx) = channel();
+        let action = if reveal { "reveal in Finder" } else { "open" };
+        self.external_action_rxs.push(rx);
+        self.status = format!("requesting {action}: {label}…");
+        thread::spawn(move || {
+            let result = runner(&path, reveal);
+            let _ = tx.send(ExternalActionResult {
+                label,
+                action,
+                result,
+            });
+        });
+    }
+
+    fn drain_external_action_results(&mut self) -> bool {
+        let mut changed = false;
+        self.external_action_rxs.retain(|rx| match rx.try_recv() {
+            Ok(msg) => {
+                self.status = match msg.result {
+                    Ok(()) => format!("{} requested: {}", msg.action, msg.label),
+                    Err(error) => format!("{} failed for {}: {error}", msg.action, msg.label),
+                };
+                changed = true;
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => {
+                self.status = String::from("external action worker failed");
+                changed = true;
+                false
+            }
+        });
+        changed
     }
 
     pub fn request_delete(&mut self) {
@@ -2454,20 +2528,8 @@ impl App {
                         let real_idx = self
                             .pkg_visible_index(self.selected_pkg)
                             .unwrap_or(usize::MAX);
-                        let packages = &self.cached_flat_packages;
-                        if let Some((package, manager)) = packages.get(real_idx) {
-                            if *manager == packages::Manager::BrewCask {
-                                self.request_uninstall();
-                            } else if let Some(path) = &package.path {
-                                self.pending_delete = Some(DeleteTarget::Package {
-                                    name: format!("{} {}", manager.label(), package.name),
-                                    path: path.clone(),
-                                    is_project_dep: false,
-                                });
-                                self.confirming_delete = true;
-                            } else {
-                                self.status = format!("no path known for package {}", package.name);
-                            }
+                        if self.cached_flat_packages.get(real_idx).is_some() {
+                            self.request_uninstall();
                         }
                     }
                     PkgView::ProjectDeps => {
@@ -5103,6 +5165,71 @@ mod tests {
             _ => panic!("expected DeleteTarget::Package"),
         }
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn installed_package_delete_uses_manager_for_full_install() {
+        let root = test_root("installed_pkg_delete");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Packages;
+        app.pkg_view = PkgView::SystemManagers;
+
+        for manager in [
+            packages::Manager::Cargo,
+            packages::Manager::Pip,
+            packages::Manager::BrewCask,
+        ] {
+            app.cached_flat_packages = vec![(
+                packages::Package {
+                    name: String::from("example"),
+                    version: String::from("1.0"),
+                    size: Some(SizeInfo::new(100, 100)),
+                    path: Some(root.join("only-one-part")),
+                    metadata_path: Some(root.join("other-parts")),
+                },
+                manager,
+            )];
+            app.rebuild_pkg_visible_indices();
+            app.selected_pkg = 0;
+            app.request_delete();
+
+            assert!(app.confirming_uninstall);
+            assert!(app.pending_delete.is_none());
+            assert_eq!(app.pending_uninstall.as_ref().unwrap().manager, manager);
+            app.cancel_uninstall();
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_action_reports_completion_after_worker_result() {
+        fn simulated_open(_path: &Path, _reveal: bool) -> Result<(), String> {
+            Err(String::from("simulated utility failure"))
+        }
+
+        let root = test_root("external_action_result");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.start_external_open_with(
+            root.join("selected"),
+            String::from("selected"),
+            true,
+            simulated_open,
+        );
+        assert!(app.status.starts_with("requesting reveal in Finder"));
+        assert_eq!(app.external_action_rxs.len(), 1);
+
+        for _ in 0..100 {
+            if app.drain_external_action_results() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.external_action_rxs.is_empty());
+        assert!(app.status.contains("simulated utility failure"));
         fs::remove_dir_all(root).unwrap();
     }
 

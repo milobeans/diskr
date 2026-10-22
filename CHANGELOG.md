@@ -6,6 +6,27 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.74] - 2026-10-22
+
+### Fixed
+
+- Package-manager and macOS utility commands keep their deadline through
+  output draining, limit captured output, and clean up process groups after
+  a timeout. Snapshot thinning reports uncertain completion so it can be
+  checked before retrying.
+- Space reports query snapshots at the owning mount and expose APFS discovery
+  failures instead of silently omitting container information.
+- Unknown command-line options now report a usage hint; paths beginning with
+  a dash remain available after `--`.
+- CLI reports and help treat a closed stdout pipe as normal completion.
+- Suggested follow-up commands quote paths for macOS shells, including spaces,
+  apostrophes, control characters and non-UTF-8 names.
+- `d` on an installed package opens its native uninstall confirmation, which
+  covers multi-file installs; `d` still moves project dependency directories
+  and file selections to Trash.
+- Finder reveal and Open actions now report their eventual utility exit status
+  through managed background jobs instead of reporting success on spawn.
+
 ## [0.1.73] - 2026-10-22
 
 ### Fixed
