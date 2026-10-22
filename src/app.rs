@@ -512,7 +512,7 @@ pub struct App {
     disk_info_id: ScanId,
     disk_info_scan_rx: Option<Receiver<DiskInfoMsg>>,
     disk_snapshots_rx: Option<Receiver<space::SnapshotListing>>,
-    disk_apfs_rx: Option<Receiver<Result<space::ApfsContainer, String>>>,
+    disk_apfs_rx: Option<Receiver<Result<space::ApfsContainer, space::DiscoveryError>>>,
     pub disk_info_report: Option<space::SpaceReport>,
     pub file_info: Option<FileInfo>,
     pub file_info_open: bool,
@@ -2541,12 +2541,13 @@ impl App {
     }
 
     pub fn retry_disk_apfs(&mut self) {
-        self.retry_disk_apfs_with(|mount| {
-            space::apfs_container_for_mount(mount).map_err(|error| error.to_string())
-        });
+        self.retry_disk_apfs_with(space::apfs_container_for_mount);
     }
 
-    fn retry_disk_apfs_with(&mut self, runner: fn(&Path) -> Result<space::ApfsContainer, String>) {
+    fn retry_disk_apfs_with(
+        &mut self,
+        runner: fn(&Path) -> Result<space::ApfsContainer, space::DiscoveryError>,
+    ) {
         let Some(report) = self.disk_info_report.as_ref() else {
             self.status = String::from("load disk details before retrying APFS");
             return;
@@ -5471,7 +5472,7 @@ mod tests {
             path: root.clone(),
             manager_label: String::from("cargo"),
             manifest: String::from("Cargo.toml"),
-            dep_count: 5,
+            dep_count: 5usize.into(),
             deps_size: None,
             deps_dir: Some(root.join("target")),
             coverage: Default::default(),
@@ -5595,16 +5596,19 @@ mod tests {
 
     #[test]
     fn disk_enrichments_retry_independently_without_real_utilities() {
-        fn snapshots(_mount: &Path) -> space::SnapshotListing {
+        fn snapshots(mount: &Path) -> space::SnapshotListing {
+            assert!(mount.ends_with("volume"));
             space::SnapshotListing {
                 names: vec![String::from("snapshot-one")],
                 error: None,
             }
         }
-        fn apfs_failure(_mount: &Path) -> Result<space::ApfsContainer, String> {
-            Err(String::from("simulated diskutil failure"))
+        fn apfs_failure(mount: &Path) -> Result<space::ApfsContainer, space::DiscoveryError> {
+            assert!(mount.ends_with("volume"));
+            Err(String::from("simulated diskutil failure").into())
         }
-        fn apfs_success(_mount: &Path) -> Result<space::ApfsContainer, String> {
+        fn apfs_success(mount: &Path) -> Result<space::ApfsContainer, space::DiscoveryError> {
+            assert!(mount.ends_with("volume"));
             Ok(space::ApfsContainer {
                 reference: String::from("disk1"),
                 size: 100,
@@ -5618,7 +5622,7 @@ mod tests {
         app.disk_info_open = true;
         app.disk_info_report = Some(space::SpaceReport {
             path: root.clone(),
-            mount: root.clone(),
+            mount: root.join("volume"),
             device: String::from("disk1s1"),
             fs_type: String::from("apfs"),
             total: 100,
@@ -5630,7 +5634,7 @@ mod tests {
                 error: Some(String::from("old snapshot error")),
             },
             apfs_container: None,
-            apfs_error: Some(String::from("old APFS error")),
+            apfs_error: Some(String::from("old APFS error").into()),
         });
         app.retry_disk_snapshots_with(snapshots);
         app.retry_disk_apfs_with(apfs_failure);
@@ -5646,7 +5650,10 @@ mod tests {
         let report = app.disk_info_report.as_ref().unwrap();
         assert_eq!(report.local_snapshots.names, ["snapshot-one"]);
         assert_eq!(
-            report.apfs_error.as_deref(),
+            report
+                .apfs_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
             Some("simulated diskutil failure")
         );
         app.retry_disk_apfs_with(apfs_success);
@@ -5894,7 +5901,7 @@ mod tests {
                 path: root.join("Cargo.toml"),
                 manager_label: String::from("cargo"),
                 manifest: String::from("Cargo.toml"),
-                dep_count: 4,
+                dep_count: 4usize.into(),
                 deps_size: Some(SizeInfo::new(100, 100)),
                 deps_dir: Some(root.join("target")),
                 coverage: Default::default(),
@@ -5903,7 +5910,7 @@ mod tests {
                 path: root.join("package.json"),
                 manager_label: String::from("npm/bun/yarn"),
                 manifest: String::from("package.json"),
-                dep_count: 8,
+                dep_count: 8usize.into(),
                 deps_size: Some(SizeInfo::new(200, 200)),
                 deps_dir: Some(root.join("node_modules")),
                 coverage: Default::default(),
@@ -6378,7 +6385,7 @@ mod tests {
                 path: root_a.clone(),
                 manager_label: String::from("cargo"),
                 manifest: String::from("Cargo.toml"),
-                dep_count: 1,
+                dep_count: 1usize.into(),
                 deps_size: None,
                 deps_dir: Some(root_a.join("target")),
                 coverage: Default::default(),
@@ -7371,7 +7378,7 @@ mod tests {
             path: root.join("Cargo.toml"),
             manager_label: String::from("cargo"),
             manifest: String::from("Cargo.toml"),
-            dep_count: 3,
+            dep_count: 3usize.into(),
             deps_size: None,
             deps_dir: None,
             coverage: Default::default(),
@@ -7411,7 +7418,7 @@ mod tests {
                 path: root.join("Cargo.toml"),
                 manager_label: String::from("cargo"),
                 manifest: String::from("Cargo.toml"),
-                dep_count: 3,
+                dep_count: 3usize.into(),
                 deps_size: None,
                 deps_dir: Some(root.join("target")),
                 coverage: Default::default(),
@@ -7420,7 +7427,7 @@ mod tests {
                 path: root.join("package.json"),
                 manager_label: String::from("npm/bun/yarn"),
                 manifest: String::from("package.json"),
-                dep_count: 10,
+                dep_count: 10usize.into(),
                 deps_size: None,
                 deps_dir: Some(root.join("node_modules")),
                 coverage: Default::default(),
@@ -7471,7 +7478,7 @@ mod tests {
             path: root.join("Cargo.toml"),
             manager_label: String::from("cargo"),
             manifest: String::from("Cargo.toml"),
-            dep_count: 2,
+            dep_count: 2usize.into(),
             deps_size: None,
             deps_dir: None,
             coverage: Default::default(),

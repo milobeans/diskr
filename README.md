@@ -16,6 +16,10 @@ Most disk usage tools show you a tree of sizes and leave you to figure out the r
 
 **APFS space accounting.** `diskr --space` explains the gap between `df` free space and what's actually available to you by surfacing APFS container info, local Time Machine snapshots, and the user-available vs. free-block distinction. It can also thin local snapshots on request (`--thin-snapshots`), with a dry-run by default.
 
+Space discovery uses the owning volume mount point. APFS failures remain visible
+in text and details; JSON retains the error text and an `apfs_diagnostic` object
+whose `kind` is `timeout`, `tool_failure` or `malformed_output`.
+
 **Package and dependency inspection.** The TUI has a dedicated packages pane showing Homebrew, Cargo, pip, npm, and other package managers with per-package sizes. It also finds project dependency directories (`node_modules`, `target`, `.venv`) under the current path and shows how much space each one takes.
 
 Package reports distinguish empty inventories from unavailable managers, command
@@ -31,6 +35,17 @@ Manager details and JSON identify the executable and package roots used by the
 scan. Uninstall uses that retained installation scope. Cargo follows
 `CARGO_INSTALL_ROOT`, its user configuration and `CARGO_HOME`; Homebrew, Bun,
 npm and pip supply their active locations through their inventory commands.
+
+Project dependency counts are unique declared names across runtime, development,
+optional, peer and build groups, not a count of installed transitive packages.
+Cargo target tables and Python PEP/Poetry groups are included; Python names are
+normalized and merged across requirements and pyproject declarations. Local
+requirements includes are read with size and recursion limits; constraint files
+do not add direct dependencies. Go `indirect` requirements are excluded.
+Manifests are never executed. Dynamic declarations, executable Gemfiles and
+read/parse failures show unknown or lower-bound counts with warnings. JSON uses
+`dep_count: null` for an incomplete count and retains `known_dep_count`,
+`dependency_count_complete` and `dependency_warnings`.
 
 **macOS-native integration.** Reveal any file in Finder with `f`, open with the default app with `O`, and move files or project dependency directories to Trash with `d`. On an installed package, `d` runs that manager's uninstall flow after confirmation.
 

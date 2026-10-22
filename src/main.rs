@@ -4,6 +4,7 @@ mod fs_ops;
 mod fsevents;
 mod history;
 mod keymap;
+mod manifest;
 mod packages;
 mod pool;
 mod reclaim;
@@ -769,7 +770,8 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
             "available": report.available,
             "free_not_user_available": report.unavailable_free(),
             "apfs_container": apfs_container,
-            "apfs_error": report.apfs_error,
+            "apfs_error": report.apfs_error.as_ref().map(ToString::to_string),
+            "apfs_diagnostic": report.apfs_error.as_ref().map(|error| error.json()),
             "local_snapshots": snapshots,
             "local_snapshot_error": report.local_snapshots.error,
         });
@@ -803,7 +805,7 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
     if let Some(error) = &report.apfs_error {
         cli_println!(
             "APFS container: unavailable ({})",
-            terminal_text::sanitize(error)
+            terminal_text::sanitize(&error.to_string())
         );
     }
     match &report.local_snapshots.error {
@@ -888,7 +890,10 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
                     "path": d.path.to_string_lossy(),
                     "manager": d.manager_label,
                     "manifest": d.manifest,
-                    "dep_count": d.dep_count,
+                    "dep_count": d.dep_count.complete.then_some(d.dep_count.known),
+                    "known_dep_count": d.dep_count.known,
+                    "dependency_count_complete": d.dep_count.complete,
+                    "dependency_warnings": d.dep_count.warnings,
                     "deps_logical": d.deps_size.map(|s| s.logical),
                     "deps_allocated": d.deps_size.map(|s| s.allocated),
                     "footprint": d.coverage.json(),
@@ -1001,6 +1006,12 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
                 dep.dep_count,
                 dep.coverage.summary(),
             );
+            for warning in &dep.dep_count.warnings {
+                cli_println!(
+                    "    Dependency warning: {}",
+                    terminal_text::sanitize(warning)
+                );
+            }
         }
     }
     cli_println!("{}", project_scan.scope.summary());
@@ -2356,7 +2367,7 @@ mod tests {
             path: root.clone(),
             manager_label: String::from("cargo"),
             manifest: String::from("Cargo.toml"),
-            dep_count: 3,
+            dep_count: 3usize.into(),
             deps_size: None,
             deps_dir: Some(root.join("target")),
             coverage: Default::default(),

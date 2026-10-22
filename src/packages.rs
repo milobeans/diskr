@@ -9,6 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::bulkstat::{self, SizeInfo};
+pub use crate::manifest::DependencyCount;
+use crate::manifest::{self, bounded_text};
 use crate::pool;
 use crate::terminal_text;
 
@@ -502,7 +504,7 @@ pub struct ProjectDeps {
     pub path: PathBuf,
     pub manager_label: String,
     pub manifest: String,
-    pub dep_count: usize,
+    pub dep_count: DependencyCount,
     pub deps_size: Option<SizeInfo>,
     pub deps_dir: Option<PathBuf>,
     pub coverage: FootprintCoverage,
@@ -1854,11 +1856,7 @@ fn scan_project_dir(
     }
 
     let new_deps = pool::par_map(groups, |group| {
-        let dep_count = group
-            .manifests
-            .iter()
-            .map(|manifest| count_manifest_deps(dir, manifest))
-            .sum();
+        let dep_count = manifest::count(dir, &group.manifests);
         let (deps_size, deps_dir, coverage) = match group.deps_path {
             Some(deps_path) => {
                 let (size, coverage) =
@@ -1891,206 +1889,8 @@ fn scan_project_dir(
     }
 }
 
-fn count_manifest_deps(dir: &Path, manifest: &str) -> usize {
-    let path = dir.join(manifest);
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return 0;
-    };
-
-    match manifest {
-        "package.json" => count_package_json_deps(&content),
-        "Cargo.toml" => count_cargo_toml_deps(&content),
-        "requirements.txt" => count_requirements_deps(&content),
-        "pyproject.toml" => count_pyproject_deps(&content),
-        "go.mod" => count_go_mod_deps(&content),
-        "Gemfile" => count_gemfile_deps(&content),
-        "composer.json" => count_composer_deps(&content),
-        _ => 0,
-    }
-}
-
-fn count_package_json_deps(content: &str) -> usize {
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) else {
-        return 0;
-    };
-    let deps = parsed
-        .get("dependencies")
-        .and_then(|d| d.as_object())
-        .map(|d| d.len())
-        .unwrap_or(0);
-    let dev_deps = parsed
-        .get("devDependencies")
-        .and_then(|d| d.as_object())
-        .map(|d| d.len())
-        .unwrap_or(0);
-    deps + dev_deps
-}
-
-fn count_cargo_toml_deps(content: &str) -> usize {
-    let mut count = 0;
-    let mut in_deps = false;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_deps = trimmed == "[dependencies]"
-                || trimmed == "[dev-dependencies]"
-                || trimmed == "[build-dependencies]";
-            continue;
-        }
-        if in_deps && trimmed.contains('=') && !trimmed.starts_with('#') {
-            count += 1;
-        }
-    }
-    count
-}
-
-fn count_requirements_deps(content: &str) -> usize {
-    content
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with('-')
-        })
-        .count()
-}
-
-fn count_pyproject_deps(content: &str) -> usize {
-    let mut count = 0;
-    let mut section = String::new();
-    let mut in_string_array = false;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if in_string_array {
-            count += count_quoted_toml_strings(trimmed);
-            if trimmed.contains(']') {
-                in_string_array = false;
-            }
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            section.clear();
-            section.push_str(trimmed);
-            continue;
-        }
-
-        let Some((key, value)) = trimmed.split_once('=') else {
-            if section.contains("dependencies")
-                && (trimmed.starts_with('"') || trimmed.starts_with('\''))
-            {
-                count += 1;
-            }
-            continue;
-        };
-
-        let key = key.trim();
-        let value = value.trim();
-        if section == "[project]" && key == "dependencies" {
-            count += count_quoted_toml_strings(value);
-            in_string_array = value.contains('[') && !value.contains(']');
-        } else if section.contains("dependencies") {
-            if value.contains('[') {
-                count += count_quoted_toml_strings(value);
-                in_string_array = !value.contains(']');
-            } else {
-                count += 1;
-            }
-        }
-    }
-    count
-}
-
-fn count_quoted_toml_strings(value: &str) -> usize {
-    let mut count = 0;
-    let mut in_quote = None;
-    let mut escaped = false;
-    for ch in value.chars() {
-        match in_quote {
-            Some(_) if escaped => {
-                escaped = false;
-            }
-            Some('"') if ch == '\\' => escaped = true,
-            Some(quote) if ch == quote => {
-                in_quote = None;
-                count += 1;
-            }
-            Some(_) => {}
-            None if ch == '"' || ch == '\'' => in_quote = Some(ch),
-            None => {}
-        }
-    }
-    count
-}
-
-fn count_go_mod_deps(content: &str) -> usize {
-    let mut count = 0;
-    let mut in_require = false;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("require (") || trimmed == "require (" {
-            in_require = true;
-            continue;
-        }
-        if trimmed == ")" {
-            in_require = false;
-            continue;
-        }
-        if in_require && !trimmed.is_empty() && !trimmed.starts_with("//") {
-            count += 1;
-        }
-        if trimmed.starts_with("require ") && !trimmed.contains('(') {
-            count += 1;
-        }
-    }
-    count
-}
-
-fn count_gemfile_deps(content: &str) -> usize {
-    content
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            trimmed.starts_with("gem ")
-        })
-        .count()
-}
-
-fn count_composer_deps(content: &str) -> usize {
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) else {
-        return 0;
-    };
-    let required = parsed
-        .get("require")
-        .and_then(|d| d.as_object())
-        .map(|d| d.len())
-        .unwrap_or(0);
-    let dev_required = parsed
-        .get("require-dev")
-        .and_then(|d| d.as_object())
-        .map(|d| d.len())
-        .unwrap_or(0);
-    required + dev_required
-}
-
 fn command_exists(cmd: &str) -> bool {
     command_path(cmd).is_some()
-}
-
-const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-
-fn bounded_text(path: &Path) -> Result<String, String> {
-    use io::Read;
-    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
-    let mut text = String::new();
-    file.take(MAX_MANIFEST_BYTES + 1)
-        .read_to_string(&mut text)
-        .map_err(|error| error.to_string())?;
-    if text.len() as u64 > MAX_MANIFEST_BYTES {
-        return Err(String::from("file exceeds 1 MiB parser limit"));
-    }
-    Ok(text)
 }
 
 fn cargo_install_root() -> Result<PathBuf, String> {
@@ -2849,69 +2649,6 @@ mod tests {
     }
 
     #[test]
-    fn count_package_json() {
-        let content = r#"{"dependencies":{"a":"1","b":"2"},"devDependencies":{"c":"3"}}"#;
-        assert_eq!(count_package_json_deps(content), 3);
-    }
-
-    #[test]
-    fn count_cargo_toml() {
-        let content = "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1\"\nanyhow = \"1\"\n\n[dev-dependencies]\ntempfile = \"3\"\n";
-        assert_eq!(count_cargo_toml_deps(content), 3);
-    }
-
-    #[test]
-    fn count_requirements() {
-        let content = "flask==2.0\nrequests>=2.28\n# comment\n-r base.txt\n\nnumpy\n";
-        assert_eq!(count_requirements_deps(content), 3);
-    }
-
-    #[test]
-    fn count_pyproject_pep621_inline_dependencies() {
-        let content = r#"
-[project]
-name = "demo"
-dependencies = ["requests>=2", "click"]
-"#;
-
-        assert_eq!(count_pyproject_deps(content), 2);
-    }
-
-    #[test]
-    fn count_pyproject_pep621_multiline_dependencies() {
-        let content = r#"
-[project]
-dependencies = [
-  "requests>=2",
-  "click",
-]
-
-[project.optional-dependencies]
-dev = ["pytest", "ruff"]
-"#;
-
-        assert_eq!(count_pyproject_deps(content), 4);
-    }
-
-    #[test]
-    fn count_go_mod() {
-        let content = "module example.com/foo\n\ngo 1.21\n\nrequire (\n\tgithub.com/a/b v1.0\n\tgithub.com/c/d v2.0\n)\n";
-        assert_eq!(count_go_mod_deps(content), 2);
-    }
-
-    #[test]
-    fn count_gemfile() {
-        let content = "source 'https://rubygems.org'\ngem 'rails'\ngem 'pg'\n";
-        assert_eq!(count_gemfile_deps(content), 2);
-    }
-
-    #[test]
-    fn count_composer_json() {
-        let content = r#"{"require":{"php":"^8.2","monolog/monolog":"^3"},"require-dev":{"phpunit/phpunit":"^11"}}"#;
-        assert_eq!(count_composer_deps(content), 3);
-    }
-
-    #[test]
     fn manager_labels_are_distinct() {
         let labels: Vec<_> = Manager::ALL.iter().map(|m| m.label()).collect();
         let mut unique = labels.clone();
@@ -3355,7 +3092,7 @@ dev = ["pytest", "ruff"]
         let deps = find_project_deps(&root, 3);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].manifest, "package.json");
-        assert_eq!(deps[0].dep_count, 1);
+        assert_eq!(deps[0].dep_count.known, 1);
         assert!(deps[0].deps_size.is_some());
 
         std::fs::remove_dir_all(root).unwrap();
@@ -3370,7 +3107,7 @@ dev = ["pytest", "ruff"]
         std::fs::write(proj.join("requirements.txt"), "requests\nflask\n").unwrap();
         std::fs::write(
             proj.join("pyproject.toml"),
-            "[project.dependencies]\nclick = \"8\"\n",
+            "[project]\ndependencies = [\"click>=8\", \"requests\"]\n",
         )
         .unwrap();
         std::fs::write(proj.join(".venv/lib/site.py"), b"python deps").unwrap();
@@ -3380,7 +3117,8 @@ dev = ["pytest", "ruff"]
         assert_eq!(deps[0].path, proj);
         assert_eq!(deps[0].manager_label, "pip, pip/uv");
         assert_eq!(deps[0].manifest, "requirements.txt, pyproject.toml");
-        assert_eq!(deps[0].dep_count, 3);
+        assert_eq!(deps[0].dep_count.known, 3);
+        assert!(deps[0].dep_count.complete);
         assert_eq!(deps[0].deps_dir.as_ref(), Some(&root.join("pyapp/.venv")));
         assert!(deps[0].deps_size.is_some());
 

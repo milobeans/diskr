@@ -1120,7 +1120,10 @@ fn draw_disk_info_modal(f: &mut Frame, app: &App) {
     if let Some(error) = &report.apfs_error {
         lines.push(Line::from(vec![
             Span::styled("apfs container ", Style::default().fg(Color::DarkGray)),
-            Span::styled(error, Style::default().fg(Color::Red)),
+            Span::styled(
+                terminal_text::sanitize(&error.to_string()).into_owned(),
+                Style::default().fg(Color::Red),
+            ),
         ]));
     }
     match report.local_snapshots.error.as_deref() {
@@ -2423,6 +2426,12 @@ fn draw_project_dep_detail(f: &mut Frame, app: &App) {
         Span::styled("  Dependencies: ", Style::default().fg(Color::DarkGray)),
         Span::styled(dep.dep_count.to_string(), Style::default().fg(Color::White)),
     ]));
+    for warning in &dep.dep_count.warnings {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", terminal_text::sanitize(warning)),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
 
     if let Some(size) = dep.deps_size {
         lines.push(Line::from(vec![

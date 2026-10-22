@@ -19,7 +19,7 @@ pub struct SpaceReport {
     pub available: u64,
     pub local_snapshots: SnapshotListing,
     pub apfs_container: Option<ApfsContainer>,
-    pub apfs_error: Option<String>,
+    pub apfs_error: Option<DiscoveryError>,
 }
 
 impl SpaceReport {
@@ -41,6 +41,52 @@ pub struct ApfsContainer {
     pub free: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscoveryErrorKind {
+    Timeout,
+    ToolFailure,
+    MalformedOutput,
+}
+
+impl DiscoveryErrorKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::ToolFailure => "tool_failure",
+            Self::MalformedOutput => "malformed_output",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DiscoveryError {
+    pub kind: DiscoveryErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for DiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.kind.label(), self.message)
+    }
+}
+
+impl std::error::Error for DiscoveryError {}
+
+impl From<String> for DiscoveryError {
+    fn from(message: String) -> Self {
+        Self {
+            kind: DiscoveryErrorKind::ToolFailure,
+            message,
+        }
+    }
+}
+
+impl DiscoveryError {
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({"kind": self.kind.label(), "message": self.message})
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ThinResult {
     pub path: PathBuf,
@@ -59,7 +105,7 @@ pub fn report_for_path(path: &Path) -> Result<SpaceReport> {
     let (apfs_container, apfs_error) = if stat.fs_type == "apfs" {
         match apfs_container_for_mount(&stat.mount) {
             Ok(container) => (Some(container), None),
-            Err(error) => (None, Some(error.to_string())),
+            Err(error) => (None, Some(error)),
         }
     } else {
         (None, None)
@@ -222,18 +268,34 @@ pub(crate) fn list_local_snapshots(path: &Path) -> SnapshotListing {
     }
 }
 
-pub(crate) fn apfs_container_for_mount(mount: &Path) -> Result<ApfsContainer> {
+pub(crate) fn apfs_container_for_mount(mount: &Path) -> Result<ApfsContainer, DiscoveryError> {
+    apfs_container_with(mount, packages::run_process)
+}
+
+fn apfs_container_with(
+    mount: &Path,
+    runner: fn(Command, Duration) -> packages::CommandResult,
+) -> Result<ApfsContainer, DiscoveryError> {
     let mut command = Command::new("diskutil");
     command.arg("info").arg("-plist").arg(mount);
-    let output = packages::run_process(command, Duration::from_secs(15));
+    let output = runner(command, Duration::from_secs(15));
     if output.timed_out {
-        bail!("diskutil info timed out; retry APFS container discovery");
+        return Err(DiscoveryError {
+            kind: DiscoveryErrorKind::Timeout,
+            message: String::from("diskutil info timed out; retry APFS container discovery"),
+        });
     }
     if !output.success {
-        bail!("diskutil info failed: {}", output.stderr.trim());
+        return Err(DiscoveryError {
+            kind: DiscoveryErrorKind::ToolFailure,
+            message: format!("diskutil info failed: {}", output.stderr.trim()),
+        });
     }
 
-    parse_apfs_container_plist(output.stdout.as_bytes())
+    parse_apfs_container_plist(output.stdout.as_bytes()).map_err(|error| DiscoveryError {
+        kind: DiscoveryErrorKind::MalformedOutput,
+        message: error.to_string(),
+    })
 }
 
 fn parse_tmutil_snapshot_names(output: &str) -> Vec<String> {
@@ -263,6 +325,9 @@ fn parse_apfs_container_plist(plist: &[u8]) -> Result<ApfsContainer> {
         .context("diskutil plist lacks APFSContainerSize")?;
     let free = extract_plist_u64(plist, "APFSContainerFree")?
         .context("diskutil plist lacks APFSContainerFree")?;
+    if reference.is_empty() || free > size {
+        bail!("diskutil plist contains inconsistent APFS container values");
+    }
 
     Ok(ApfsContainer {
         reference,
@@ -404,4 +469,45 @@ com.apple.os.update-MSUPrepareUpdate
 
         assert!(parse_apfs_container_plist(plist).is_err());
     }
+}
+#[test]
+fn apfs_discovery_preserves_failure_categories_and_exact_mount_argument() {
+    fn timeout(command: Command, duration: Duration) -> packages::CommandResult {
+        assert_eq!(command.get_program(), "diskutil");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["info", "-plist", "/fixture volume"]
+        );
+        assert_eq!(duration, Duration::from_secs(15));
+        packages::CommandResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            success: false,
+            timed_out: true,
+        }
+    }
+    fn failed(command: Command, duration: Duration) -> packages::CommandResult {
+        let mut result = timeout(command, duration);
+        result.timed_out = false;
+        result.stderr = String::from("simulated utility failure");
+        result
+    }
+    fn malformed(command: Command, duration: Duration) -> packages::CommandResult {
+        let mut result = failed(command, duration);
+        result.success = true;
+        result.stdout = String::from("not a plist");
+        result
+    }
+    let mount = Path::new("/fixture volume");
+    let error = apfs_container_with(mount, timeout).unwrap_err();
+    assert_eq!(error.kind, DiscoveryErrorKind::Timeout);
+    assert_eq!(error.json()["kind"], "timeout");
+    assert_eq!(
+        apfs_container_with(mount, failed).unwrap_err().kind,
+        DiscoveryErrorKind::ToolFailure
+    );
+    assert_eq!(
+        apfs_container_with(mount, malformed).unwrap_err().kind,
+        DiscoveryErrorKind::MalformedOutput
+    );
 }

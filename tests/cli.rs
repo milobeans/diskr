@@ -20,6 +20,7 @@ fn package_json_retains_custom_manager_root_and_footprint_scope() {
     std::fs::create_dir_all(&tools).unwrap();
     std::fs::create_dir_all(install.join("bin")).unwrap();
     std::fs::write(install.join("bin/example"), b"fixture-tool").unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[").unwrap();
     let cargo = tools.join("cargo");
     std::fs::write(&cargo, "#!/bin/sh\n[ \"$1\" = install ] && [ \"$2\" = --list ] && [ \"$3\" = --root ] && [ \"$4\" = \"$CARGO_INSTALL_ROOT\" ] || exit 42\nprintf 'example v1.0.0:\\n    example\\n'\n").unwrap();
     std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -57,6 +58,14 @@ fn package_json_retains_custom_manager_root_and_footprint_scope() {
     );
     assert_eq!(cargo["size_coverage"]["scope_limited"], 1);
     assert_eq!(cargo["size_coverage"]["unknown"], 0);
+    let project = &report["project_dependencies"][0];
+    assert!(project["dep_count"].is_null(), "{report:#}");
+    assert_eq!(project["known_dep_count"], 0);
+    assert_eq!(project["dependency_count_complete"], false);
+    assert!(!project["dependency_warnings"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     std::fs::remove_dir_all(root).unwrap();
 }
 

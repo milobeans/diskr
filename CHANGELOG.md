@@ -6,6 +6,19 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.79] - 2026-10-22
+
+### Fixed
+
+- Project dependency counts deduplicate declared names across dependency groups
+  and shared manifests. Cargo target tables, Python optional/build/Poetry groups
+  and bounded local requirements includes are recognized. Malformed, unreadable,
+  dynamic and unsupported manifests retain warnings and unknown or lower-bound
+  counts in text, details and JSON instead of reporting a confident zero.
+- APFS discovery distinguishes timeouts, tool failures and malformed output,
+  retaining a machine-readable diagnostic in space reports. Discovery and
+  retries use the owning mount point rather than the selected subdirectory.
+
 ## [0.1.78] - 2026-10-22
 
 ### Fixed
