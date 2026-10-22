@@ -6,6 +6,25 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.72] - 2026-10-22
+
+### Fixed
+
+- Cache freshness survives interrupted launches and changes of watched root.
+  Nanosecond update epochs prevent equal-time stale writers from resurrecting
+  invalidated sizes, while cached mount exclusions and scan-policy identity
+  remain visible after navigation and relaunch. Incomplete sizes remain
+  retryable with `S` (or `r` to refresh).
+- Baseline saves cancel abandoned walks, reject older same-path writes under
+  the state lock, and commit on background workers. Cache writes also run off
+  the event loop with coalescing and retry backoff; damaged state is backed up
+  before recovery.
+- History validates its versioned records, retains unaffected baselines when
+  individual records are invalid, reports empty additions and type changes,
+  and retains per-child uncertainty instead of claiming reliable growth from
+  incomplete scans. Persisted paths and FSEvents retain raw Unix path identity;
+  the Trash bridge uses filesystem representations instead of UTF-8 conversion.
+
 ## [0.1.71] - 2026-10-22
 
 ### Fixed

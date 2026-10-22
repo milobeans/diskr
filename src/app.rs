@@ -157,6 +157,19 @@ struct HistoryMsg {
 enum HistoryResult {
     Diff(Result<history::DiffReport, String>),
     Save(Result<history::ScanRecord, String>),
+    Stored(Result<history::ScanRecord, String>),
+}
+
+struct CacheWriteResult {
+    result: Result<(), String>,
+    invalidations: Vec<state::CacheInvalidation>,
+}
+
+struct HistoryJobGuard(Arc<AtomicU64>);
+impl Drop for HistoryJobGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
 }
 
 #[derive(Clone)]
@@ -448,10 +461,12 @@ pub struct App {
     /// scans there will undercount, so the header shows a persistent hint.
     pub fda_limited: bool,
     cache_age: HashMap<PathBuf, u64>,
+    cache_details: HashMap<PathBuf, state::CacheDetails>,
     stale_size_cache: HashSet<PathBuf>,
     cache_invalidations: HashMap<PathBuf, u64>,
     size_cache_dirty: bool,
     last_size_cache_save: Instant,
+    cache_write_rx: Option<Receiver<CacheWriteResult>>,
     entry_index: HashMap<PathBuf, usize>,
     cached_flat_packages: Vec<(packages::Package, packages::Manager)>,
     last_sort: Instant,
@@ -509,6 +524,7 @@ pub struct App {
     /// Cancellation generation for the background history-diff walk; bumped to
     /// stop a walk for a directory the user has navigated away from.
     history_generation: Arc<AtomicU64>,
+    history_jobs: Arc<AtomicU64>,
     history_rx: Option<Receiver<HistoryMsg>>,
     #[cfg(test)]
     history_store_path: Option<PathBuf>,
@@ -597,6 +613,7 @@ impl App {
     }
 
     pub fn new(cwd: PathBuf) -> Result<Self> {
+        let mut cache_details = HashMap::new();
         let (mut size_cache, mut inaccessible_cache, mut cache_age, mut stale_size_cache) = (
             HashMap::new(),
             HashMap::new(),
@@ -630,9 +647,14 @@ impl App {
                         inaccessible_cache.insert(entry.path.clone(), entry.inaccessible);
                     }
                     cache_age.insert(entry.path.clone(), entry.scanned_at);
-                    if freshness.is_stale(&entry.path) {
+                    if entry.details.stale
+                        || entry.details.policy_version != state::SCAN_POLICY_VERSION
+                        || entry.inaccessible > 0
+                        || freshness.is_stale(&entry.path)
+                    {
                         stale_size_cache.insert(entry.path.clone());
                     }
+                    cache_details.insert(entry.path.clone(), entry.details);
                     size_cache.insert(entry.path, entry.size);
                 }
                 None
@@ -692,10 +714,12 @@ impl App {
             size_cache,
             inaccessible_cache,
             cache_age,
+            cache_details,
             stale_size_cache,
             cache_invalidations: HashMap::new(),
             size_cache_dirty,
             last_size_cache_save: Instant::now(),
+            cache_write_rx: None,
             home: std::env::var_os("HOME").map(PathBuf::from),
             fda_limited: false,
             entry_index: HashMap::new(),
@@ -744,6 +768,7 @@ impl App {
             history_loading: false,
             history_saving: false,
             history_generation: Arc::new(AtomicU64::new(0)),
+            history_jobs: Arc::new(AtomicU64::new(0)),
             history_rx: None,
             #[cfg(test)]
             history_store_path: None,
@@ -815,6 +840,11 @@ impl App {
 
     pub fn history_delta_status(&self) -> Option<String> {
         let diff = self.history_diff.as_ref()?;
+        if diff.baseline_inaccessible > 0 || diff.current_inaccessible > 0 {
+            return Some(String::from(
+                "baseline comparison incomplete · delta uncertain",
+            ));
+        }
         let delta = diff.total_delta_allocated();
         let bytes = delta.unsigned_abs().min(u128::from(u64::MAX)) as u64;
         let delta_label = if delta > 0 {
@@ -931,13 +961,23 @@ impl App {
             };
             let modified = meta.as_ref().and_then(|m| m.modified().ok());
             let inaccessible = self.inaccessible_cache.get(&path).copied().unwrap_or(0);
-            let size_stale = is_dir && self.stale_size_cache.contains(&path);
+            let size_stale = is_dir
+                && (self.stale_size_cache.contains(&path)
+                    || self
+                        .cache_details
+                        .get(&path)
+                        .is_some_and(|d| meta.as_ref().is_some_and(|m| d.device != m.dev())));
             let cached_at = if is_dir {
                 self.cache_age.get(&path).copied()
             } else {
                 None
             };
             let name_lower = name.to_lowercase();
+            let skipped_mounts = self
+                .cache_details
+                .get(&path)
+                .map(|d| d.skipped_mounts)
+                .unwrap_or(0);
             let idx = self.entries.len();
             self.entry_index.insert(path.clone(), idx);
             self.entries.push(Entry {
@@ -950,7 +990,7 @@ impl App {
                 size_stale,
                 cached_at,
                 inaccessible,
-                skipped_mounts: 0,
+                skipped_mounts,
                 modified,
                 scanning: false,
                 size_delta: None,
@@ -1431,6 +1471,7 @@ impl App {
                 }
                 ScanMsg::DirSize {
                     scan_id,
+                    epoch,
                     path,
                     size,
                     inaccessible,
@@ -1444,6 +1485,10 @@ impl App {
                     // so we can show how much it grew/shrank.
                     let previous = self.size_cache.get(&path).copied();
                     self.record_cached_size(path.clone(), size, inaccessible, scanned_at, false);
+                    if let Some(details) = self.cache_details.get_mut(&path) {
+                        details.generation = epoch;
+                        details.skipped_mounts = skipped_mounts;
+                    }
                     if let Some(&idx) = self.entry_index.get(&path) {
                         if let Some(e) = self.entries.get_mut(idx) {
                             e.size = Some(size);
@@ -1506,15 +1551,15 @@ impl App {
             self.apply_sort_preserving_selection();
             changed = true;
         }
-        if self.size_cache_dirty && self.last_size_cache_save.elapsed() >= SIZE_CACHE_SAVE_INTERVAL
+        changed |= self.drain_cache_write(false).unwrap_or_else(|err| {
+            self.status = format!("size cache save failed: {err}");
+            true
+        });
+        if self.cache_write_rx.is_none()
+            && self.size_cache_dirty
+            && self.last_size_cache_save.elapsed() >= SIZE_CACHE_SAVE_INTERVAL
         {
-            match self.save_size_cache() {
-                Ok(()) => changed = true,
-                Err(err) => {
-                    self.status = format!("size cache save failed: {err}");
-                    changed = true;
-                }
-            }
+            self.schedule_cache_write();
         }
         changed |= self.drain_package_results();
         changed |= self.drain_dep_results();
@@ -1529,7 +1574,7 @@ impl App {
     }
 
     pub fn save_history_baseline(&mut self) {
-        if self.history_saving {
+        if self.history_saving || self.history_jobs.load(AtomicOrdering::Relaxed) > 0 {
             self.status = String::from("baseline save already in progress");
             return;
         }
@@ -1742,12 +1787,22 @@ impl App {
 
     fn start_history_save_request(&mut self, cwd: PathBuf) {
         let request_id = self.next_history_request_id();
+        let expected = self.history_generation.load(AtomicOrdering::Relaxed);
+        let cancellation =
+            bulkstat::ScanCancellation::new(Arc::clone(&self.history_generation), expected);
         let (tx, rx) = channel();
         self.history_rx = Some(rx);
         self.history_loading = true;
         self.history_saving = true;
+        self.history_jobs.fetch_add(1, AtomicOrdering::Relaxed);
+        let guard = HistoryJobGuard(Arc::clone(&self.history_jobs));
         thread::spawn(move || {
-            let result = history::scan_record(&cwd).map_err(|err| err.to_string());
+            let _guard = guard;
+            let result = match history::scan_record_with_cancellation(&cwd, &cancellation) {
+                Ok(Some(record)) => Ok(record),
+                Ok(None) => return,
+                Err(err) => Err(err.to_string()),
+            };
             let _ = tx.send(HistoryMsg {
                 request_id,
                 cwd,
@@ -1779,10 +1834,10 @@ impl App {
                         true
                     }
                     HistoryResult::Save(Ok(record)) => {
-                        if let Err(err) = self.store_history_record(&record) {
-                            self.status = format!("baseline save failed: {err}");
-                            return true;
-                        }
+                        self.start_history_store(msg.request_id, msg.cwd, record);
+                        true
+                    }
+                    HistoryResult::Stored(Ok(record)) => {
                         self.history_records
                             .insert(record.path.clone(), record.clone());
                         history::prune_records(&mut self.history_records);
@@ -1792,6 +1847,10 @@ impl App {
                         true
                     }
                     HistoryResult::Save(Err(err)) => {
+                        self.status = format!("baseline save failed: {err}");
+                        true
+                    }
+                    HistoryResult::Stored(Err(err)) => {
                         self.status = format!("baseline save failed: {err}");
                         true
                     }
@@ -1810,12 +1869,40 @@ impl App {
         }
     }
 
-    fn store_history_record(&self, record: &history::ScanRecord) -> Result<()> {
+    fn start_history_store(&mut self, request_id: u64, cwd: PathBuf, record: history::ScanRecord) {
+        let (tx, rx) = channel();
+        self.history_rx = Some(rx);
+        self.history_loading = true;
+        self.history_saving = true;
+        self.history_jobs.fetch_add(1, AtomicOrdering::Relaxed);
+        let guard = HistoryJobGuard(Arc::clone(&self.history_jobs));
         #[cfg(test)]
-        if let Some(path) = &self.history_store_path {
-            return history::store_record_to_path(path, record);
-        }
-        history::store_record(record)
+        let store_path = self.history_store_path.clone();
+        #[cfg(not(test))]
+        let store_path: Option<PathBuf> = None;
+        let cancellation = bulkstat::ScanCancellation::new(
+            Arc::clone(&self.history_generation),
+            self.history_generation.load(AtomicOrdering::Relaxed),
+        );
+        thread::spawn(move || {
+            let _guard = guard;
+            let result =
+                history::store_record_cancellable(&record, &cancellation, store_path.as_deref());
+            let result = result
+                .and_then(|stored| {
+                    if stored {
+                        Ok(record)
+                    } else {
+                        anyhow::bail!("a newer baseline already exists")
+                    }
+                })
+                .map_err(|e| e.to_string());
+            let _ = tx.send(HistoryMsg {
+                request_id,
+                cwd,
+                result: HistoryResult::Stored(result),
+            });
+        });
     }
 
     pub fn reclaim_item_count(&self) -> usize {
@@ -2579,7 +2666,62 @@ impl App {
         }
     }
 
+    fn schedule_cache_write(&mut self) {
+        let entries = self.size_cache_entries_for_store(now_secs());
+        let invalidations: Vec<_> = std::mem::take(&mut self.cache_invalidations)
+            .into_iter()
+            .map(|(path, invalidated_at)| state::CacheInvalidation {
+                path,
+                invalidated_at,
+            })
+            .collect();
+        let (tx, rx) = channel();
+        self.cache_write_rx = Some(rx);
+        self.size_cache_dirty = false;
+        self.last_size_cache_save = Instant::now();
+        thread::spawn(move || {
+            let result =
+                state::store_size_cache(&entries, &invalidations).map_err(|e| e.to_string());
+            let _ = tx.send(CacheWriteResult {
+                result,
+                invalidations,
+            });
+        });
+    }
+
+    fn drain_cache_write(&mut self, wait: bool) -> Result<bool> {
+        let Some(rx) = self.cache_write_rx.take() else {
+            return Ok(false);
+        };
+        let msg = if wait {
+            rx.recv().map_err(|e| e.to_string())
+        } else {
+            match rx.try_recv() {
+                Ok(msg) => Ok(msg),
+                Err(TryRecvError::Empty) => {
+                    self.cache_write_rx = Some(rx);
+                    return Ok(false);
+                }
+                Err(TryRecvError::Disconnected) => Err(String::from("cache writer disconnected")),
+            }
+        };
+        self.last_size_cache_save = Instant::now();
+        let msg = msg.map_err(anyhow::Error::msg)?;
+        if let Err(err) = msg.result {
+            for item in msg.invalidations {
+                self.cache_invalidations
+                    .entry(item.path)
+                    .and_modify(|epoch| *epoch = (*epoch).max(item.invalidated_at))
+                    .or_insert(item.invalidated_at);
+            }
+            self.size_cache_dirty = true;
+            return Err(anyhow::Error::msg(err));
+        }
+        Ok(true)
+    }
+
     pub fn save_size_cache(&mut self) -> Result<()> {
+        self.drain_cache_write(true)?;
         if !self.size_cache_dirty {
             return Ok(());
         }
@@ -2607,6 +2749,10 @@ impl App {
                 path: path.clone(),
                 size: *size,
                 inaccessible: self.inaccessible_cache.get(path).copied().unwrap_or(0),
+                details: state::CacheDetails {
+                    stale: self.stale_size_cache.contains(path),
+                    ..self.cache_details.get(path).copied().unwrap_or_default()
+                },
                 scanned_at: self
                     .cache_age
                     .get(path)
@@ -2623,7 +2769,7 @@ impl App {
             entries.truncate(state::SIZE_CACHE_MAX_ENTRIES);
             let retained: HashSet<PathBuf> =
                 entries.iter().map(|entry| entry.path.clone()).collect();
-            let invalidated_at = now_secs();
+            let invalidated_at = state::next_epoch();
             self.cache_invalidations.extend(
                 self.size_cache
                     .keys()
@@ -2634,6 +2780,7 @@ impl App {
             self.inaccessible_cache
                 .retain(|path, _| retained.contains(path));
             self.cache_age.retain(|path, _| retained.contains(path));
+            self.cache_details.retain(|path, _| retained.contains(path));
             self.stale_size_cache.retain(|path| retained.contains(path));
         }
         entries
@@ -2648,6 +2795,18 @@ impl App {
         stale: bool,
     ) {
         self.cache_invalidations.remove(&path);
+        self.cache_details.insert(
+            path.clone(),
+            state::CacheDetails {
+                generation: state::next_epoch(),
+                policy_version: state::SCAN_POLICY_VERSION,
+                device: std::fs::symlink_metadata(&path)
+                    .map(|m| m.dev())
+                    .unwrap_or(0),
+                stale,
+                skipped_mounts: 0,
+            },
+        );
         self.size_cache.insert(path.clone(), size);
         if inaccessible > 0 {
             self.inaccessible_cache.insert(path.clone(), inaccessible);
@@ -2665,18 +2824,21 @@ impl App {
 
     fn remove_cached_size(&mut self, path: &Path) {
         let mut removed = self.size_cache.remove(path).is_some();
+        self.cache_details.remove(path);
         removed |= self.inaccessible_cache.remove(path).is_some();
         removed |= self.cache_age.remove(path).is_some();
         removed |= self.stale_size_cache.remove(path);
         if removed {
             self.cache_invalidations
-                .insert(path.to_path_buf(), now_secs());
+                .insert(path.to_path_buf(), state::next_epoch());
             self.size_cache_dirty = true;
         }
     }
 
     fn remove_cached_subtree(&mut self, path: &Path) {
-        let invalidated_at = now_secs();
+        let invalidated_at = state::next_epoch();
+        self.cache_details
+            .retain(|cached, _| !cached.starts_with(path));
         let removed_paths: Vec<PathBuf> = self
             .size_cache
             .keys()
@@ -3804,7 +3966,7 @@ fn full_disk_access_missing() -> bool {
 }
 
 fn entry_needs_scan(entry: &Entry) -> bool {
-    entry.is_dir && (entry.size.is_none() || entry.size_stale)
+    entry.is_dir && (entry.size.is_none() || entry.size_stale || entry.inaccessible > 0)
 }
 
 fn limited_scan_status(action: &str, scanning: usize, total: usize) -> String {
@@ -4138,6 +4300,65 @@ pub fn trash_only_report(root: &Path, allocated: u64) -> reclaim::ReclaimReport 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_write_failure_restores_invalidations_and_backs_off() {
+        let root = test_root("cache_writer_backoff");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        let (tx, rx) = channel();
+        app.cache_write_rx = Some(rx);
+        let path = root.join("removed");
+        tx.send(CacheWriteResult {
+            result: Err(String::from("disk full")),
+            invalidations: vec![state::CacheInvalidation {
+                path: path.clone(),
+                invalidated_at: 12,
+            }],
+        })
+        .unwrap();
+        assert!(app.drain_cache_write(false).is_err());
+        assert_eq!(app.cache_invalidations.get(&path), Some(&12));
+        assert!(app.size_cache_dirty);
+        assert!(app.last_size_cache_save.elapsed() < Duration::from_secs(1));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_cache_remains_retryable_and_mount_coverage_survives_reload() {
+        let root = test_root("incomplete_cache_retry");
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.record_cached_size(child.clone(), SizeInfo::new(1, 2), 1, now_secs(), false);
+        app.cache_details.get_mut(&child).unwrap().skipped_mounts = 2;
+        app.reload().unwrap();
+        let entry = app.entries.iter().find(|e| e.path == child).unwrap();
+        assert!(entry_needs_scan(entry));
+        assert_eq!(entry.skipped_mounts, 2);
+        assert_eq!(
+            app.size_cache_entries_for_store(now_secs())[0]
+                .details
+                .skipped_mounts,
+            2
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn abandoned_baseline_job_retains_single_flight_guard() {
+        let root = test_root("history_cancel_guard");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.history_jobs.store(1, AtomicOrdering::Relaxed);
+        app.apply_history_baseline(None);
+        let request = app.active_history_request_id;
+        app.save_history_baseline();
+        assert_eq!(request, app.active_history_request_id);
+        assert_eq!(app.status, "baseline save already in progress");
+        app.history_jobs.store(0, AtomicOrdering::Relaxed);
+        fs::remove_dir_all(root).unwrap();
+    }
     use std::fs;
 
     #[test]
@@ -4298,6 +4519,7 @@ mod tests {
         for (name, size) in [("a", 101), ("b", 500)] {
             tx.send(ScanMsg::DirSize {
                 scan_id: 77,
+                epoch: state::next_epoch(),
                 path: root.join(name),
                 size: SizeInfo::new(size, size),
                 inaccessible: 0,
@@ -5279,6 +5501,7 @@ mod tests {
         app.history_baseline = Some(history::ScanRecord {
             path: root.clone(),
             timestamp: now_secs().saturating_sub(60),
+            generation: 0,
             enumeration_errors: 0,
             children: Vec::new(),
         });
@@ -5325,6 +5548,7 @@ mod tests {
         let baseline = history::ScanRecord {
             path: root.clone(),
             timestamp: now_secs().saturating_sub(30),
+            generation: 0,
             enumeration_errors: 0,
             children: Vec::new(),
         };
@@ -5370,6 +5594,7 @@ mod tests {
                 history::ScanRecord {
                     path,
                     timestamp: idx as u64,
+                    generation: 0,
                     enumeration_errors: 0,
                     children: Vec::new(),
                 },
@@ -5387,6 +5612,7 @@ mod tests {
             result: HistoryResult::Save(Ok(history::ScanRecord {
                 path: canonical.clone(),
                 timestamp: history::HISTORY_MAX_RECORDS as u64 + 10,
+                generation: 0,
                 enumeration_errors: 0,
                 children: Vec::new(),
             })),
@@ -5394,6 +5620,12 @@ mod tests {
         .unwrap();
 
         assert!(app.drain_history_results());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.history_saving && Instant::now() < deadline {
+            app.drain_history_results();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!app.history_saving);
         assert_eq!(app.history_records.len(), history::HISTORY_MAX_RECORDS);
         assert!(app.history_records.contains_key(&canonical));
         assert!(!app
@@ -5421,6 +5653,7 @@ mod tests {
         app.history_baseline = Some(history::ScanRecord {
             path: root_a.clone(),
             timestamp: 100,
+            generation: 0,
             enumeration_errors: 0,
             children: Vec::new(),
         });
@@ -5474,6 +5707,7 @@ mod tests {
             result: HistoryResult::Save(Ok(history::ScanRecord {
                 path: canonical.clone(),
                 timestamp: 100,
+                generation: 0,
                 enumeration_errors: 0,
                 children: Vec::new(),
             })),
@@ -5920,6 +6154,7 @@ mod tests {
 
         tx.send(ScanMsg::DirSize {
             scan_id: 9,
+            epoch: state::next_epoch(),
             path: dir.clone(),
             size: SizeInfo::new(300, 5000),
             inaccessible: 0,
@@ -6380,6 +6615,7 @@ mod tests {
         // this dir_b result was written to index 1: todo.py.
         tx.send(ScanMsg::DirSize {
             scan_id: 1,
+            epoch: state::next_epoch(),
             path: dir_b.clone(),
             size: SizeInfo::new(508 * 1024 * 1024, 508 * 1024 * 1024),
             inaccessible: 0,
@@ -6437,6 +6673,7 @@ mod tests {
 
         tx.send(ScanMsg::DirSize {
             scan_id: 1,
+            epoch: state::next_epoch(),
             path: stale_dir.clone(),
             size: SizeInfo::new(12_345, 16_384),
             inaccessible: 1,
@@ -6490,6 +6727,7 @@ mod tests {
 
         tx.send(ScanMsg::DirSize {
             scan_id: 7,
+            epoch: state::next_epoch(),
             path: dir.clone(),
             size: SizeInfo::new(99, 128),
             inaccessible: 0,

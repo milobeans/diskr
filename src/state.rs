@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,7 +11,66 @@ use crate::bulkstat::SizeInfo;
 
 pub(crate) const SIZE_CACHE_MAX_ENTRIES: usize = 50_000;
 
-const SIZE_CACHE_VERSION: u64 = 2;
+const SIZE_CACHE_VERSION: u64 = 3;
+pub(crate) const SCAN_POLICY_VERSION: u64 = 1;
+
+/// Nanosecond epochs order updates independently of the displayed second age.
+pub(crate) fn next_epoch() -> u64 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+    LAST.fetch_update(
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+        |last| Some(clock.max(last.saturating_add(1))),
+    )
+    .unwrap()
+    .saturating_add(1)
+    .max(clock)
+}
+
+pub(crate) fn encode_path(path: &Path) -> String {
+    path.to_str()
+        .map(str::to_owned)
+        .filter(|s| !s.starts_with("@unix:"))
+        .unwrap_or_else(|| {
+            format!(
+                "@unix:{}",
+                path.as_os_str()
+                    .as_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+        })
+}
+
+pub(crate) fn decode_path(encoded: &str) -> Option<PathBuf> {
+    if let Some(hex) = encoded.strip_prefix("@unix:") {
+        if hex.len() % 2 != 0 || !hex.is_ascii() {
+            return None;
+        }
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        Some(std::ffi::OsString::from_vec(bytes).into())
+    } else {
+        Some(PathBuf::from(encoded))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CacheDetails {
+    pub generation: u64,
+    pub skipped_mounts: u32,
+    pub policy_version: u64,
+    pub device: u64,
+    pub stale: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CachedSize {
@@ -18,6 +78,7 @@ pub(crate) struct CachedSize {
     pub size: SizeInfo,
     pub inaccessible: u32,
     pub scanned_at: u64,
+    pub details: CacheDetails,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,7 +140,13 @@ fn store_size_cache_merged_to_path(
     invalidations: &[CacheInvalidation],
 ) -> Result<()> {
     with_exclusive_lock(path, || {
-        let current = load_size_cache_state_from_path(path)?;
+        let current = match load_size_cache_state_from_path(path) {
+            Ok(current) => current,
+            Err(_) => {
+                backup_corrupt_state(path)?;
+                SizeCacheState::default()
+            }
+        };
         let mut merged: HashMap<PathBuf, CachedSize> = current
             .entries
             .into_iter()
@@ -97,7 +164,7 @@ fn store_size_cache_merged_to_path(
             *invalidated_at = (*invalidated_at).max(invalidation.invalidated_at);
             if merged
                 .get(&invalidation.path)
-                .is_some_and(|entry| entry.scanned_at <= *invalidated_at)
+                .is_some_and(|entry| entry.details.generation <= *invalidated_at)
             {
                 merged.remove(&invalidation.path);
             }
@@ -105,12 +172,12 @@ fn store_size_cache_merged_to_path(
         for entry in entries {
             if tombstones
                 .get(&entry.path)
-                .is_some_and(|invalidated_at| entry.scanned_at < *invalidated_at)
+                .is_some_and(|invalidated_at| entry.details.generation <= *invalidated_at)
             {
                 continue;
             }
             match merged.get(&entry.path) {
-                Some(existing) if existing.scanned_at > entry.scanned_at => {}
+                Some(existing) if existing.details.generation > entry.details.generation => {}
                 _ => {
                     merged.insert(entry.path.clone(), entry.clone());
                     tombstones.remove(&entry.path);
@@ -147,6 +214,27 @@ fn store_size_cache_merged_to_path(
     })
 }
 
+pub(crate) fn mark_size_cache_stale(freshness: &crate::fsevents::Freshness) -> Result<()> {
+    mark_size_cache_stale_at(&size_cache_file(), freshness)
+}
+
+fn mark_size_cache_stale_at(path: &Path, freshness: &crate::fsevents::Freshness) -> Result<()> {
+    with_exclusive_lock(path, || {
+        let mut current = load_size_cache_state_from_path(path)?;
+        let epoch = next_epoch();
+        for entry in &mut current.entries {
+            if freshness.is_stale(&entry.path) {
+                entry.details.stale = true;
+                current.invalidations.push(CacheInvalidation {
+                    path: entry.path.clone(),
+                    invalidated_at: epoch,
+                });
+            }
+        }
+        store_size_cache_state_to_path(path, &current)
+    })
+}
+
 fn load_size_cache_from_path(path: &Path) -> Result<Vec<CachedSize>> {
     Ok(load_size_cache_state_from_path(path)?.entries)
 }
@@ -162,7 +250,7 @@ fn load_size_cache_state_from_path(path: &Path) -> Result<SizeCacheState> {
     let value: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parse {} (delete it to reset cache)", path.display()))?;
     let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-    if !matches!(version, 1 | SIZE_CACHE_VERSION) {
+    if !matches!(version, 1 | 2 | SIZE_CACHE_VERSION) {
         bail!(
             "unexpected size-cache version in {} (delete it to reset cache)",
             path.display()
@@ -194,6 +282,13 @@ fn load_size_cache_state_from_path(path: &Path) -> Result<SizeCacheState> {
 /// full disk leaves the previous file intact instead of a half-written one, and
 /// the pid+timestamp suffix keeps concurrent writers from clobbering each
 /// other's temp file.
+pub(crate) fn backup_corrupt_state(path: &Path) -> Result<()> {
+    let contents = std::fs::read_to_string(path)?;
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(format!(".corrupt-{}", next_epoch()));
+    atomic_write(Path::new(&backup), &contents)
+}
+
 pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
 
@@ -302,11 +397,16 @@ fn store_size_cache_state_to_path(path: &Path, state: &SizeCacheState) -> Result
         .iter()
         .map(|entry| {
             serde_json::json!({
-                "path": entry.path.to_string_lossy(),
+                "path": encode_path(&entry.path),
                 "logical": entry.size.logical,
                 "allocated": entry.size.allocated,
                 "inaccessible": entry.inaccessible,
                 "scanned_at": entry.scanned_at,
+                "generation": entry.details.generation,
+                "skipped_mounts": entry.details.skipped_mounts,
+                "policy_version": entry.details.policy_version,
+                "device": entry.details.device,
+                "stale": entry.details.stale,
             })
         })
         .collect();
@@ -315,7 +415,7 @@ fn store_size_cache_state_to_path(path: &Path, state: &SizeCacheState) -> Result
         .iter()
         .map(|entry| {
             serde_json::json!({
-                "path": entry.path.to_string_lossy(),
+                "path": encode_path(&entry.path),
                 "invalidated_at": entry.invalidated_at,
             })
         })
@@ -335,7 +435,7 @@ fn cache_invalidation_from_json(value: &serde_json::Value) -> Option<CacheInvali
         return None;
     }
     Some(CacheInvalidation {
-        path: PathBuf::from(path),
+        path: decode_path(path)?,
         invalidated_at: value.get("invalidated_at")?.as_u64()?,
     })
 }
@@ -355,10 +455,27 @@ fn cached_size_from_json(value: &serde_json::Value) -> Option<CachedSize> {
         .unwrap_or(0);
 
     Some(CachedSize {
-        path: PathBuf::from(path),
+        path: decode_path(path)?,
         size: SizeInfo::new(logical, allocated),
         inaccessible,
         scanned_at,
+        details: CacheDetails {
+            generation: value
+                .get("generation")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(scanned_at),
+            skipped_mounts: value
+                .get("skipped_mounts")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| n.try_into().ok())
+                .unwrap_or(0),
+            policy_version: value
+                .get("policy_version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            device: value.get("device").and_then(|v| v.as_u64()).unwrap_or(0),
+            stale: value.get("stale").and_then(|v| v.as_bool()).unwrap_or(true),
+        },
     })
 }
 
@@ -368,6 +485,52 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn dirty_flags_survive_restart_and_reject_equal_epoch_writers() {
+        let path = temp_file("durable_dirty");
+        let old = CachedSize {
+            path: PathBuf::from("/tmp/tree"),
+            size: SizeInfo::new(1, 2),
+            inaccessible: 0,
+            scanned_at: 10,
+            details: CacheDetails {
+                generation: 20,
+                policy_version: SCAN_POLICY_VERSION,
+                ..Default::default()
+            },
+        };
+        store_size_cache_merged_to_path(&path, std::slice::from_ref(&old), &[]).unwrap();
+        mark_size_cache_stale_at(&path, &crate::fsevents::Freshness::All).unwrap();
+        store_size_cache_merged_to_path(&path, std::slice::from_ref(&old), &[]).unwrap();
+        assert!(load_size_cache_from_path(&path).unwrap()[0].details.stale);
+        let epoch = load_size_cache_state_from_path(&path)
+            .unwrap()
+            .invalidations[0]
+            .invalidated_at;
+        let mut equal = old.clone();
+        equal.details.generation = epoch;
+        store_size_cache_merged_to_path(&path, &[equal], &[]).unwrap();
+        assert!(load_size_cache_from_path(&path).unwrap()[0].details.stale);
+        let mut fresh = old;
+        fresh.details.generation = next_epoch();
+        fresh.details.skipped_mounts = 3;
+        store_size_cache_merged_to_path(&path, std::slice::from_ref(&fresh), &[]).unwrap();
+        assert_eq!(load_size_cache_from_path(&path).unwrap(), vec![fresh]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn raw_unix_paths_round_trip_without_lossy_collisions() {
+        let a = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/raw-\xff".to_vec()));
+        let b = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/raw-\xfe".to_vec()));
+        assert_ne!(encode_path(&a), encode_path(&b));
+        assert_eq!(decode_path(&encode_path(&a)), Some(a));
+        assert_eq!(
+            decode_path(&encode_path(Path::new("@unix:ff"))),
+            Some(PathBuf::from("@unix:ff"))
+        );
+    }
+
+    #[test]
     fn size_cache_round_trips_schema_v2() {
         let path = temp_file("round_trip");
         let entries = vec![CachedSize {
@@ -375,6 +538,7 @@ mod tests {
             size: SizeInfo::new(123, 456),
             inaccessible: 2,
             scanned_at: 42,
+            details: CacheDetails::default(),
         }];
 
         store_size_cache_to_path(&path, &entries).unwrap();
@@ -444,6 +608,10 @@ mod tests {
                         size: SizeInfo::new(scanned_at, scanned_at),
                         inaccessible: 0,
                         scanned_at,
+                        details: CacheDetails {
+                            generation: scanned_at,
+                            ..Default::default()
+                        },
                     }],
                     &[],
                 )
@@ -472,6 +640,10 @@ mod tests {
             size: SizeInfo::new(10, 10),
             inaccessible: 0,
             scanned_at: 10,
+            details: CacheDetails {
+                generation: 10,
+                ..Default::default()
+            },
         };
         store_size_cache_merged_to_path(&path, std::slice::from_ref(&cached), &[]).unwrap();
         store_size_cache_merged_to_path(

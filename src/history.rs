@@ -35,6 +35,7 @@ pub struct ScanRecord {
     pub path: PathBuf,
     /// Seconds since the Unix epoch when the baseline was captured.
     pub timestamp: u64,
+    pub generation: u64,
     /// Immediate entries that could not be enumerated or inspected.
     pub enumeration_errors: u32,
     pub children: Vec<ChildSize>,
@@ -68,6 +69,10 @@ pub struct ChildChange {
     pub name: String,
     pub before: Option<SizeInfo>,
     pub after: Option<SizeInfo>,
+    pub before_inaccessible: u32,
+    pub after_inaccessible: u32,
+    pub before_is_dir: Option<bool>,
+    pub after_is_dir: Option<bool>,
 }
 
 impl ChildChange {
@@ -112,7 +117,9 @@ impl DiffReport {
 pub fn save(path: &Path) -> Result<ScanRecord> {
     validate_dir(path)?;
     let record = scan_record(path)?;
-    store_record(&record)?;
+    if !store_record(&record)? {
+        bail!("a newer baseline already exists; this scan was not saved");
+    }
     Ok(record)
 }
 
@@ -155,10 +162,10 @@ pub fn diff_from_record_with_cancellation(
 /// Pure diff of two scan records. `before`/`after` need not be sorted.
 pub fn diff_records(before: &ScanRecord, after: &ScanRecord) -> DiffReport {
     let mut changes: Vec<ChildChange> = Vec::new();
-    let before_by_name: HashMap<&str, SizeInfo> = before
+    let before_by_name: HashMap<&str, &ChildSize> = before
         .children
         .iter()
-        .map(|child| (child.name.as_str(), child.size))
+        .map(|child| (child.name.as_str(), child))
         .collect();
     let after_names: std::collections::HashSet<&str> = after
         .children
@@ -170,10 +177,21 @@ pub fn diff_records(before: &ScanRecord, after: &ScanRecord) -> DiffReport {
         let prior = before_by_name.get(child.name.as_str()).copied();
         let change = ChildChange {
             name: child.name.clone(),
-            before: prior,
+            before: prior.map(|c| c.size),
             after: Some(child.size),
+            before_inaccessible: prior
+                .map(|c| c.inaccessible)
+                .unwrap_or(before.enumeration_errors),
+            after_inaccessible: child.inaccessible,
+            before_is_dir: prior.map(|c| c.is_dir),
+            after_is_dir: Some(child.is_dir),
         };
-        if change.delta_allocated() != 0 || change.delta_logical() != 0 {
+        if prior.is_none()
+            || change.before_is_dir != change.after_is_dir
+            || change.before_inaccessible != change.after_inaccessible
+            || change.delta_allocated() != 0
+            || change.delta_logical() != 0
+        {
             changes.push(change);
         }
     }
@@ -185,6 +203,10 @@ pub fn diff_records(before: &ScanRecord, after: &ScanRecord) -> DiffReport {
                 name: child.name.clone(),
                 before: Some(child.size),
                 after: None,
+                before_inaccessible: child.inaccessible,
+                after_inaccessible: after.enumeration_errors,
+                before_is_dir: Some(child.is_dir),
+                after_is_dir: None,
             });
         }
     }
@@ -225,6 +247,7 @@ pub(crate) fn scan_record(path: &Path) -> Result<ScanRecord> {
         scan_record_with_cancellation(path, &never)?.unwrap_or_else(|| ScanRecord {
             path: path.to_path_buf(),
             timestamp: now_secs(),
+            generation: state::next_epoch(),
             enumeration_errors: 0,
             children: Vec::new(),
         }),
@@ -239,6 +262,8 @@ pub(crate) fn scan_record_with_cancellation(
     if cancellation.is_cancelled() {
         return Ok(None);
     }
+    let timestamp = now_secs();
+    let generation = state::next_epoch();
     let canonical = path
         .canonicalize()
         .with_context(|| format!("resolve {}", path.display()))?;
@@ -258,7 +283,7 @@ pub(crate) fn scan_record_with_cancellation(
                 continue;
             }
         };
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = state::encode_path(Path::new(&entry.file_name()));
         let meta = match std::fs::symlink_metadata(entry.path()) {
             Ok(meta) => meta,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -298,7 +323,8 @@ pub(crate) fn scan_record_with_cancellation(
 
     Ok(Some(ScanRecord {
         path: canonical,
-        timestamp: now_secs(),
+        timestamp,
+        generation,
         enumeration_errors,
         children,
     }))
@@ -324,7 +350,18 @@ fn load_history_from_path(path: &Path) -> Result<serde_json::Map<String, serde_j
     let value: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("parse {} (delete it to reset history)", path.display()))?;
     match value {
-        serde_json::Value::Object(map) => Ok(map),
+        serde_json::Value::Object(mut map) => {
+            if let Some(version) = map.remove("version") {
+                if version.as_u64() != Some(1) {
+                    bail!("unsupported history schema version");
+                }
+                return map
+                    .remove("records")
+                    .and_then(|v| v.as_object().cloned())
+                    .context("history schema missing records");
+            }
+            Ok(map)
+        }
         _ => bail!(
             "unexpected history format in {} (delete it to reset history)",
             path.display()
@@ -341,24 +378,47 @@ pub fn load_records() -> Result<HashMap<PathBuf, ScanRecord>> {
 /// silently presenting "no baselines", mirroring how the size cache surfaces
 /// its own load errors.
 pub fn load_records_with_warning() -> (HashMap<PathBuf, ScanRecord>, Option<String>) {
-    match load_records() {
-        Ok(records) => (records, None),
+    match load_records_report(&history_file()) {
+        Ok((records, rejected)) => (
+            records,
+            (rejected > 0).then(|| {
+                format!(
+                    "history ignored {rejected} invalid baseline records; valid records retained"
+                )
+            }),
+        ),
         Err(err) => (HashMap::new(), Some(format!("history load failed: {err}"))),
     }
 }
 
 fn load_records_from_path(path: &Path) -> Result<HashMap<PathBuf, ScanRecord>> {
+    Ok(load_records_report(path)?.0)
+}
+
+fn load_records_report(path: &Path) -> Result<(HashMap<PathBuf, ScanRecord>, usize)> {
     let history = load_history_from_path(path)?;
-    let mut records: HashMap<PathBuf, ScanRecord> = history
-        .into_iter()
-        .map(|(path, value)| {
-            let path = PathBuf::from(path);
-            let record = record_from_json(&path, &value);
-            (path, record)
-        })
-        .collect();
+    let mut records = HashMap::new();
+    let mut rejected = 0;
+    for (path, value) in history {
+        let parsed = (|| -> Result<(PathBuf, ScanRecord)> {
+            let path = state::decode_path(&path).context("invalid baseline path encoding")?;
+            if !path.is_absolute() {
+                bail!("baseline path is not absolute");
+            }
+            let record = record_from_json(&path, &value)?;
+            Ok((path, record))
+        })();
+        match parsed {
+            Ok((path, record)) => {
+                records.insert(path, record);
+            }
+            Err(_) => {
+                rejected += 1;
+            }
+        }
+    }
     prune_records(&mut records);
-    Ok(records)
+    Ok((records, rejected))
 }
 
 /// Load the saved baseline for a path if one exists.
@@ -370,22 +430,61 @@ pub fn load_record_for_path(path: &Path) -> Result<Option<ScanRecord>> {
     Ok(history.get(&canonical).cloned())
 }
 
-pub(crate) fn store_record(record: &ScanRecord) -> Result<()> {
+pub(crate) fn store_record(record: &ScanRecord) -> Result<bool> {
     let dir = state::state_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = history_file();
     store_record_to_path(&path, record)
 }
 
-pub(crate) fn store_record_to_path(path: &Path, record: &ScanRecord) -> Result<()> {
+pub(crate) fn store_record_to_path(path: &Path, record: &ScanRecord) -> Result<bool> {
+    store_record_guarded(path, record, &bulkstat::ScanCancellation::never())
+}
+
+pub(crate) fn store_record_cancellable(
+    record: &ScanRecord,
+    cancellation: &bulkstat::ScanCancellation,
+    override_path: Option<&Path>,
+) -> Result<bool> {
+    store_record_guarded(
+        override_path.unwrap_or(&history_file()),
+        record,
+        cancellation,
+    )
+}
+
+fn store_record_guarded(
+    path: &Path,
+    record: &ScanRecord,
+    cancellation: &bulkstat::ScanCancellation,
+) -> Result<bool> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     state::with_exclusive_lock(path, || {
-        let mut records = load_records_from_path(path)?;
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let mut records = match load_records_report(path) {
+            Ok((records, 0)) => records,
+            Ok((records, _)) => {
+                state::backup_corrupt_state(path)?;
+                records
+            }
+            Err(_) => {
+                state::backup_corrupt_state(path)?;
+                HashMap::new()
+            }
+        };
+        if records.get(&record.path).is_some_and(|old| {
+            (old.timestamp, old.generation) > (record.timestamp, record.generation)
+        }) {
+            return Ok(false);
+        }
         records.insert(record.path.clone(), record.clone());
         prune_records(&mut records);
-        store_records_to_path(path, &records)
+        store_records_to_path(path, &records)?;
+        Ok(true)
     })
 }
 
@@ -413,9 +512,10 @@ fn store_records_to_path(path: &Path, records: &HashMap<PathBuf, ScanRecord>) ->
     });
     let mut history = serde_json::Map::with_capacity(ordered.len());
     for (path, record) in ordered {
-        history.insert(path.to_string_lossy().into_owned(), record_to_json(record));
+        history.insert(state::encode_path(path), record_to_json(record));
     }
-    let text = serde_json::to_string_pretty(&serde_json::Value::Object(history))?;
+    let text =
+        serde_json::to_string_pretty(&serde_json::json!({"version": 1, "records": history}))?;
     state::atomic_write(path, &text)
 }
 
@@ -434,62 +534,170 @@ fn record_to_json(record: &ScanRecord) -> serde_json::Value {
         })
         .collect();
     serde_json::json!({
-        "path": record.path.to_string_lossy(),
+        "path": state::encode_path(&record.path),
         "timestamp": record.timestamp,
+        "generation": record.generation,
         "enumeration_errors": record.enumeration_errors,
         "children": children,
     })
 }
 
-fn record_from_json(path: &Path, value: &serde_json::Value) -> ScanRecord {
-    let timestamp = value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
-    let enumeration_errors = value
-        .get("enumeration_errors")
+fn record_from_json(path: &Path, value: &serde_json::Value) -> Result<ScanRecord> {
+    let timestamp = value
+        .get("timestamp")
         .and_then(|v| v.as_u64())
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0);
+        .context("baseline missing valid timestamp")?;
     let children = value
         .get("children")
         .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    let name = item.get("name")?.as_str()?.to_string();
-                    let is_dir = item
-                        .get("is_dir")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let logical = item.get("logical").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let allocated = item.get("allocated").and_then(|v| v.as_u64()).unwrap_or(0);
-                    // Missing in pre-0.1.x baselines; default to 0 so old files
-                    // load unchanged.
-                    let inaccessible = item
-                        .get("inaccessible")
-                        .and_then(|v| v.as_u64())
-                        .and_then(|n| u32::try_from(n).ok())
-                        .unwrap_or(0);
-                    Some(ChildSize {
-                        name,
-                        is_dir,
-                        size: SizeInfo::new(logical, allocated),
-                        inaccessible,
-                    })
+        .context("baseline missing children")?
+        .iter()
+        .map(|item| -> Result<ChildSize> {
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .context("child missing name")?
+                .to_string();
+            if name.is_empty()
+                || state::decode_path(&name).is_none_or(|p| {
+                    p.components().count() != 1
+                        || !matches!(p.components().next(), Some(std::path::Component::Normal(_)))
                 })
-                .collect()
+            {
+                bail!("invalid baseline child name");
+            }
+            let is_dir = item
+                .get("is_dir")
+                .and_then(|v| v.as_bool())
+                .context("child missing type")?;
+            let logical = item
+                .get("logical")
+                .and_then(|v| v.as_u64())
+                .context("child missing logical bytes")?;
+            let allocated = item
+                .get("allocated")
+                .and_then(|v| v.as_u64())
+                .context("child missing allocated bytes")?;
+            let inaccessible = optional_count(item, "inaccessible")?;
+            Ok(ChildSize {
+                name,
+                is_dir,
+                size: SizeInfo::new(logical, allocated),
+                inaccessible,
+            })
         })
-        .unwrap_or_default();
-    ScanRecord {
+        .collect::<Result<Vec<_>>>()?;
+    let mut names = std::collections::HashSet::new();
+    if children.iter().any(|c| !names.insert(&c.name)) {
+        bail!("duplicate baseline child name");
+    }
+    Ok(ScanRecord {
         path: path.to_path_buf(),
         timestamp,
-        enumeration_errors,
+        generation: match value.get("generation") {
+            None => 0,
+            Some(v) => v.as_u64().context("invalid baseline generation")?,
+        },
+        enumeration_errors: optional_count(value, "enumeration_errors")?,
         children,
+    })
+}
+
+fn optional_count(value: &serde_json::Value, key: &str) -> Result<u32> {
+    match value.get(key) {
+        None => Ok(0),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| n.try_into().ok())
+            .with_context(|| format!("invalid {key}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_same_path_save_is_rejected_inside_the_lock() {
+        let path = state::state_dir().join("ordered-history.json");
+        let mut newest = record(vec![]);
+        newest.timestamp = 20;
+        assert!(store_record_to_path(&path, &newest).unwrap());
+        let mut older = newest.clone();
+        older.timestamp = 10;
+        assert!(!store_record_to_path(&path, &older).unwrap());
+        assert_eq!(
+            load_records_from_path(&path).unwrap().get(&newest.path),
+            Some(&newest)
+        );
+    }
+
+    #[test]
+    fn diff_keeps_empty_additions_type_changes_and_per_child_uncertainty() {
+        let mut unknown = child("uncertain", 12);
+        unknown.inaccessible = 1;
+        let before = record(vec![unknown, child("type", 0)]);
+        let mut file = child("type", 0);
+        file.is_dir = false;
+        let after = record(vec![child("empty", 0), child("uncertain", 12), file]);
+        let diff = diff_records(&before, &after);
+        assert_eq!(diff.changes.len(), 3);
+        assert!(diff
+            .changes
+            .iter()
+            .any(|c| c.name == "empty" && c.before.is_none()));
+        assert!(diff.changes.iter().any(|c| c.name == "uncertain"
+            && c.before_inaccessible == 1
+            && c.after_inaccessible == 0));
+        assert!(diff
+            .changes
+            .iter()
+            .any(|c| c.name == "type" && c.before_is_dir != c.after_is_dir));
+    }
+
+    #[test]
+    fn malformed_history_records_are_not_zero_baselines() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"timestamp":1,"children":[{"name":"a","is_dir":false}]}),
+            serde_json::json!({"timestamp":1,"children":[],"enumeration_errors":-1}),
+        ] {
+            assert!(record_from_json(Path::new("/tmp/test"), &value).is_err());
+        }
+    }
+
+    #[test]
+    fn history_retains_valid_records_and_backs_up_corrupt_entries() {
+        let path = state::state_dir().join("mixed-history.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let valid = record(vec![]);
+        let original = serde_json::json!({"/tmp/example": record_to_json(&valid), "/tmp/bad": {"timestamp": 10}}).to_string();
+        std::fs::write(&path, &original).unwrap();
+        let (loaded, rejected) = load_records_report(&path).unwrap();
+        assert_eq!(rejected, 1);
+        assert_eq!(loaded.len(), 1);
+        assert!(store_record_to_path(&path, &valid).unwrap());
+        let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(backups[0].path()).unwrap(),
+            original
+        );
+        assert_eq!(load_records_report(&path).unwrap().1, 0);
+    }
+
+    #[test]
+    fn cancelled_history_store_does_not_write() {
+        let path = state::state_dir().join("cancelled.json");
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2));
+        let cancellation = bulkstat::ScanCancellation::new(generation, 1);
+        assert!(!store_record_cancellable(&record(vec![]), &cancellation, Some(&path)).unwrap());
+        assert!(!path.exists());
+    }
 
     fn child(name: &str, allocated: u64) -> ChildSize {
         ChildSize {
@@ -504,6 +712,7 @@ mod tests {
         ScanRecord {
             path: PathBuf::from("/tmp/example"),
             timestamp: 1000,
+            generation: 0,
             enumeration_errors: 0,
             children,
         }
@@ -552,6 +761,7 @@ mod tests {
         let original = ScanRecord {
             path: PathBuf::from("/tmp/example"),
             timestamp: 4242,
+            generation: 0,
             enumeration_errors: 2,
             children: vec![
                 ChildSize {
@@ -570,7 +780,7 @@ mod tests {
         };
 
         let json = record_to_json(&original);
-        let restored = record_from_json(&original.path, &json);
+        let restored = record_from_json(&original.path, &json).unwrap();
         assert_eq!(restored, original);
     }
 
@@ -585,6 +795,7 @@ mod tests {
         let baseline = ScanRecord {
             path: dir.clone(),
             timestamp: 0,
+            generation: 0,
             enumeration_errors: 0,
             children: Vec::new(),
         };
@@ -625,7 +836,7 @@ mod tests {
                 {"name": "dir", "is_dir": true, "logical": 10, "allocated": 20}
             ],
         });
-        let record = record_from_json(Path::new("/tmp/example"), &value);
+        let record = record_from_json(Path::new("/tmp/example"), &value).unwrap();
         assert_eq!(record.children[0].inaccessible, 0);
         assert_eq!(record.inaccessible(), 0);
     }
@@ -693,6 +904,7 @@ mod tests {
                 record_to_json(&ScanRecord {
                     path,
                     timestamp: idx as u64,
+                    generation: 0,
                     enumeration_errors: 0,
                     children: Vec::new(),
                 }),
@@ -731,6 +943,7 @@ mod tests {
                     &ScanRecord {
                         path: PathBuf::from(format!("/tmp/{name}")),
                         timestamp,
+                        generation: 0,
                         enumeration_errors: 0,
                         children: Vec::new(),
                     },

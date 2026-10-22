@@ -18,6 +18,7 @@ pub enum ScanMsg {
     },
     DirSize {
         scan_id: ScanId,
+        epoch: u64,
         path: PathBuf,
         size: SizeInfo,
         /// Permission-denied directories under `path`; size is a lower bound when > 0.
@@ -66,6 +67,7 @@ impl Scanner {
             return Ok(());
         }
         let remaining = Arc::new(AtomicUsize::new(dirs.len()));
+        let epoch = crate::state::next_epoch();
         // The shared injector is FIFO, so directories start in listing order.
         for dir in dirs {
             let started_tx = self.tx.clone();
@@ -88,6 +90,7 @@ impl Scanner {
                     };
                     let _ = done_tx.send(ScanMsg::DirSize {
                         scan_id,
+                        epoch,
                         path: dir,
                         size: scan.size,
                         inaccessible: scan.inaccessible,
@@ -137,6 +140,7 @@ mod tests {
                 }
                 ScanMsg::DirSize {
                     scan_id,
+                    epoch: _,
                     path,
                     size,
                     inaccessible,

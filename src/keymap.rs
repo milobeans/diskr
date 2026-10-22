@@ -134,7 +134,7 @@ const FILES: &[KeyBinding] = &[
     },
     KeyBinding {
         key: "S",
-        action: "Scan missing or stale visible directory sizes",
+        action: "Scan missing, stale, or incomplete visible directory sizes",
         footer: Some(FooterBinding {
             key: "S",
             action: "scan all",

@@ -18,7 +18,7 @@
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -28,7 +28,7 @@ use anyhow::Result;
 
 use crate::state;
 
-const STATE_VERSION: u64 = 1;
+const STATE_VERSION: u64 = 2;
 
 /// Result of consulting FSEvents at startup. `is_stale` answers, per cached
 /// directory, whether it must be revalidated.
@@ -83,12 +83,17 @@ pub fn plan_freshness(root: &Path) -> Freshness {
     let outcome = match saved {
         Some(saved)
             if saved.volume_uuid == uuid
+                && saved.watched_root == root
                 && saved.last_event_id > 0
                 && saved.last_event_id < now_id =>
         {
             replay_into_freshness(&root, saved.last_event_id)
         }
-        Some(saved) if saved.volume_uuid == uuid && saved.last_event_id == now_id => {
+        Some(saved)
+            if saved.volume_uuid == uuid
+                && saved.watched_root == root
+                && saved.last_event_id == now_id =>
+        {
             Freshness::Touched {
                 watched_root: root.clone(),
                 changed: Vec::new(),
@@ -99,8 +104,12 @@ pub fn plan_freshness(root: &Path) -> Freshness {
         _ => Freshness::All,
     };
 
-    // Persist the current id regardless, so the next launch has a baseline.
-    let _ = save_state(&state_file(), &uuid, now_id);
+    // The cursor must never outrun durable dirty flags. A crash between these
+    // writes replays events again, which is conservative and safe.
+    if state::mark_size_cache_stale(&outcome).is_err() {
+        return Freshness::All;
+    }
+    let _ = save_state(&state_file(), &uuid, &root, now_id);
     outcome
 }
 
@@ -118,6 +127,7 @@ fn replay_into_freshness(root: &Path, since: FSEventStreamEventId) -> Freshness 
 
 struct SavedState {
     volume_uuid: String,
+    watched_root: PathBuf,
     last_event_id: u64,
 }
 
@@ -133,14 +143,16 @@ fn load_state(path: &Path) -> Option<SavedState> {
     }
     Some(SavedState {
         volume_uuid: value.get("volume_uuid")?.as_str()?.to_string(),
+        watched_root: state::decode_path(value.get("watched_root")?.as_str()?)?,
         last_event_id: value.get("last_event_id")?.as_u64()?,
     })
 }
 
-fn save_state(path: &Path, volume_uuid: &str, last_event_id: u64) -> Result<()> {
+fn save_state(path: &Path, volume_uuid: &str, root: &Path, last_event_id: u64) -> Result<()> {
     let value = serde_json::json!({
         "version": STATE_VERSION,
         "volume_uuid": volume_uuid,
+        "watched_root": state::encode_path(root),
         "last_event_id": last_event_id,
     });
     state::atomic_write(path, &serde_json::to_string_pretty(&value)?)
@@ -442,11 +454,9 @@ extern "C" fn fsevents_callback(
         }
         let bytes = unsafe { CStr::from_ptr(raw) }.to_bytes();
         if !bytes.is_empty() {
-            state.changed_dirs.push(PathBuf::from(
-                std::str::from_utf8(bytes)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned()),
-            ));
+            state
+                .changed_dirs
+                .push(std::ffi::OsString::from_vec(bytes.to_vec()).into());
         }
     }
 }
@@ -540,7 +550,7 @@ mod tests {
             std::process::id(),
             current_event_id()
         ));
-        save_state(&path, "ABC-123", 987_654).unwrap();
+        save_state(&path, "ABC-123", Path::new("/tmp/root"), 987_654).unwrap();
         let loaded = load_state(&path).expect("state present");
         assert_eq!(loaded.volume_uuid, "ABC-123");
         assert_eq!(loaded.last_event_id, 987_654);

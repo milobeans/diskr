@@ -79,7 +79,7 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | . | Toggle hidden files in the Files pane |
 | o | Cycle sort mode in the Files pane |
 | r | Refresh the current view and rescan all visible directory sizes |
-| S | Scan every missing or stale visible directory size in the Files pane |
+| S | Scan every missing, stale, or incomplete visible directory size in the Files pane |
 | B | Save a history baseline for the current Files directory |
 | t | Open the top-files list for the selection |
 | c | Rename the selected file |

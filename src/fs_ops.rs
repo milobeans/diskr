@@ -11,16 +11,7 @@ pub fn delete_to_trash(path: &Path) -> Result<()> {
 
     unsafe {
         let _pool = AutoreleasePool::new()?;
-        let path_string = msg_send_id_with_cstr(
-            class(c"NSString")?,
-            selector(c"stringWithUTF8String:"),
-            path.as_ptr(),
-        );
-        if path_string.is_null() {
-            return Err(anyhow!("could not create NSString for path"));
-        }
-
-        let url = msg_send_id_with_id(class(c"NSURL")?, selector(c"fileURLWithPath:"), path_string);
+        let url = file_url(path.as_ptr())?;
         if url.is_null() {
             return Err(anyhow!("could not create file URL for path"));
         }
@@ -106,15 +97,16 @@ unsafe fn msg_send_id(receiver: Id, sel: Sel) -> Id {
     f(receiver, sel)
 }
 
-unsafe fn msg_send_id_with_cstr(receiver: Id, sel: Sel, arg: *const libc::c_char) -> Id {
-    let f: unsafe extern "C" fn(Id, Sel, *const libc::c_char) -> Id =
+unsafe fn file_url(path: *const libc::c_char) -> Result<Id> {
+    let f: unsafe extern "C" fn(Id, Sel, *const libc::c_char, libc::c_schar, Id) -> Id =
         std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, sel, arg)
-}
-
-unsafe fn msg_send_id_with_id(receiver: Id, sel: Sel, arg: Id) -> Id {
-    let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = std::mem::transmute(objc_msgSend as *const ());
-    f(receiver, sel, arg)
+    Ok(f(
+        class(c"NSURL")?,
+        selector(c"fileURLWithFileSystemRepresentation:isDirectory:relativeToURL:"),
+        path,
+        0,
+        std::ptr::null_mut(),
+    ))
 }
 
 unsafe fn msg_send_bool_with_trash_args(
@@ -192,6 +184,19 @@ pub fn run_osascript(program: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_url_preserves_path_without_trashing_anything() {
+        let path = c"/tmp/diskr URL with spaces and unicode-é";
+        unsafe {
+            let _pool = AutoreleasePool::new().unwrap();
+            let url = file_url(path.as_ptr()).unwrap();
+            assert!(!url.is_null());
+            let actual = msg_send_const_char(url, selector(c"fileSystemRepresentation"));
+            assert!(!actual.is_null());
+            assert_eq!(CStr::from_ptr(actual), path);
+        }
+    }
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 

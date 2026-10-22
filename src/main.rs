@@ -570,6 +570,11 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
                     "after_allocated": change.after.map(|s| s.allocated),
                     "delta_logical": change.delta_logical().to_string(),
                     "delta_allocated": change.delta_allocated().to_string(),
+                    "before_inaccessible": change.before_inaccessible,
+                    "after_inaccessible": change.after_inaccessible,
+                    "before_is_dir": change.before_is_dir,
+                    "after_is_dir": change.after_is_dir,
+                    "delta_complete": change.before_inaccessible == 0 && change.after_inaccessible == 0,
                 })
             })
             .collect();
@@ -583,6 +588,7 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
             "after_total_allocated": report.after_total.allocated,
             "baseline_inaccessible": report.baseline_inaccessible,
             "current_inaccessible": report.current_inaccessible,
+            "delta_complete": report.baseline_inaccessible == 0 && report.current_inaccessible == 0,
             "total_delta_logical": report.total_delta_logical().to_string(),
             "total_delta_allocated": report.total_delta_allocated().to_string(),
             "changes": changes,
@@ -608,12 +614,16 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
     );
     if report.baseline_inaccessible > 0 || report.current_inaccessible > 0 {
         println!(
-            "Warning: unreadable directories (baseline {}, current {}); totals are lower bounds.",
+            "Warning: unreadable directories (baseline {}, current {}); totals are lower bounds and deltas are indeterminate.",
             report.baseline_inaccessible, report.current_inaccessible
         );
     }
     if report.changes.is_empty() {
-        println!("No changes since the baseline.");
+        if report.baseline_inaccessible > 0 || report.current_inaccessible > 0 {
+            println!("No observed changes; comparison incomplete.");
+        } else {
+            println!("No changes since the baseline.");
+        }
         return Ok(());
     }
     for change in &report.changes {
@@ -628,6 +638,15 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
 }
 
 fn change_status(change: &history::ChildChange) -> &'static str {
+    if change.before_inaccessible > 0 || change.after_inaccessible > 0 {
+        return "uncertain";
+    }
+    if change.before_is_dir != change.after_is_dir
+        && change.before.is_some()
+        && change.after.is_some()
+    {
+        return "type changed";
+    }
     match (change.before, change.after) {
         (None, Some(_)) => "new",
         (Some(_), None) => "removed",
@@ -1868,11 +1887,19 @@ mod tests {
             name: String::from("logical-only"),
             before: Some(bulkstat::SizeInfo::new(200, 100)),
             after: Some(bulkstat::SizeInfo::new(120, 100)),
+            before_inaccessible: 0,
+            after_inaccessible: 0,
+            before_is_dir: Some(true),
+            after_is_dir: Some(true),
         };
         let grew = history::ChildChange {
             name: String::from("logical-only"),
             before: Some(bulkstat::SizeInfo::new(120, 100)),
             after: Some(bulkstat::SizeInfo::new(200, 100)),
+            before_inaccessible: 0,
+            after_inaccessible: 0,
+            before_is_dir: Some(true),
+            after_is_dir: Some(true),
         };
 
         assert_eq!(change_status(&shrank), "shrank");
