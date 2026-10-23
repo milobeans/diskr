@@ -49,7 +49,7 @@ const GLOBAL: &[KeyBinding] = &[
     },
     KeyBinding {
         key: "Esc, Ctrl+C",
-        action: "Cancel focused reclaim scan, close modal or clear search/filter",
+        action: "Cancel focused listing/inventory/reclaim scan, close modal or clear search/filter",
         footer: None,
     },
 ];

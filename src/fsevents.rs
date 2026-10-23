@@ -114,7 +114,11 @@ pub fn plan_freshness(root: &Path) -> Freshness {
 }
 
 fn replay_into_freshness(root: &Path, since: FSEventStreamEventId) -> Freshness {
-    match changes_since(root, since) {
+    freshness_from_report(root, changes_since(root, since))
+}
+
+fn freshness_from_report(root: &Path, report: Option<ChangeReport>) -> Freshness {
+    match report {
         Some(report) if report.reliable => Freshness::Touched {
             watched_root: root.to_path_buf(),
             changed: report.changed_dirs,
@@ -574,16 +578,48 @@ mod tests {
     }
 
     #[test]
-    fn replay_run_loop_completes_with_no_history() {
-        // Replaying "since the current id" has no historical events, so
-        // HistoryDone fires immediately. This drives the whole run-loop FFI
-        // path — CFArray/CFString creation, FSEventStreamCreate/Schedule/Start,
-        // the callback, and CFRunLoopRunInMode — deterministically, without
-        // depending on a specific change being journaled. If FSEvents is
-        // unavailable it returns None; either way it must not hang or panic.
-        let dir = std::env::temp_dir();
-        if let Some(report) = changes_since(&dir, current_event_id()) {
-            assert!(report.reliable);
+    fn unreliable_or_unavailable_replay_never_keeps_cached_paths_fresh() {
+        let root = Path::new("/fixture");
+        for report in [
+            None,
+            Some(ChangeReport {
+                changed_dirs: Vec::new(),
+                reliable: false,
+            }),
+        ] {
+            assert!(matches!(
+                freshness_from_report(root, report),
+                Freshness::All
+            ));
         }
+        let touched = freshness_from_report(
+            root,
+            Some(ChangeReport {
+                changed_dirs: vec![root.join("changed")],
+                reliable: true,
+            }),
+        );
+        assert!(touched.is_stale(&root.join("changed")));
+        assert!(!touched.is_stale(&root.join("unchanged")));
+    }
+
+    #[test]
+    fn replay_run_loop_completes_with_no_history() {
+        // Exercise the real FFI/run-loop path, not the OS journal's delivery
+        // reliability. Coalesced/dropped events remain valid conservative input.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "diskr_fsevents_replay_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let report = changes_since(&dir, current_event_id());
+        let reliable = report.as_ref().is_some_and(|report| report.reliable);
+        let outcome = freshness_from_report(&dir, report);
+        assert_eq!(matches!(outcome, Freshness::Touched { .. }), reliable);
+        std::fs::remove_dir(dir).unwrap();
     }
 }

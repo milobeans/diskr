@@ -224,7 +224,15 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
             .title("files · 0 items")
             .border_style(Style::default().fg(border_color));
         let message = match &app.listing_state {
+            ListingState::Loading => app.listing_progress(),
+            ListingState::Cancelled => {
+                String::from("listing cancelled · shown entries are partial · r retry")
+            }
             ListingState::Unreadable(message) => format!("{message} · r retry · Backspace parent"),
+            ListingState::Ready if app.cwd_enumeration_errors > 0 => format!(
+                "no visible entries · {} entries unreadable · r retry",
+                app.cwd_enumeration_errors
+            ),
             ListingState::Ready if app.entries.is_empty() && app.hidden_entry_count > 0 => {
                 String::from("no visible files · . shows hidden")
             }
@@ -1559,6 +1567,11 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
             proj_style,
         ),
         Span::styled(total_str, Style::default().fg(Color::Green)),
+        if app.package_scan_partial {
+            Span::styled(" [partial]", Style::default().fg(Color::Yellow))
+        } else {
+            Span::raw("")
+        },
         if app.pkg_show_unused {
             Span::styled(" [dependency leaves]", Style::default().fg(Color::Magenta))
         } else {
@@ -1650,7 +1663,11 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
                 PkgView::ProjectDeps => "no project manifests found",
             }
         };
-        let message = if app.pkg_view == PkgView::ProjectDeps && !app.pkg_filter_active() {
+        let message = if app.packages_loading {
+            app.package_progress()
+        } else if app.package_scan_partial {
+            format!("{message}\ninventory incomplete; p to scan again")
+        } else if app.pkg_view == PkgView::ProjectDeps && !app.pkg_filter_active() {
             format!("{message}\n{}", app.project_scope.summary())
         } else {
             message.to_string()
@@ -2807,7 +2824,7 @@ fn selection_status(app: &App) -> Vec<Span<'static>> {
                     Style::default().fg(Color::Cyan),
                 ));
                 spans.push(Span::styled(
-                    "scanning packages",
+                    app.package_progress(),
                     Style::default().fg(Color::White),
                 ));
                 return spans;
@@ -3015,6 +3032,15 @@ fn files_pane_title(app: &App, visible_count: usize, total_size: u64, sized: usi
     } else {
         format!("files · {visible_count} items")
     };
+    if matches!(
+        app.listing_state,
+        ListingState::Loading | ListingState::Cancelled
+    ) {
+        title.push_str(" · partial");
+    }
+    if app.cwd_enumeration_errors > 0 {
+        title.push_str(&format!(" · {} unreadable", app.cwd_enumeration_errors));
+    }
     if total_size > 0 {
         title.push_str(&format!(" · {} rows*", human(total_size)));
     }
@@ -3786,6 +3812,11 @@ mod tests {
         std::fs::write(root.join(".hidden"), b"x").unwrap();
         let mut app = App::new(root.clone()).unwrap();
         assert!(render_app(&mut app, 80, 24).contains("no visible files"));
+        app.cwd_enumeration_errors = 2;
+        assert!(render_app(&mut app, 80, 24).contains("2 entries unreadable"));
+        app.cwd_enumeration_errors = 0;
+        app.listing_state = ListingState::Cancelled;
+        assert!(render_app(&mut app, 80, 24).contains("listing cancelled"));
         app.listing_state = ListingState::Unreadable(String::from("cannot read: denied"));
         assert!(render_app(&mut app, 80, 24).contains("cannot read: denied"));
         std::fs::remove_dir_all(root).unwrap();

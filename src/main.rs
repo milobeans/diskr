@@ -148,10 +148,60 @@ fn run_main() -> Result<()> {
         }
         CliAction::Top { path, limit, json } => print_top(path, limit, json),
         CliAction::Reclaim { path, json } => print_reclaim(path, json),
-        CliAction::Save { path, json } => save_baseline(path, json),
-        CliAction::Diff { path, json } => print_diff(path, json),
+        CliAction::Save {
+            path,
+            json,
+            baseline,
+        } => save_baseline(path, json, baseline),
+        CliAction::Diff {
+            path,
+            json,
+            baseline,
+            explicit_path,
+        } => print_diff(path, json, baseline, explicit_path),
         CliAction::Space { path, json } => print_space(path, json),
-        CliAction::Packages { path, json } => print_packages(path, json),
+        CliAction::Packages {
+            path,
+            json,
+            scope,
+            profile,
+        } => {
+            let (path, scope) = match profile {
+                Some(name) => {
+                    let profile = history::scan_profile(&name)?;
+                    (profile.root, profile.scope)
+                }
+                None => (path, scope),
+            };
+            print_packages(path, json, scope)
+        }
+        CliAction::Library {
+            operation,
+            json,
+            confirmed,
+        } => {
+            let mut value = history::manage_library(operation, confirmed)?;
+            value["scope"] = serde_json::json!({"policy":"baseline/profile catalog metadata; saved roots are not rescanned"});
+            let warnings: Vec<String> = value["history_warning"]
+                .as_str()
+                .map(str::to_owned)
+                .into_iter()
+                .collect();
+            let complete = warnings.is_empty();
+            note_report_completeness(complete);
+            if json {
+                emit_report(
+                    "baseline_library",
+                    &state::state_dir(),
+                    value,
+                    complete,
+                    warnings,
+                )
+            } else {
+                cli_println!("{}", serde_json::to_string_pretty(&value)?);
+                Ok(())
+            }
+        }
         CliAction::ThinSnapshots {
             path,
             bytes,
@@ -168,12 +218,9 @@ fn run_main() -> Result<()> {
 }
 
 fn run_app(start: PathBuf) -> Result<()> {
-    let start = canonical_dir(start)?;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("diskr requires an interactive terminal");
     }
-
-    let mut app = App::new(start)?;
 
     // Install the panic hook before entering the TUI. The hook restores the
     // terminal first so the panic message lands on a sane screen, then
@@ -189,6 +236,49 @@ fn run_app(start: PathBuf) -> Result<()> {
     let _terminal_guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+
+    let startup_label = format!(
+        "diskr\nloading state for {}\nq / Esc / Ctrl+C cancel",
+        SafePath(&start)
+    );
+    terminal.draw(|frame| {
+        frame.render_widget(
+            ratatui_widgets::paragraph::Paragraph::new(startup_label.clone()),
+            frame.area(),
+        )
+    })?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(canonical_dir(start).and_then(App::new_streaming));
+    });
+    let mut app = loop {
+        match rx.try_recv() {
+            Ok(result) => break result?,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => bail!("startup worker stopped"),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && (matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                            || (key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL))) =>
+                {
+                    return Ok(())
+                }
+                Event::Resize(_, _) => {
+                    terminal.draw(|frame| {
+                        frame.render_widget(
+                            ratatui_widgets::paragraph::Paragraph::new(startup_label.clone()),
+                            frame.area(),
+                        )
+                    })?;
+                }
+                _ => {}
+            }
+        }
+    };
 
     let res = run(&mut terminal, &mut app);
     let cache_res = app.save_size_cache();
@@ -251,10 +341,13 @@ enum CliAction {
     Save {
         path: PathBuf,
         json: bool,
+        baseline: Option<String>,
     },
     Diff {
         path: PathBuf,
         json: bool,
+        baseline: Option<String>,
+        explicit_path: bool,
     },
     Space {
         path: PathBuf,
@@ -263,6 +356,13 @@ enum CliAction {
     Packages {
         path: PathBuf,
         json: bool,
+        scope: packages::InventoryScope,
+        profile: Option<String>,
+    },
+    Library {
+        operation: history::LibraryAction,
+        json: bool,
+        confirmed: bool,
     },
     ThinSnapshots {
         path: PathBuf,
@@ -287,6 +387,14 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
     let mut json = false;
     let mut separator_seen = false;
     let mut options = ReportOptions::default();
+    let mut inventory_scope = packages::InventoryScope::default();
+    let mut inventory_options = false;
+    let mut explicit_managers = false;
+    let mut projects_only = false;
+    let mut baseline = None;
+    let mut profile = None;
+    let mut save_profile = None;
+    let mut library_action = None;
 
     while let Some(arg) = args.next() {
         if separator_seen {
@@ -296,6 +404,118 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
 
         let arg_text = arg.to_string_lossy().into_owned();
         match arg_text.as_str() {
+            "--baseline" => {
+                if baseline.is_some() {
+                    bail!("specify --baseline once");
+                }
+                baseline = Some(parse_library_name(args.next())?);
+            }
+            "--profile" => {
+                if profile.is_some() {
+                    bail!("specify --profile once");
+                }
+                profile = Some(parse_library_name(args.next())?);
+            }
+            "--save-profile" => {
+                if save_profile.is_some() {
+                    bail!("specify --save-profile once");
+                }
+                save_profile = Some(parse_library_name(args.next())?);
+            }
+            "--baselines" => {
+                if library_action.is_some() {
+                    bail!("choose one baseline library operation");
+                }
+                let operation = args
+                    .next()
+                    .context("--baselines requires list, pin, unpin, prune, export, import or remove-profile")?;
+                library_action = Some(match operation.to_str() {
+                    Some("list") => history::LibraryAction::List,
+                    Some("remove-profile") => history::LibraryAction::RemoveProfile {
+                        name: parse_library_name(args.next())?,
+                    },
+                    Some("pin") => history::LibraryAction::Pin {
+                        name: parse_library_name(args.next())?,
+                        pinned: true,
+                    },
+                    Some("unpin") => history::LibraryAction::Pin {
+                        name: parse_library_name(args.next())?,
+                        pinned: false,
+                    },
+                    Some("prune") => {
+                        let keep = args
+                            .next()
+                            .context("prune requires an unpinned retention count")?;
+                        history::LibraryAction::Prune {
+                            keep: keep
+                                .to_str()
+                                .and_then(|value| value.parse().ok())
+                                .context("invalid prune retention count")?,
+                        }
+                    }
+                    Some("export") => history::LibraryAction::Export(PathBuf::from(
+                        args.next()
+                            .context("export requires a new destination file")?,
+                    )),
+                    Some("import") => history::LibraryAction::Import(PathBuf::from(
+                        args.next().context("import requires a library file")?,
+                    )),
+                    _ => bail!("--baselines requires list, pin, unpin, prune, export, import or remove-profile"),
+                });
+            }
+            "--projects-only" => {
+                inventory_options = true;
+                projects_only = true;
+                inventory_scope.managers.clear();
+            }
+            "--no-projects" => {
+                inventory_options = true;
+                inventory_scope.projects = false;
+            }
+            "--manager" => {
+                inventory_options = true;
+                let value = args.next().context("--manager requires a manager key")?;
+                let manager = value
+                    .to_str()
+                    .and_then(packages::Manager::from_key)
+                    .context("--manager expects brew, brew-cask, npm, pip, cargo or bun")?;
+                if !explicit_managers {
+                    inventory_scope.managers.clear();
+                }
+                explicit_managers = true;
+                if !inventory_scope.managers.contains(&manager) {
+                    inventory_scope.managers.push(manager);
+                }
+            }
+            "--max-depth" => {
+                inventory_options = true;
+                let value = args.next().context("--max-depth requires 0 through 64")?;
+                inventory_scope.depth = value
+                    .to_str()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|depth| *depth <= 64)
+                    .context("--max-depth requires 0 through 64")?;
+            }
+            "--exclude" => {
+                inventory_options = true;
+                let excluded = PathBuf::from(
+                    args.next()
+                        .context("--exclude requires a root-relative subtree")?,
+                );
+                if excluded.as_os_str().is_empty()
+                    || excluded.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    bail!("--exclude requires a root-relative subtree without ..");
+                }
+                inventory_scope.excludes.push(excluded);
+            }
             "--strict" => options.strict = true,
             "--min-size" => {
                 let value = args.next().context("--min-size requires a byte size")?;
@@ -374,11 +594,21 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
         && !diff_baseline
         && !space_report
         && !packages_report
+        && library_action.is_none()
+        && save_profile.is_none()
     {
-        bail!("--json requires --top, --reclaim, --save, --diff, --space, or --packages");
+        bail!("--json requires --top, --reclaim, --save, --diff, --space, or --packages (also supported by --baselines and --save-profile)");
     }
-    if confirmed && thin_snapshots.is_none() {
-        bail!("--yes requires --thin-snapshots");
+    if confirmed
+        && thin_snapshots.is_none()
+        && !matches!(
+            library_action.as_ref(),
+            Some(
+                history::LibraryAction::Prune { .. } | history::LibraryAction::RemoveProfile { .. }
+            )
+        )
+    {
+        bail!("--yes requires --thin-snapshots or --baselines prune/remove-profile");
     }
     if separator_seen && path.is_none() {
         bail!("usage: diskr [PATH]");
@@ -389,9 +619,11 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
         + usize::from(diff_baseline)
         + usize::from(space_report)
         + usize::from(packages_report)
+        + usize::from(library_action.is_some())
+        + usize::from(save_profile.is_some())
         + usize::from(thin_snapshots.is_some());
     if mode_count > 1 {
-        bail!("choose only one of --top, --reclaim, --save, --diff, --space, --packages, or --thin-snapshots");
+        bail!("choose only one of --top, --reclaim, --save, --diff, --space, --packages, or --thin-snapshots; baseline-library and save-profile modes are also exclusive");
     }
 
     if options.strict && (mode_count == 0 || thin_snapshots.is_some()) {
@@ -403,38 +635,77 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
     if options.class.is_some() && !reclaim_report {
         bail!("--class requires --reclaim");
     }
-    let action: Result<CliAction> = match top_limit {
-        Some(limit) => Ok(CliAction::Top {
-            path: path.unwrap_or_else(dirs_home),
-            limit,
+    if inventory_options && !packages_report && save_profile.is_none() {
+        bail!("inventory scope options require --packages or --save-profile");
+    }
+    if projects_only && (explicit_managers || !inventory_scope.projects) {
+        bail!("--projects-only cannot be combined with --manager or --no-projects");
+    }
+    if baseline.is_some() && !save_baseline && !diff_baseline {
+        bail!("--baseline requires --save or --diff");
+    }
+    if profile.is_some() && (!packages_report || path.is_some() || inventory_options) {
+        bail!("--profile requires --packages without an explicit path or scope overrides");
+    }
+    if library_action.is_some() && path.is_some() {
+        bail!("baseline library operations do not accept a scan path");
+    }
+    let explicit_path = path.is_some();
+    let action: Result<CliAction> = if let Some(name) = save_profile {
+        Ok(CliAction::Library {
+            operation: history::LibraryAction::SaveProfile {
+                name,
+                root: path.unwrap_or_else(dirs_home),
+                scope: inventory_scope,
+            },
             json,
-        }),
-        None if reclaim_report => Ok(CliAction::Reclaim {
-            path: path.unwrap_or_else(dirs_home),
-            json,
-        }),
-        None if save_baseline => Ok(CliAction::Save {
-            path: path.unwrap_or_else(dirs_home),
-            json,
-        }),
-        None if diff_baseline => Ok(CliAction::Diff {
-            path: path.unwrap_or_else(dirs_home),
-            json,
-        }),
-        None if space_report => Ok(CliAction::Space {
-            path: path.unwrap_or_else(dirs_home),
-            json,
-        }),
-        None if packages_report => Ok(CliAction::Packages {
-            path: path.unwrap_or_else(dirs_home),
-            json,
-        }),
-        None if thin_snapshots.is_some() => Ok(CliAction::ThinSnapshots {
-            path: path.unwrap_or_else(dirs_home),
-            bytes: thin_snapshots.unwrap_or_default(),
             confirmed,
-        }),
-        None => Ok(CliAction::Run(path.unwrap_or_else(dirs_home))),
+        })
+    } else if let Some(operation) = library_action {
+        Ok(CliAction::Library {
+            operation,
+            json,
+            confirmed,
+        })
+    } else {
+        match top_limit {
+            Some(limit) => Ok(CliAction::Top {
+                path: path.unwrap_or_else(dirs_home),
+                limit,
+                json,
+            }),
+            None if reclaim_report => Ok(CliAction::Reclaim {
+                path: path.unwrap_or_else(dirs_home),
+                json,
+            }),
+            None if save_baseline => Ok(CliAction::Save {
+                path: path.unwrap_or_else(dirs_home),
+                json,
+                baseline,
+            }),
+            None if diff_baseline => Ok(CliAction::Diff {
+                path: path.unwrap_or_else(dirs_home),
+                json,
+                baseline,
+                explicit_path,
+            }),
+            None if space_report => Ok(CliAction::Space {
+                path: path.unwrap_or_else(dirs_home),
+                json,
+            }),
+            None if packages_report => Ok(CliAction::Packages {
+                path: path.unwrap_or_else(dirs_home),
+                json,
+                scope: inventory_scope,
+                profile,
+            }),
+            None if thin_snapshots.is_some() => Ok(CliAction::ThinSnapshots {
+                path: path.unwrap_or_else(dirs_home),
+                bytes: thin_snapshots.unwrap_or_default(),
+                confirmed,
+            }),
+            None => Ok(CliAction::Run(path.unwrap_or_else(dirs_home))),
+        }
     };
     let action = action?;
     Ok(if options == ReportOptions::default() {
@@ -445,6 +716,13 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
             options,
         }
     })
+}
+
+fn parse_library_name(value: Option<OsString>) -> Result<String> {
+    let value = value.context("option requires a name")?;
+    let name = value.to_str().context("names must be UTF-8")?;
+    history::validate_library_name(name)?;
+    Ok(name.to_owned())
 }
 
 fn set_cli_path(path: &mut Option<PathBuf>, value: OsString) -> Result<()> {
@@ -480,12 +758,27 @@ Usage:
   diskr --diff [--json] [PATH]
   diskr --space [--json] [PATH]
   diskr --packages [--json] [PATH]
+  diskr --save --baseline NAME [--json] [PATH]
+  diskr --diff --baseline NAME [--json] [PATH]
+  diskr --baselines list|pin NAME|unpin NAME|prune KEEP|export FILE|import FILE
+  diskr --baselines remove-profile NAME [--yes]
+  diskr --save-profile NAME [inventory options] [PATH]
+  diskr --packages --profile NAME [--json]
   diskr --thin-snapshots SIZE [--yes] [PATH]
 
 Report options:
   --strict             Exit 2 after printing an incomplete report (default: 0)
   --min-size SIZE      Filter rows in --top, --reclaim or --packages
   --class CLASS        Filter --reclaim: safe, regenerable or risky
+  --projects-only      --packages: discover projects without running managers
+  --manager KEY        --packages: select manager (repeatable); projects remain on
+  --no-projects        --packages: omit project discovery
+  --max-depth N        --packages: project depth, 0 through 64 (default: 5)
+  --exclude SUBTREE    --packages: exclude a root-relative project subtree
+  --baseline NAME      Select an immutable named capture for --save or --diff
+  --save-profile NAME  Save a root and package scope without running managers
+  --profile NAME       Use a local package profile; no path/scope overrides
+  --baselines prune N  Preview removal of older unpinned captures; --yes applies
 
 Terminal preferences:
   DISKR_THEME=dark|light|high-contrast|mono
@@ -777,9 +1070,15 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
+fn save_baseline(path: PathBuf, json: bool, baseline: Option<String>) -> Result<()> {
     let path = canonical_dir(path)?;
-    let record = history::save(&path)?;
+    let record = if let Some(name) = &baseline {
+        let record = history::scan_record(&path)?;
+        history::save_named_baseline(name, &record)?;
+        record
+    } else {
+        history::save(&path)?
+    };
     let total = record.total();
     let complete = record.inaccessible() == 0 && record.skipped_mounts() == 0;
     let warnings = scan_warnings(record.inaccessible(), record.skipped_mounts());
@@ -802,6 +1101,8 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
         let value = serde_json::json!({
             "path": record.path.to_string_lossy(),
             "timestamp": record.timestamp,
+            "baseline_name": baseline,
+            "retention": {"latest_root_limit":history::HISTORY_MAX_RECORDS,"named":"explicit prune only; pinned records protected"},
             "total_logical": total.logical,
             "total_allocated": total.allocated,
             "inaccessible": record.inaccessible(),
@@ -826,17 +1127,44 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
         );
     }
     cli_println!(
-        "Compare later with: diskr --diff {}",
+        "Compare later with: diskr --diff {}{}",
+        baseline
+            .as_ref()
+            .map(|name| format!("--baseline {name} "))
+            .unwrap_or_default(),
         shell_quote_path(&record.path)
     );
+    cli_println!("Retention: latest per-root history keeps {} roots; named baselines require explicit prune and may be pinned.", history::HISTORY_MAX_RECORDS);
     Ok(())
 }
 
-fn print_diff(path: PathBuf, json: bool) -> Result<()> {
-    let path = canonical_dir(path)?;
-    let report = history::diff(&path)?;
-    let complete = report.complete();
-    let warnings = scan_warnings(
+fn print_diff(
+    path: PathBuf,
+    json: bool,
+    baseline: Option<String>,
+    explicit_path: bool,
+) -> Result<()> {
+    let (path, report, origin, foreign) = if let Some(name) = baseline {
+        let (baseline, foreign) = history::named_baseline(&name)?;
+        let path = canonical_dir(if explicit_path {
+            path
+        } else {
+            baseline.record.path.clone()
+        })?;
+        if path != baseline.record.path {
+            bail!("named baseline root does not match selected path; roots are never implicitly retargeted");
+        }
+        let report = history::diff_from_record(&baseline.record, &path)?;
+        let origin = serde_json::json!({"name":name,"machine":baseline.machine,"foreign_machine":foreign,
+            "root_identity":state::encode_path(&baseline.record.path)});
+        (path, report, Some(origin), foreign)
+    } else {
+        let path = canonical_dir(path)?;
+        let report = history::diff(&path)?;
+        (path, report, None, false)
+    };
+    let complete = report.complete() && !foreign;
+    let mut warnings = scan_warnings(
         report
             .baseline_inaccessible
             .saturating_add(report.current_inaccessible),
@@ -844,6 +1172,9 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
             .baseline_skipped_mounts
             .saturating_add(report.current_skipped_mounts),
     );
+    if foreign {
+        warnings.push(String::from("baseline was captured on another machine; allocation deltas are cross-environment comparisons"));
+    }
     note_report_completeness(complete);
     if json {
         let changes: Vec<_> = report
@@ -872,6 +1203,7 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
         let value = serde_json::json!({
             "path": report.path.to_string_lossy(),
             "baseline_timestamp": report.baseline_timestamp,
+            "baseline_origin": origin,
             "current_timestamp": report.current_timestamp,
             "before_total_logical": report.before_total.logical,
             "before_total_allocated": report.before_total.allocated,
@@ -879,7 +1211,7 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
             "after_total_allocated": report.after_total.allocated,
             "baseline_inaccessible": report.baseline_inaccessible,
             "current_inaccessible": report.current_inaccessible,
-            "delta_complete": report.complete(),
+            "delta_complete": complete,
             "baseline_skipped_mounts": report.baseline_skipped_mounts,
             "current_skipped_mounts": report.current_skipped_mounts,
             "total_delta_logical": report.total_delta_logical().to_string(),
@@ -892,6 +1224,9 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
     }
 
     cli_println!("Diff for {}", SafePath(&report.path));
+    if foreign {
+        cli_println!("Warning: baseline captured on another machine; allocation deltas are cross-environment comparisons.");
+    }
     cli_println!(
         "Baseline captured {}",
         format_elapsed(
@@ -913,7 +1248,7 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
         );
     }
     if report.changes.is_empty() {
-        if !report.complete() {
+        if !complete {
             cli_println!("No observed changes; comparison incomplete.");
         } else {
             cli_println!("No changes since the baseline.");
@@ -1059,10 +1394,26 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_packages(path: PathBuf, json: bool) -> Result<()> {
+fn print_packages(path: PathBuf, json: bool, scope: packages::InventoryScope) -> Result<()> {
     let path = canonical_dir(path)?;
-    let mut reports = packages::scan_managers();
-    let mut project_scan = packages::scan_project_deps(&path, 5);
+    let mut reports = packages::scan_selected_managers(&scope.managers);
+    let mut project_scan = if scope.projects {
+        packages::scan_project_deps_streamed(
+            &path,
+            &scope,
+            &bulkstat::ScanCancellation::never(),
+            &|_| {},
+        )
+    } else {
+        packages::ProjectDepsReport {
+            projects: Vec::new(),
+            inaccessible: 0,
+            scope: bulkstat::DiscoveryCoverage {
+                depth_limit: scope.depth,
+                ..Default::default()
+            },
+        }
+    };
     let graph = packages::scan_dep_graph(&reports);
     let mut warnings = scan_warnings(project_scan.inaccessible, project_scan.scope.skipped_mounts);
     let unknown = reports
@@ -1195,7 +1546,7 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             "project_dependencies": projects,
             "project_inventory_count": project_count,
             "project_filtered_out": project_count - project_deps.len(),
-            "scope": {"policy": "retained manager environments and bounded project discovery", "project": project_scan.scope.json()},
+            "scope": {"policy": "retained manager environments and bounded project discovery", "project": project_scan.scope.json(), "inventory": scope.json()},
             "coverage": {"project_inaccessible": project_scan.inaccessible, "project_skipped_mounts": project_scan.scope.skipped_mounts, "unknown_footprints": unknown, "partial_footprints": partial, "scope_limited_footprints": scope_limited},
             "dependency_graph_warnings": graph.warnings().iter().map(|warning| serde_json::json!({
                 "manager": warning.manager.label(),
@@ -1206,6 +1557,7 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
     }
 
     cli_println!("Package report");
+    cli_println!("Inventory scope: {}", scope.json());
     print_filter_notice()?;
     cli_println!();
 
@@ -2261,6 +2613,10 @@ fn cancel_active_state(app: &mut App) {
             if app.focus == Focus::Reclaim && app.reclaim_loading {
                 app.cancel_reclaim_scan();
                 app.focus = Focus::Files;
+            } else if app.focus == Focus::Packages && (app.packages_loading || app.deps_loading) {
+                app.cancel_package_scan();
+            } else if app.focus == Focus::Files && app.listing_loading() {
+                app.cancel_listing();
             } else if app.focus == Focus::Packages
                 && (app.pkg_search_mode || app.pkg_filter_active())
             {
@@ -2413,6 +2769,86 @@ mod tests {
 
     fn parse(parts: &[&str]) -> Result<CliAction> {
         parse_args(parts.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn library_modes_reject_conflicting_roots_overrides_and_confirmation_flags() {
+        for arguments in [
+            vec!["--baseline", "capture"],
+            vec!["--baselines", "list", "/tmp"],
+            vec!["--baselines", "pin"],
+            vec!["--baselines", "prune", "-1"],
+            vec!["--baselines", "list", "--yes"],
+            vec!["--packages", "--profile", "work", "/tmp"],
+            vec!["--packages", "--profile", "work", "--max-depth", "2"],
+            vec!["--save-profile", "work", "--packages"],
+            vec!["--save-profile", "work", "--save-profile", "other"],
+            vec!["--save", "--baseline", "a", "--baseline", "b"],
+            vec!["--save", "--baseline", "bad/name"],
+        ] {
+            assert!(parse(&arguments).is_err(), "accepted {arguments:?}");
+        }
+        assert!(matches!(
+            parse(&["--diff", "--baseline", "capture"]).unwrap(),
+            CliAction::Diff {
+                baseline: Some(_),
+                explicit_path: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["--baselines", "remove-profile", "work", "--yes"]).unwrap(),
+            CliAction::Library {
+                confirmed: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn inventory_options_preserve_scope_and_reject_ambiguous_arguments() {
+        let CliAction::Packages { scope, .. } = parse(&[
+            "--packages",
+            "--projects-only",
+            "--max-depth",
+            "0",
+            "--exclude",
+            "archive",
+        ])
+        .unwrap() else {
+            panic!("package action")
+        };
+        assert!(scope.managers.is_empty());
+        assert!(scope.projects);
+        assert_eq!(scope.depth, 0);
+        assert_eq!(scope.excludes, [PathBuf::from("archive")]);
+        let CliAction::Packages { scope, .. } = parse(&[
+            "--packages",
+            "--manager",
+            "cargo",
+            "--manager",
+            "cargo",
+            "--no-projects",
+        ])
+        .unwrap() else {
+            panic!("package action")
+        };
+        assert_eq!(scope.managers, [packages::Manager::Cargo]);
+        assert!(!scope.projects);
+        for arguments in [
+            vec!["--projects-only"],
+            vec!["--packages", "--manager", "unknown"],
+            vec!["--packages", "--projects-only", "--manager", "cargo"],
+            vec!["--packages", "--manager", "cargo", "--projects-only"],
+            vec!["--packages", "--projects-only", "--no-projects"],
+            vec!["--packages", "--max-depth", "65"],
+            vec!["--packages", "--max-depth", "-1"],
+            vec!["--packages", "--exclude", "../outside"],
+            vec!["--packages", "--exclude", "/outside"],
+            vec!["--top", "5", "--manager", "cargo"],
+        ] {
+            assert!(parse(&arguments).is_err(), "accepted {arguments:?}");
+        }
     }
 
     #[test]
@@ -2576,7 +3012,7 @@ mod tests {
         let action = parse(&["--save", "/tmp"]).unwrap();
         assert!(matches!(
             action,
-            CliAction::Save { path, json: false } if path == std::path::Path::new("/tmp")
+            CliAction::Save { path, json: false, .. } if path == std::path::Path::new("/tmp")
         ));
     }
 
@@ -2585,7 +3021,7 @@ mod tests {
         let action = parse(&["--diff", "--json", "/tmp"]).unwrap();
         assert!(matches!(
             action,
-            CliAction::Diff { path, json: true } if path == std::path::Path::new("/tmp")
+            CliAction::Diff { path, json: true, .. } if path == std::path::Path::new("/tmp")
         ));
     }
 
@@ -2608,7 +3044,8 @@ mod tests {
             action,
             CliAction::Packages {
                 path,
-                json: true
+                json: true,
+                ..
             } if path == std::path::Path::new("/tmp")
         ));
     }
@@ -2820,7 +3257,7 @@ mod tests {
         // print_packages validates before scanning, so a bad root errors
         // instead of exiting 0 with only global package info.
         let missing = test_root("packages_missing");
-        assert!(print_packages(missing, false).is_err());
+        assert!(print_packages(missing, false, packages::InventoryScope::default()).is_err());
     }
 
     #[test]

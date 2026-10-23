@@ -142,9 +142,60 @@ diskr --save ~/Downloads           # save a scan baseline
 diskr --diff ~/Downloads           # what changed since the baseline
 diskr --space ~                    # APFS free-space breakdown and snapshots
 diskr --packages ~                 # system packages and project dependencies
+diskr --packages --projects-only --max-depth 3 --exclude archive ~/code
+diskr --packages --manager cargo --manager brew --no-projects ~
 diskr --thin-snapshots 10G ~       # preview snapshot thinning (dry run)
 diskr --thin-snapshots 10G --yes ~ # execute it
 ```
+
+Package scope controls apply to `--packages` or `--save-profile`. `--projects-only` never
+invokes package managers; `--manager` is repeatable and selects `brew`,
+`brew-cask`, `npm`, `pip`, `cargo` or `bun`, with projects still included unless
+`--no-projects` is set. `--max-depth` accepts 0 (the selected directory only)
+through 64, default 5. Repeat `--exclude` for exact root-relative project
+subtrees, not shell globs; absolute paths and `..` are rejected. Exclusions
+affect discovery, not the footprint of an included project's dependency tree.
+The selected scope is included in JSON and human output.
+
+### Baselines and saved inventory profiles
+
+The default `--save`/`--diff` pair keeps one latest baseline per root, retaining
+up to 512 roots. Named captures are separate, immutable and never silently
+replace that latest baseline. Names use 1-80 ASCII letters, digits, `.`, `_` or
+`-`. Capture a new name for each comparison point:
+
+```sh
+diskr --save --baseline before-cleanup ~/code
+diskr --diff --baseline before-cleanup --json
+diskr --baselines list --json
+diskr --baselines pin before-cleanup
+diskr --baselines unpin before-cleanup
+diskr --baselines prune 10         # preview: keep newest 10 unpinned, plus all pinned
+diskr --baselines prune 10 --yes   # apply; prints a recoverable library backup path
+diskr --baselines export /tmp/diskr-baselines.json
+diskr --baselines import /tmp/diskr-baselines.json
+diskr --save-profile work --projects-only --max-depth 3 --exclude archive ~/code
+diskr --packages --profile work --json
+diskr --baselines remove-profile work        # preview; add --yes to back up and remove
+```
+
+Without a path, a named diff uses its stored root. An explicit different root
+is rejected, not retargeted. The library lives alongside history as
+`baseline-library.json`, with a 16MiB bound, at most 2,048 named captures and
+256 profiles. Retention/capacity and source identities are visible in the list.
+Pruning requires `--yes`, retains all pinned records and writes a backup before
+removal. Exports refuse to overwrite an existing file; imports validate before
+atomically merging, reject conflicting names, preserve machine/raw-root
+identity, and never replace latest-root history. Re-importing identical records
+is harmless. A named cross-machine comparison is explicitly warned and partial
+for `--strict`; imported foreign profiles cannot run until recreated locally
+with an explicit root/scope and a new name.
+
+Profiles save a package inventory root and scope without invoking managers.
+`--packages --profile NAME` accepts report filters/JSON/strict options, but not
+another path or scope overrides. Saving an existing name is an error.
+Obsolete profiles can be removed explicitly with `--baselines remove-profile`;
+like pruning, it previews by default and requires `--yes`, with a backup.
 
 ## Keys
 
@@ -156,7 +207,7 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | --- | --- |
 | ? | Show full keyboard help |
 | q | Quit |
-| Esc, Ctrl+C | Cancel a focused reclaim scan, focus Files, close a modal or clear a filter |
+| Esc, Ctrl+C | Cancel a focused listing/inventory/reclaim scan, focus Files, close a modal or clear a filter |
 | Up/Down, j/k | Move selection, or scroll keyboard help and detail drawers |
 | PageUp/PageDown | Move by a page, including in keyboard help and detail drawers |
 | Home/End | Jump to first or last item in lists, help, and detail drawers |
@@ -195,6 +246,15 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | Home/End (details) | Jump to the start or end of detail content |
 
 ## How it works
+
+Startup renders before state loading, with q/Esc/Ctrl+C cancellation. Directory
+enumeration runs off the UI loop in bounded batches; navigation and refresh
+invalidate older generations. Esc/Ctrl+C in Files cancels enumeration and
+labels the shown list partial; `r` retries. Ready inventory rows appear while
+other managers/projects are still running. The inventory footer reports elapsed
+time and ready stages; Esc/Ctrl+C cancels its read-only subprocesses/walks,
+retaining ready rows with a partial marker. Quit cancels read-only discovery,
+while pending mutations keep the existing graceful-shutdown policy.
 
 For terminal accessibility, set `DISKR_THEME=dark` (default), `light`,
 `high-contrast` or `mono`. A non-empty `NO_COLOR` selects monochrome, preserving
@@ -242,6 +302,32 @@ construction. Its p95 is the largest sample (nearest-rank percentile). It is a
 warm-cache local comparison, not a cold-disk or universal throughput claim.
 The viewport check reports frame latency and allocation counts at a fixed
 terminal size. Neither benchmark enforces machine-dependent timing thresholds.
+
+For the full fixture protocol, run benchmarks serially so scanner counters and
+timings do not include another benchmark's work:
+
+```sh
+cargo test --release --locked benchmark_ -- --ignored --nocapture --test-threads=1
+DISKR_BENCH_IDLE_SECONDS=5 cargo test --release --locked --test cli native_tui_restores -- --nocapture
+```
+
+Fixtures cover a flat 10,000-file listing, 10,000 files across 100 directories,
+a 64-level chain, denied directories, hardlinks, a 1GiB sparse file, and an APFS
+clone where supported. Normal tests also exercise an injected foreign device
+and real read-only APFS helper-mount rejection before enumeration; no mount or
+privileged tracing setup is performed. Listing checks report first-row and total
+latency, p95 cursor/batch-drain time and harness RSS. Boundary scans report
+direct scanner `openat`/`fstat`/`getattrlistbulk`/`close` counts from test-only
+instrumentation, not system-wide or std-library syscall totals. The native
+100×24 PTY check loads 10,002 files and measures first paint/row, idle CPU time
+with Mach timebase conversion, and child-process RSS. Idle sampling is opt-in
+(1-60 seconds), not a CI speed threshold. It also exercises retained filtering,
+refresh, confirmation cancellation, help, quit and terminal restoration using
+an isolated HOME; destructive confirmation is never accepted.
+
+Record CPU, macOS/filesystem, terminal dimensions, build profile, warm/cold cache
+state, sample count and tool versions when comparing results. These fixtures
+are local warm-cache diagnostics, not a claim about every volume or workload.
 
 Artifact classifications require supporting project/environment markers; a name
 such as `target` alone is not a cleanup recommendation. Simulator devices and

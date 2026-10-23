@@ -31,6 +31,8 @@ published in this repository.
   `diskr --diff [--json] [PATH]`; baselines are stored per path under
   `~/Library/Application Support/diskr/history.json` and `--diff` reports
   per-child growth, additions, and removals without changing the baseline.
+  Named captures now add immutable comparison points, listing/pinning, explicit
+  pruning with backups, portable export/import and preserved source identities.
 - Reclaimability scoring: categorize large items by whether they are safe to
   delete, cheap to regenerate, expensive to rebuild, or user-owned and risky.
   Implemented with `diskr --reclaim [--json] [PATH]`, which tags every finding
@@ -68,8 +70,10 @@ published in this repository.
 - Duplicate finder: detect duplicate large files and consider APFS clone-based
   dedupe with `clonefile(2)` so duplicates can reclaim physical space without
   destroying logical copies.
-- Saved roots and profiles: let users pin common scan targets and switch between
-  named views such as `dev`, `media`, `downloads`, and external volumes.
+- Saved roots and profiles: CLI package profiles now retain a named root,
+  manager selection, project depth and exclusions, with list/export/import and
+  guarded removal. A direct in-TUI saved-root/profile chooser remains a separate
+  navigation feature; named CLI profiles do not imply that picker is shipped.
 
 ## TUI Density and Declutter
 

@@ -8,6 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -647,9 +648,659 @@ fn optional_count(value: &serde_json::Value, key: &str) -> Result<u32> {
     }
 }
 
+const LIBRARY_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const LIBRARY_MAX_BASELINES: usize = 2048;
+const LIBRARY_MAX_PROFILES: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedBaseline {
+    pub machine: String,
+    pub pinned: bool,
+    pub record: ScanRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanProfile {
+    pub machine: String,
+    pub root: PathBuf,
+    pub scope: crate::packages::InventoryScope,
+}
+
+#[derive(Default)]
+struct BaselineLibrary {
+    machine: String,
+    baselines: std::collections::BTreeMap<String, NamedBaseline>,
+    profiles: std::collections::BTreeMap<String, ScanProfile>,
+}
+
+pub enum LibraryAction {
+    List,
+    Pin {
+        name: String,
+        pinned: bool,
+    },
+    RemoveProfile {
+        name: String,
+    },
+    Prune {
+        keep: usize,
+    },
+    Export(PathBuf),
+    Import(PathBuf),
+    SaveProfile {
+        name: String,
+        root: PathBuf,
+        scope: crate::packages::InventoryScope,
+    },
+}
+
+fn library_file() -> PathBuf {
+    state::state_dir().join("baseline-library.json")
+}
+
+pub fn validate_library_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 80
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        bail!("names require 1-80 ASCII letters, digits, dots, underscores or hyphens");
+    }
+    Ok(())
+}
+
+fn machine_id(value: &serde_json::Value) -> Result<String> {
+    let machine = value.as_str().context("library missing machine identity")?;
+    if machine.is_empty()
+        || machine.len() > 128
+        || !machine
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+    {
+        bail!("invalid library machine identity");
+    }
+    Ok(machine.to_owned())
+}
+
+fn library_root(value: &serde_json::Value) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let root = value
+        .as_str()
+        .and_then(state::decode_path)
+        .context("invalid library root identity")?;
+    if !root.is_absolute() || root.as_os_str().as_bytes().contains(&0) {
+        bail!("library root must be an absolute Unix path");
+    }
+    Ok(root)
+}
+
+fn library_from_json(value: &serde_json::Value) -> Result<BaselineLibrary> {
+    if value["version"].as_u64() != Some(1) {
+        bail!("unsupported baseline library version");
+    }
+    let mut library = BaselineLibrary {
+        machine: machine_id(&value["machine"])?,
+        ..Default::default()
+    };
+    let baselines = value["baselines"]
+        .as_object()
+        .context("library missing baselines")?;
+    let profiles = value["profiles"]
+        .as_object()
+        .context("library missing profiles")?;
+    if baselines.len() > LIBRARY_MAX_BASELINES || profiles.len() > LIBRARY_MAX_PROFILES {
+        bail!("baseline library capacity exceeded");
+    }
+    for (name, item) in baselines {
+        validate_library_name(name)?;
+        let root = library_root(&item["record"]["path"])?;
+        library.baselines.insert(
+            name.clone(),
+            NamedBaseline {
+                machine: machine_id(&item["machine"])?,
+                pinned: item["pinned"]
+                    .as_bool()
+                    .context("baseline missing pinned state")?,
+                record: record_from_json(&root, &item["record"])?,
+            },
+        );
+    }
+    for (name, item) in profiles {
+        validate_library_name(name)?;
+        let settings = &item["scope"];
+        let depth = settings["max_depth"]
+            .as_u64()
+            .filter(|depth| *depth <= 64)
+            .context("profile depth must be 0-64")? as usize;
+        let mut managers = Vec::new();
+        for key in settings["managers"]
+            .as_array()
+            .context("profile missing managers")?
+        {
+            let manager = key
+                .as_str()
+                .and_then(crate::packages::Manager::from_key)
+                .context("unknown profile manager")?;
+            if managers.contains(&manager) {
+                bail!("duplicate profile manager");
+            }
+            managers.push(manager);
+        }
+        let mut excludes = Vec::new();
+        for value in settings["exclude_identities"]
+            .as_array()
+            .context("profile missing exclusions")?
+        {
+            let excluded = value
+                .as_str()
+                .and_then(state::decode_path)
+                .context("invalid profile exclusion identity")?;
+            if excluded.as_os_str().is_empty()
+                || excluded.as_os_str().as_bytes().contains(&0)
+                || excluded.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                bail!("profile exclusions must remain root-relative without ..");
+            }
+            excludes.push(excluded);
+        }
+        library.profiles.insert(
+            name.clone(),
+            ScanProfile {
+                machine: machine_id(&item["machine"])?,
+                root: library_root(&item["root_identity"])?,
+                scope: crate::packages::InventoryScope {
+                    managers,
+                    projects: settings["projects"]
+                        .as_bool()
+                        .context("profile missing projects state")?,
+                    depth,
+                    excludes,
+                },
+            },
+        );
+    }
+    Ok(library)
+}
+
+fn library_json(library: &BaselineLibrary) -> serde_json::Value {
+    let baselines: serde_json::Map<_,_> = library.baselines.iter().map(|(name, baseline)|
+        (name.clone(), serde_json::json!({"machine":baseline.machine,"pinned":baseline.pinned,"record":record_to_json(&baseline.record)}))).collect();
+    let profiles: serde_json::Map<_,_> = library.profiles.iter().map(|(name, profile)|
+        (name.clone(), serde_json::json!({"machine":profile.machine,"root_identity":state::encode_path(&profile.root),"scope":profile.scope.json()}))).collect();
+    serde_json::json!({"version":1,"machine":library.machine,"baselines":baselines,"profiles":profiles})
+}
+
+fn read_library(path: &Path) -> Result<BaselineLibrary> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BaselineLibrary::default())
+        }
+        Err(error) => return Err(error).context("open baseline library"),
+    };
+    let mut bytes = Vec::new();
+    file.take(LIBRARY_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LIBRARY_MAX_BYTES {
+        bail!("baseline library exceeds 16MiB limit");
+    }
+    library_from_json(&serde_json::from_slice(&bytes).context("parse baseline library")?)
+}
+
+fn update_library<R>(
+    path: &Path,
+    update: impl FnOnce(&mut BaselineLibrary) -> Result<R>,
+) -> Result<R> {
+    use std::io::Read;
+    state::with_exclusive_lock(path, || {
+        let mut library = read_library(path)?;
+        if library.machine.is_empty() {
+            let mut random = [0u8; 16];
+            std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+            library.machine = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        }
+        let result = update(&mut library)?;
+        if library.baselines.len() > LIBRARY_MAX_BASELINES
+            || library.profiles.len() > LIBRARY_MAX_PROFILES
+        {
+            bail!("baseline library full; explicitly prune captures or remove obsolete profiles before adding records");
+        }
+        let text = serde_json::to_string_pretty(&library_json(&library))?;
+        if text.len() as u64 > LIBRARY_MAX_BYTES {
+            bail!("baseline library exceeds 16MiB limit; explicitly prune or export first");
+        }
+        state::atomic_write(path, &text)?;
+        Ok(result)
+    })
+}
+
+pub fn save_named_baseline(name: &str, record: &ScanRecord) -> Result<()> {
+    save_named_baseline_to(&library_file(), name, record)
+}
+
+fn save_named_baseline_to(path: &Path, name: &str, record: &ScanRecord) -> Result<()> {
+    validate_library_name(name)?;
+    update_library(path, |library| {
+        if library.baselines.contains_key(name) {
+            bail!("baseline name already exists; choose a new name");
+        }
+        library.baselines.insert(
+            name.to_owned(),
+            NamedBaseline {
+                machine: library.machine.clone(),
+                pinned: false,
+                record: record.clone(),
+            },
+        );
+        Ok(())
+    })
+}
+
+pub fn named_baseline(name: &str) -> Result<(NamedBaseline, bool)> {
+    validate_library_name(name)?;
+    let mut library = read_library(&library_file())?;
+    let baseline = library
+        .baselines
+        .remove(name)
+        .context("named baseline not found")?;
+    let foreign = baseline.machine != library.machine;
+    Ok((baseline, foreign))
+}
+
+pub fn scan_profile(name: &str) -> Result<ScanProfile> {
+    validate_library_name(name)?;
+    let mut library = read_library(&library_file())?;
+    let profile = library
+        .profiles
+        .remove(name)
+        .context("scan profile not found")?;
+    if profile.machine != library.machine {
+        bail!("imported profile belongs to another machine; save a new local profile with an explicit root and scope before running it");
+    }
+    Ok(profile)
+}
+
+fn write_new_export(path: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        state::next_epoch()
+    ));
+    let temporary = PathBuf::from(temporary);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(temporary.clone());
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    std::fs::hard_link(&temporary, path).context("export destination must not already exist")?;
+    Ok(())
+}
+
+fn prune_names(library: &BaselineLibrary, keep: usize) -> Vec<String> {
+    let mut candidates: Vec<_> = library
+        .baselines
+        .iter()
+        .filter(|(_, baseline)| !baseline.pinned)
+        .collect();
+    candidates.sort_by(|(name_a, a), (name_b, b)| {
+        b.record
+            .timestamp
+            .cmp(&a.record.timestamp)
+            .then(b.record.generation.cmp(&a.record.generation))
+            .then(name_a.cmp(name_b))
+    });
+    candidates
+        .into_iter()
+        .skip(keep)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+pub fn manage_library(action: LibraryAction, confirmed: bool) -> Result<serde_json::Value> {
+    manage_library_at(&library_file(), action, confirmed)
+}
+
+fn manage_library_at(
+    path: &Path,
+    action: LibraryAction,
+    confirmed: bool,
+) -> Result<serde_json::Value> {
+    match action {
+        LibraryAction::List => {
+            let library = read_library(path)?;
+            let (latest, history_warning) = load_records_with_warning();
+            let mut latest: Vec<_> = latest.into_values().collect();
+            latest.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok(
+                serde_json::json!({"library":path.to_string_lossy(),"local_machine":library.machine,
+                "history_warning":history_warning,"latest_roots":latest.iter().map(|record| serde_json::json!({
+                    "root":record.path.to_string_lossy(),"root_identity":state::encode_path(&record.path),"timestamp":record.timestamp,
+                    "logical":record.total().logical,"allocated":record.total().allocated})).collect::<Vec<_>>(),
+                "latest_root_retention":HISTORY_MAX_RECORDS,"named_retention":"explicit prune only; pinned records protected",
+                "baseline_capacity":LIBRARY_MAX_BASELINES,"profile_capacity":LIBRARY_MAX_PROFILES,
+                "baselines":library.baselines.iter().map(|(name, baseline)| serde_json::json!({"name":name,"machine":baseline.machine,
+                    "pinned":baseline.pinned,"root":baseline.record.path.to_string_lossy(),"root_identity":state::encode_path(&baseline.record.path),
+                    "timestamp":baseline.record.timestamp,"logical":baseline.record.total().logical,"allocated":baseline.record.total().allocated,
+                    "complete":baseline.record.inaccessible()==0 && baseline.record.skipped_mounts()==0})).collect::<Vec<_>>(),
+                "profiles":library.profiles.iter().map(|(name, profile)| serde_json::json!({"name":name,"machine":profile.machine,
+                    "root":profile.root.to_string_lossy(),"root_identity":state::encode_path(&profile.root),"scope":profile.scope.json()})).collect::<Vec<_>>() }),
+            )
+        }
+        LibraryAction::Pin { name, pinned } => {
+            validate_library_name(&name)?;
+            update_library(path, |library| {
+                library
+                    .baselines
+                    .get_mut(&name)
+                    .context("named baseline not found")?
+                    .pinned = pinned;
+                Ok(serde_json::json!({"name":name,"pinned":pinned}))
+            })
+        }
+        LibraryAction::RemoveProfile { name } if !confirmed => {
+            validate_library_name(&name)?;
+            let library = read_library(path)?;
+            let profile = library
+                .profiles
+                .get(&name)
+                .context("scan profile not found")?;
+            Ok(
+                serde_json::json!({"dry_run":true,"would_remove_profile":name,"root_identity":state::encode_path(&profile.root),"note":"rerun with --yes; a recoverable backup is written first"}),
+            )
+        }
+        LibraryAction::RemoveProfile { name } => {
+            validate_library_name(&name)?;
+            update_library(path, |library| {
+                if !library.profiles.contains_key(&name) {
+                    bail!("scan profile not found");
+                }
+                let backup = path.with_file_name(format!(
+                    "baseline-library.profile-backup-{}.json",
+                    state::next_epoch()
+                ));
+                write_new_export(
+                    &backup,
+                    &serde_json::to_string_pretty(&library_json(library))?,
+                )?;
+                library.profiles.remove(&name);
+                Ok(
+                    serde_json::json!({"dry_run":false,"removed_profile":name,"backup":backup.to_string_lossy()}),
+                )
+            })
+        }
+        LibraryAction::Prune { keep } if !confirmed => {
+            let library = read_library(path)?;
+            Ok(
+                serde_json::json!({"dry_run":true,"keep_unpinned":keep,"would_remove":prune_names(&library,keep),"note":"all pinned baselines retained; rerun with --yes to apply"}),
+            )
+        }
+        LibraryAction::Prune { keep } => update_library(path, |library| {
+            let names = prune_names(library, keep);
+            let backup = if names.is_empty() {
+                None
+            } else {
+                let backup = path.with_file_name(format!(
+                    "baseline-library.prune-backup-{}.json",
+                    state::next_epoch()
+                ));
+                write_new_export(
+                    &backup,
+                    &serde_json::to_string_pretty(&library_json(library))?,
+                )?;
+                for name in &names {
+                    library.baselines.remove(name);
+                }
+                Some(backup)
+            };
+            Ok(
+                serde_json::json!({"dry_run":false,"removed":names,"backup":backup.map(|path| path.to_string_lossy().into_owned()),"pinned_retained":true}),
+            )
+        }),
+        LibraryAction::Export(destination) => {
+            let library = read_library(path)?;
+            if library.machine.is_empty() {
+                bail!("baseline library is empty; nothing to export");
+            }
+            write_new_export(
+                &destination,
+                &serde_json::to_string_pretty(&library_json(&library))?,
+            )?;
+            Ok(
+                serde_json::json!({"exported":destination.to_string_lossy(),"baselines":library.baselines.len(),"profiles":library.profiles.len()}),
+            )
+        }
+        LibraryAction::Import(source) => {
+            if !source.is_file() {
+                bail!("import source must be a library file");
+            }
+            let incoming = read_library(&source)?;
+            update_library(path, |library| {
+                for (name, baseline) in &incoming.baselines {
+                    if library
+                        .baselines
+                        .get(name)
+                        .is_some_and(|existing| existing != baseline)
+                    {
+                        bail!("conflicting imported baseline {name}; no changes applied");
+                    }
+                }
+                for (name, profile) in &incoming.profiles {
+                    if library
+                        .profiles
+                        .get(name)
+                        .is_some_and(|existing| existing != profile)
+                    {
+                        bail!("conflicting imported profile {name}; no changes applied");
+                    }
+                }
+                library.baselines.extend(incoming.baselines);
+                library.profiles.extend(incoming.profiles);
+                Ok(
+                    serde_json::json!({"imported":source.to_string_lossy(),"baselines":library.baselines.len(),"profiles":library.profiles.len(),
+                    "identity":"source machine and exact root retained; latest-root baselines unchanged"}),
+                )
+            })
+        }
+        LibraryAction::SaveProfile { name, root, scope } => {
+            validate_library_name(&name)?;
+            let root = root.canonicalize().context("resolve profile root")?;
+            if !root.is_dir() {
+                bail!("profile root must be a directory");
+            }
+            update_library(path, |library| {
+                if library.profiles.contains_key(&name) {
+                    bail!("profile name already exists; choose a new name");
+                }
+                let value = serde_json::json!({"saved_profile":name,"root":root.to_string_lossy(),"root_identity":state::encode_path(&root),"scope":scope.json()});
+                library.profiles.insert(
+                    name,
+                    ScanProfile {
+                        machine: library.machine.clone(),
+                        root,
+                        scope,
+                    },
+                );
+                Ok(value)
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_library_import_and_invalid_profiles_preserve_the_existing_catalog() {
+        let root = state::state_dir().join(format!("library-bounds-{}", state::next_epoch()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("library.json");
+        save_named_baseline_to(&path, "retained", &record(Vec::new())).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let oversized = root.join("oversized.json");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(LIBRARY_MAX_BYTES + 1)
+            .unwrap();
+        assert!(manage_library_at(&path, LibraryAction::Import(oversized), false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut value = library_json(&read_library(&path).unwrap());
+        let too_many: serde_json::Map<_, _> = (0..=LIBRARY_MAX_BASELINES)
+            .map(|index| {
+                (
+                    format!("capture-{index}"),
+                    value["baselines"]["retained"].clone(),
+                )
+            })
+            .collect();
+        value["baselines"] = serde_json::Value::Object(too_many);
+        assert!(library_from_json(&value).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn named_library_pins_prunes_with_backup_and_imports_without_retargeting() {
+        let root = state::state_dir().join(format!("library-lifecycle-{}", state::next_epoch()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("library.json");
+        for (name, timestamp) in [("protected", 1), ("older", 2), ("newest", 3)] {
+            let mut record = record(vec![child("file", timestamp)]);
+            record.timestamp = timestamp;
+            save_named_baseline_to(&path, name, &record).unwrap();
+        }
+        manage_library_at(
+            &path,
+            LibraryAction::Pin {
+                name: String::from("protected"),
+                pinned: true,
+            },
+            false,
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let preview = manage_library_at(&path, LibraryAction::Prune { keep: 1 }, false).unwrap();
+        assert_eq!(preview["would_remove"], serde_json::json!(["older"]));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let result = manage_library_at(&path, LibraryAction::Prune { keep: 1 }, true).unwrap();
+        let backup = Path::new(result["backup"].as_str().unwrap());
+        assert_eq!(read_library(backup).unwrap().baselines.len(), 3);
+        let library = read_library(&path).unwrap();
+        assert_eq!(library.baselines.len(), 2);
+        assert!(library.baselines["protected"].pinned);
+        assert!(save_named_baseline_to(&path, "protected", &record(Vec::new())).is_err());
+        let destination = root.join("export.json");
+        manage_library_at(&path, LibraryAction::Export(destination.clone()), false).unwrap();
+        assert!(
+            manage_library_at(&path, LibraryAction::Export(destination.clone()), false).is_err()
+        );
+        let imported = root.join("imported.json");
+        manage_library_at(&imported, LibraryAction::Import(destination.clone()), false).unwrap();
+        let restored = read_library(&imported).unwrap();
+        assert_ne!(restored.machine, library.machine);
+        assert_eq!(restored.baselines, library.baselines);
+        manage_library_at(&imported, LibraryAction::Import(destination.clone()), false).unwrap();
+        let conflict = root.join("conflict.json");
+        save_named_baseline_to(&conflict, "protected", &record(Vec::new())).unwrap();
+        let before = std::fs::read(&conflict).unwrap();
+        assert!(manage_library_at(&conflict, LibraryAction::Import(destination), false).is_err());
+        assert_eq!(std::fs::read(&conflict).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn library_round_trip_preserves_raw_roots_and_exclusion_identities_and_rejects_invalid_data() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = PathBuf::from(std::ffi::OsString::from_vec(b"/fixture/raw-\xff".to_vec()));
+        let excluded = PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xfe".to_vec()));
+        let mut library = BaselineLibrary {
+            machine: String::from("local-machine"),
+            ..Default::default()
+        };
+        library.baselines.insert(
+            String::from("raw"),
+            NamedBaseline {
+                machine: library.machine.clone(),
+                pinned: true,
+                record: ScanRecord {
+                    path: raw.clone(),
+                    timestamp: 1,
+                    generation: 2,
+                    enumeration_errors: 0,
+                    children: Vec::new(),
+                },
+            },
+        );
+        library.profiles.insert(
+            String::from("work"),
+            ScanProfile {
+                machine: library.machine.clone(),
+                root: raw,
+                scope: crate::packages::InventoryScope {
+                    excludes: vec![excluded],
+                    ..Default::default()
+                },
+            },
+        );
+        let value = library_json(&library);
+        let restored = library_from_json(&value).unwrap();
+        assert_eq!(restored.baselines, library.baselines);
+        assert_eq!(restored.profiles, library.profiles);
+        for mutate in [0, 1, 2, 3] {
+            let mut malformed = value.clone();
+            match mutate {
+                0 => malformed["version"] = serde_json::json!(99),
+                1 => {
+                    malformed["baselines"]["raw"]["record"]["path"] = serde_json::json!("relative")
+                }
+                2 => malformed["profiles"]["work"]["scope"]["max_depth"] = serde_json::json!(65),
+                _ => {
+                    malformed["profiles"]["work"]["scope"]["exclude_identities"] =
+                        serde_json::json!(["../outside"])
+                }
+            }
+            assert!(library_from_json(&malformed).is_err());
+        }
+        assert!(validate_library_name("../outside").is_err());
+        assert!(validate_library_name("bad\nname").is_err());
+    }
+
+    #[test]
+    fn concurrent_named_writers_merge_under_the_library_lock() {
+        let root = state::state_dir().join(format!("library-concurrent-{}", state::next_epoch()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("library.json");
+        std::thread::scope(|scope| {
+            for index in 0..12 {
+                let path = &path;
+                scope.spawn(move || {
+                    save_named_baseline_to(path, &format!("capture-{index}"), &record(Vec::new()))
+                        .unwrap()
+                });
+            }
+        });
+        assert_eq!(read_library(&path).unwrap().baselines.len(), 12);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn baseline_children_share_root_unique_hardlink_accounting() {

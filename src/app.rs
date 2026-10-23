@@ -66,7 +66,133 @@ pub enum ActiveModal {
 
 pub enum ListingState {
     Ready,
+    Loading,
+    Cancelled,
     Unreadable(String),
+}
+
+struct ListingRow {
+    entry: Entry,
+    device: Option<u64>,
+    class: Option<reclaim::Reclaimability>,
+}
+
+struct ListingBatch {
+    generation: u64,
+    cwd: PathBuf,
+    rows: Vec<ListingRow>,
+    hidden: usize,
+    errors: u32,
+    finished: bool,
+    error: Option<String>,
+}
+
+fn enumerate_listing(
+    cwd: PathBuf,
+    show_hidden: bool,
+    home: Option<PathBuf>,
+    cancellation: bulkstat::ScanCancellation,
+    generation: u64,
+    tx: std::sync::mpsc::SyncSender<ListingBatch>,
+) {
+    let mut batch = ListingBatch {
+        generation,
+        cwd: cwd.clone(),
+        rows: Vec::new(),
+        hidden: 0,
+        errors: 0,
+        finished: false,
+        error: None,
+    };
+    let read = match std::fs::read_dir(&cwd) {
+        Ok(read) => read,
+        Err(error) => {
+            batch.errors = 1;
+            batch.finished = true;
+            batch.error = Some(format!("cannot read {}: {error}", cwd.display()));
+            let _ = tx.send(batch);
+            return;
+        }
+    };
+    let mut last_batch = Instant::now();
+    for dirent in read {
+        if cancellation.is_cancelled() {
+            return;
+        }
+        let dirent = match dirent {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                batch.errors = batch.errors.saturating_add(1);
+                continue;
+            }
+        };
+        let name = dirent.file_name().to_string_lossy().into_owned();
+        if !show_hidden && name.starts_with('.') {
+            batch.hidden += 1;
+            continue;
+        }
+        let path = dirent.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => Some(meta),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                batch.errors = batch.errors.saturating_add(1);
+                None
+            }
+        };
+        let is_dir = meta.as_ref().is_some_and(|meta| meta.is_dir());
+        let is_symlink = meta
+            .as_ref()
+            .is_some_and(|meta| meta.file_type().is_symlink());
+        let size = meta
+            .as_ref()
+            .filter(|meta| meta.is_file() || meta.file_type().is_symlink())
+            .map(|meta| SizeInfo::new(meta.len(), meta.blocks().saturating_mul(512)));
+        let class = if is_dir {
+            reclaim::classify_path(&path, home.as_deref())
+        } else {
+            None
+        };
+        batch.rows.push(ListingRow {
+            device: meta.as_ref().map(|meta| meta.dev()),
+            class,
+            entry: Entry {
+                name_lower: name.to_lowercase(),
+                name,
+                path,
+                is_dir,
+                is_symlink,
+                size,
+                modified: meta.as_ref().and_then(|meta| meta.modified().ok()),
+                size_stale: false,
+                cached_at: None,
+                inaccessible: 0,
+                skipped_mounts: 0,
+                scanning: false,
+                size_delta: None,
+            },
+        });
+        if batch.rows.len() >= 256 || last_batch.elapsed() >= Duration::from_millis(25) {
+            let next = ListingBatch {
+                generation,
+                cwd: cwd.clone(),
+                rows: Vec::new(),
+                hidden: batch.hidden,
+                errors: batch.errors,
+                finished: false,
+                error: None,
+            };
+            if tx.send(std::mem::replace(&mut batch, next)).is_err() {
+                return;
+            }
+            last_batch = Instant::now();
+        }
+    }
+    if !cancellation.is_cancelled() {
+        batch.finished = true;
+        let _ = tx.send(batch);
+    }
 }
 
 impl SortMode {
@@ -413,6 +539,12 @@ pub struct App {
     pub status: String,
     pub cwd_enumeration_errors: u32,
     pub listing_state: ListingState,
+    streaming_listings: bool,
+    listing_generation: Arc<AtomicU64>,
+    listing_rx: Option<Receiver<ListingBatch>>,
+    listing_started: Option<Instant>,
+    listing_restore: Option<(Option<PathBuf>, usize)>,
+    listing_full_scan: bool,
     pub hidden_entry_count: usize,
     pub show_help: bool,
     pub help_scroll: usize,
@@ -427,6 +559,10 @@ pub struct App {
     pub pkg_view: PkgView,
     pub packages_loaded: bool,
     pub packages_loading: bool,
+    pub package_scan_partial: bool,
+    managers_complete: bool,
+    package_scan_started: Option<Instant>,
+    package_generation: Arc<AtomicU64>,
 
     pub input_mode: InputMode,
     pub input_prompt: String,
@@ -578,6 +714,7 @@ struct PkgScanMsg {
     project_dep_errors: u32,
     project_scope: bulkstat::DiscoveryCoverage,
     include_managers: bool,
+    finished: bool,
 }
 
 struct DepScanMsg {
@@ -654,7 +791,16 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub fn new(cwd: PathBuf) -> Result<Self> {
+        Self::new_with_listings(cwd, false)
+    }
+
+    pub fn new_streaming(cwd: PathBuf) -> Result<Self> {
+        Self::new_with_listings(cwd, true)
+    }
+
+    fn new_with_listings(cwd: PathBuf, streaming_listings: bool) -> Result<Self> {
         let mut cache_details = HashMap::new();
         let (mut size_cache, mut inaccessible_cache, mut cache_age, mut stale_size_cache) = (
             HashMap::new(),
@@ -720,6 +866,12 @@ impl App {
             status: String::from("i info · f Finder · O open"),
             cwd_enumeration_errors: 0,
             listing_state: ListingState::Ready,
+            streaming_listings,
+            listing_generation: Arc::new(AtomicU64::new(0)),
+            listing_rx: None,
+            listing_started: None,
+            listing_restore: None,
+            listing_full_scan: false,
             hidden_entry_count: 0,
             show_help: false,
             help_scroll: 0,
@@ -733,6 +885,10 @@ impl App {
             pkg_view: PkgView::SystemManagers,
             packages_loaded: false,
             packages_loading: false,
+            package_scan_partial: false,
+            managers_complete: false,
+            package_scan_started: None,
+            package_generation: Arc::new(AtomicU64::new(0)),
             input_mode: InputMode::None,
             input_prompt: String::new(),
             input_buffer: String::new(),
@@ -931,6 +1087,10 @@ impl App {
         previous_selected: Option<PathBuf>,
         previous_index: usize,
     ) -> Result<()> {
+        if self.streaming_listings {
+            self.listing_restore = Some((previous_selected, previous_index));
+            return self.rebuild_entries();
+        }
         self.rebuild_entries()?;
         self.restore_visible_selection(previous_selected, previous_index);
         self.auto_scan();
@@ -957,6 +1117,11 @@ impl App {
     }
 
     fn rebuild_entries(&mut self) -> Result<()> {
+        self.cancel_package_scan();
+        if self.streaming_listings {
+            self.start_listing();
+            return Ok(());
+        }
         self.file_aggregates = None;
         self.reclaim_classes.clear();
         self.entries.clear();
@@ -1064,6 +1229,163 @@ impl App {
         Ok(())
     }
 
+    fn start_listing(&mut self) {
+        self.invalidate_pending_scan_results();
+        self.listing_rx = None;
+        let generation = self
+            .listing_generation
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .saturating_add(1);
+        let cancellation =
+            bulkstat::ScanCancellation::new(Arc::clone(&self.listing_generation), generation);
+        self.entries.clear();
+        self.entry_index.clear();
+        self.search_matches.clear();
+        self.reclaim_classes.clear();
+        self.file_aggregates = None;
+        self.selected = 0;
+        self.hidden_entry_count = 0;
+        self.cwd_enumeration_errors = 0;
+        self.listing_state = ListingState::Loading;
+        self.listing_full_scan = false;
+        self.listing_started = Some(Instant::now());
+        self.status = self.listing_progress();
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        self.listing_rx = Some(rx);
+        let cwd = self.cwd.clone();
+        let hidden = self.show_hidden;
+        let home = self.home.clone();
+        thread::spawn(move || enumerate_listing(cwd, hidden, home, cancellation, generation, tx));
+    }
+
+    pub fn listing_loading(&self) -> bool {
+        self.listing_rx.is_some()
+    }
+
+    pub fn listing_progress(&self) -> String {
+        format!(
+            "listing: {} entries · {}s · partial · Esc cancel",
+            self.entries.len(),
+            self.listing_started
+                .map(|started| started.elapsed().as_secs())
+                .unwrap_or(0)
+        )
+    }
+
+    pub fn cancel_listing(&mut self) {
+        self.listing_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.listing_rx = None;
+        self.listing_restore = None;
+        self.listing_full_scan = false;
+        self.listing_state = ListingState::Cancelled;
+        self.status =
+            String::from("directory listing cancelled; shown entries are partial · r retry");
+    }
+
+    fn drain_listing_results(&mut self) -> bool {
+        let previous = self.listing_restore.clone().unwrap_or_else(|| {
+            (
+                self.visible_entry(self.selected)
+                    .map(|entry| entry.path.clone()),
+                self.selected,
+            )
+        });
+        let mut changed = false;
+        let mut finished = false;
+        let mut error = None;
+        for _ in 0..16 {
+            let recv = match self.listing_rx.as_ref() {
+                Some(rx) => rx.try_recv(),
+                None => break,
+            };
+            let batch = match recv {
+                Ok(batch) => batch,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    error = Some(String::from(
+                        "directory enumeration failed; listing is partial",
+                    ));
+                    self.cwd_enumeration_errors = self.cwd_enumeration_errors.saturating_add(1);
+                    finished = true;
+                    break;
+                }
+            };
+            if batch.generation != self.listing_generation.load(AtomicOrdering::Relaxed)
+                || batch.cwd != self.cwd
+            {
+                continue;
+            }
+            changed = true;
+            self.hidden_entry_count = batch.hidden;
+            self.cwd_enumeration_errors = batch.errors;
+            for row in batch.rows {
+                let mut entry = row.entry;
+                if entry.is_dir {
+                    entry.size = self.size_cache.get(&entry.path).copied();
+                    entry.inaccessible = self
+                        .inaccessible_cache
+                        .get(&entry.path)
+                        .copied()
+                        .unwrap_or(0);
+                    entry.cached_at = self.cache_age.get(&entry.path).copied();
+                    entry.size_stale = self.stale_size_cache.contains(&entry.path)
+                        || self.cache_details.get(&entry.path).is_some_and(|details| {
+                            row.device.is_some_and(|device| details.device != device)
+                        });
+                    entry.skipped_mounts = self
+                        .cache_details
+                        .get(&entry.path)
+                        .map(|details| details.skipped_mounts)
+                        .unwrap_or(0);
+                }
+                if let Some(class) = row.class {
+                    self.reclaim_classes.insert(entry.path.clone(), class);
+                }
+                self.entries.push(entry);
+            }
+            if batch.finished {
+                finished = true;
+                error = batch.error;
+                break;
+            }
+        }
+        if !changed && !finished {
+            return false;
+        }
+        self.apply_sort();
+        self.restore_visible_selection(previous.0.clone(), previous.1);
+        if previous
+            .0
+            .as_ref()
+            .is_some_and(|path| self.entries.iter().any(|entry| &entry.path == path))
+            || finished
+        {
+            self.listing_restore = None;
+        }
+        if finished {
+            self.listing_rx = None;
+            self.listing_state = error
+                .map(ListingState::Unreadable)
+                .unwrap_or(ListingState::Ready);
+            let preserve_feedback = !self.status.starts_with("listing:")
+                && !matches!(self.listing_state, ListingState::Unreadable(_));
+            let feedback = self.status.clone();
+            if self.listing_full_scan && !matches!(self.listing_state, ListingState::Unreadable(_))
+            {
+                self.scan_all_missing_visible();
+            } else {
+                self.auto_scan();
+            }
+            if preserve_feedback {
+                self.status = feedback;
+            }
+        } else if self.status.starts_with("listing:") {
+            self.status = self.listing_progress();
+        }
+        true
+    }
+
     fn rebuild_entry_index(&mut self) {
         self.entry_index.clear();
         for (i, entry) in self.entries.iter().enumerate() {
@@ -1142,6 +1464,9 @@ impl App {
         if self.confirming_delete {
             return;
         }
+        if self.focus == Focus::Files {
+            self.listing_restore = None;
+        }
         match self.focus {
             Focus::Files => {
                 let item_count = self.visible_entry_count();
@@ -1181,6 +1506,9 @@ impl App {
     }
 
     pub fn page_move(&mut self, pages: i32) {
+        if self.focus == Focus::Files {
+            self.listing_restore = None;
+        }
         let delta = pages as i64 * self.active_page_rows() as i64;
         match self.focus {
             Focus::Files => {
@@ -1224,6 +1552,9 @@ impl App {
     }
 
     pub fn move_to_start(&mut self) {
+        if self.focus == Focus::Files {
+            self.listing_restore = None;
+        }
         match self.focus {
             Focus::Files => {
                 self.selected = 0;
@@ -1236,6 +1567,9 @@ impl App {
     }
 
     pub fn move_to_end(&mut self) {
+        if self.focus == Focus::Files {
+            self.listing_restore = None;
+        }
         match self.focus {
             Focus::Files => {
                 let n = self.visible_entry_count();
@@ -1369,6 +1703,12 @@ impl App {
     /// Scan only a small batch of nearby directories. Starting at `/` or other broad
     /// roots should not recursively walk every child before the user asks for it.
     fn auto_scan(&mut self) {
+        if matches!(
+            self.listing_state,
+            ListingState::Loading | ListingState::Cancelled
+        ) {
+            return;
+        }
         if let ListingState::Unreadable(message) = &self.listing_state {
             self.status = message.clone();
             return;
@@ -1491,6 +1831,12 @@ impl App {
             self.remove_cached_size(&path);
         }
         self.refresh_disks();
+        if self.streaming_listings {
+            self.listing_restore = Some((previous_selected, previous_index));
+            let _ = self.rebuild_entries();
+            self.listing_full_scan = true;
+            return;
+        }
         if self.rebuild_entries().is_err() {
             return;
         }
@@ -1527,6 +1873,11 @@ impl App {
         if self.confirming_delete {
             return;
         }
+        if self.listing_loading() {
+            self.listing_full_scan = true;
+            self.status = self.listing_progress();
+            return;
+        }
         let missing: Vec<PathBuf> = self
             .visible_entries()
             .filter(|e| entry_needs_scan(e))
@@ -1542,7 +1893,7 @@ impl App {
     }
 
     pub fn drain_scan_results(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.drain_listing_results();
         while let Ok(msg) = self.scan_rx.try_recv() {
             match msg {
                 ScanMsg::DirStarted { scan_id, path } if scan_id == self.active_scan_id => {
@@ -2636,7 +2987,8 @@ impl App {
     }
 
     pub fn has_pending_scan_work(&self) -> bool {
-        self.sort_dirty
+        self.listing_loading()
+            || self.sort_dirty
             || self.entries.iter().any(|entry| entry.scanning)
             || self.top_files_loading
             || self.reclaim_loading
@@ -2663,7 +3015,9 @@ impl App {
     }
 
     pub fn begin_shutdown(&mut self) {
+        self.cancel_listing();
         self.cancel_reclaim_scan();
+        self.cancel_package_scan();
         self.shutting_down = true;
         self.scanner.cancel_current();
         self.pending_scan_dirs.clear();
@@ -3381,8 +3735,27 @@ impl App {
         let scan_id = self.next_pkg_scan_id();
         let (tx, rx) = std::sync::mpsc::channel();
         let cwd = self.cwd.clone();
+        let generation = self
+            .package_generation
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .saturating_add(1);
+        let cancellation =
+            bulkstat::ScanCancellation::new(Arc::clone(&self.package_generation), generation);
 
         self.packages_loading = true;
+        self.package_scan_partial = true;
+        self.package_scan_started = Some(Instant::now());
+        self.deps_loading = false;
+        self.dep_scan_rx = None;
+        self.project_deps.clear();
+        self.project_deps_cwd = None;
+        if include_managers {
+            self.managers_complete = false;
+            self.pkg_reports.clear();
+            self.dep_graph = None;
+        }
+        self.rebuild_project_dep_search_text();
+        self.rebuild_flat_packages();
         self.pkg_scan_rx = Some(rx);
         self.status = if include_managers {
             String::from("scanning packages…")
@@ -3391,12 +3764,56 @@ impl App {
         };
 
         thread::spawn(move || {
-            let reports = if include_managers {
-                packages::scan_managers()
-            } else {
-                Vec::new()
-            };
-            let project_scan = packages::scan_project_deps(&cwd, 5);
+            let reports = std::sync::Mutex::new(Vec::new());
+            let project_scan = thread::scope(|scope| {
+                if include_managers {
+                    scope.spawn(|| {
+                        packages::scan_managers_streamed(
+                            packages::Manager::ALL,
+                            &cancellation,
+                            &|report| {
+                                reports.lock().unwrap().push(report.clone());
+                                let _ = tx.send(PkgScanMsg {
+                                    scan_id,
+                                    cwd: cwd.clone(),
+                                    reports: vec![report],
+                                    project_deps: Vec::new(),
+                                    project_dep_errors: 0,
+                                    project_scope: Default::default(),
+                                    include_managers,
+                                    finished: false,
+                                });
+                            },
+                        )
+                    });
+                }
+                packages::scan_project_deps_streamed(
+                    &cwd,
+                    &packages::InventoryScope::default(),
+                    &cancellation,
+                    &|project| {
+                        let _ = tx.send(PkgScanMsg {
+                            scan_id,
+                            cwd: cwd.clone(),
+                            reports: Vec::new(),
+                            project_deps: vec![project],
+                            project_dep_errors: 0,
+                            project_scope: Default::default(),
+                            include_managers,
+                            finished: false,
+                        });
+                    },
+                )
+            });
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let mut reports = reports.into_inner().unwrap();
+            reports.sort_by_key(|report| {
+                packages::Manager::ALL
+                    .iter()
+                    .position(|manager| *manager == report.manager)
+            });
             let _ = tx.send(PkgScanMsg {
                 scan_id,
                 cwd,
@@ -3405,6 +3822,7 @@ impl App {
                 project_dep_errors: project_scan.inaccessible,
                 project_scope: project_scan.scope,
                 include_managers,
+                finished: true,
             });
         });
     }
@@ -3414,92 +3832,148 @@ impl App {
         self.active_pkg_scan_id
     }
 
+    pub fn package_progress(&self) -> String {
+        format!(
+            "inventory: {} managers ready · {} projects · {}s · partial · Esc cancel",
+            self.pkg_reports.len(),
+            self.project_deps.len(),
+            self.package_scan_started
+                .map(|started| started.elapsed().as_secs())
+                .unwrap_or(0)
+        )
+    }
+
+    pub fn cancel_package_scan(&mut self) {
+        if !self.packages_loading && !self.deps_loading {
+            return;
+        }
+        self.package_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.packages_loading = false;
+        self.deps_loading = false;
+        self.pkg_scan_rx = None;
+        self.dep_scan_rx = None;
+        self.package_scan_partial = true;
+        self.status = String::from("inventory cancelled; ready results retained as partial");
+    }
+
     fn drain_package_results(&mut self) -> bool {
-        loop {
+        let mut changed = false;
+        let mut finished = None;
+        for _ in 0..128 {
             let recv = match self.pkg_scan_rx.as_ref() {
                 Some(rx) => rx.try_recv(),
-                None => return false,
+                None => break,
             };
-
-            return match recv {
-                Ok(msg) => {
-                    if msg.scan_id != self.active_pkg_scan_id {
-                        continue;
-                    }
-                    if msg.cwd != self.cwd {
-                        self.packages_loading = false;
-                        self.pkg_scan_rx = None;
-                        self.status = String::from("discarded stale package scan");
-                        return true;
-                    }
-                    if msg.include_managers {
-                        self.pkg_reports = msg.reports;
-                        self.packages_loaded = true;
-                    }
-                    self.project_deps = msg.project_deps;
-                    self.project_dep_errors = msg.project_dep_errors;
-                    self.project_scope = msg.project_scope;
-                    self.project_deps_cwd = Some(msg.cwd);
-                    self.rebuild_project_dep_search_text();
-                    self.rebuild_flat_packages();
-                    self.selected_pkg = self
-                        .selected_pkg
-                        .min(self.pkg_item_count().saturating_sub(1));
-                    self.packages_loading = false;
-                    self.pkg_scan_rx = None;
-                    if msg.include_managers {
-                        let total = self.cached_flat_packages.len();
-                        let warnings: Vec<&str> = self
-                            .pkg_reports
-                            .iter()
-                            .filter_map(|r| r.warning.as_deref())
-                            .collect();
-                        let base = format!(
-                            "{} packages across {} managers · {} projects · scanning deps…",
-                            total,
-                            self.pkg_reports.iter().filter(|r| r.available).count(),
-                            self.project_deps.len()
-                        );
-                        if warnings.is_empty() && self.project_dep_errors == 0 {
-                            self.status = base;
-                        } else {
-                            let mut warnings: Vec<String> =
-                                warnings.into_iter().map(str::to_owned).collect();
-                            if self.project_dep_errors > 0 {
-                                warnings.push(format!(
-                                    "{} project paths unreadable",
-                                    self.project_dep_errors
-                                ));
-                            }
-                            self.status = format!("{base} ({})", warnings.join("; "));
-                        }
-                        self.start_dep_scan();
-                    } else {
-                        self.status = format!(
-                            "project dependencies refreshed · {} projects{}",
-                            self.project_deps.len(),
-                            if self.project_dep_errors > 0 {
-                                format!(" · {} paths unreadable", self.project_dep_errors)
-                            } else {
-                                String::new()
-                            }
-                        );
-                    }
-                    true
-                }
-                Err(TryRecvError::Empty) => false,
+            let msg = match recv {
+                Ok(msg) => msg,
+                Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.packages_loading = false;
+                    self.package_scan_partial = true;
                     self.pkg_scan_rx = None;
-                    self.status = String::from("package scan failed");
-                    true
+                    self.status = String::from("package scan failed; ready results are partial");
+                    changed = true;
+                    break;
                 }
             };
+            if msg.scan_id != self.active_pkg_scan_id {
+                continue;
+            }
+            if msg.cwd != self.cwd {
+                self.cancel_package_scan();
+                self.status = String::from("discarded stale package scan");
+                return true;
+            }
+            changed = true;
+            if msg.finished {
+                if msg.include_managers {
+                    self.pkg_reports = msg.reports;
+                    self.managers_complete = true;
+                }
+                self.project_deps = msg.project_deps;
+                self.project_dep_errors = msg.project_dep_errors;
+                self.project_scope = msg.project_scope;
+                self.project_deps_cwd = Some(msg.cwd);
+                self.packages_loading = false;
+                self.package_scan_partial = !self.managers_complete;
+                self.packages_loaded = true;
+                self.pkg_scan_rx = None;
+                finished = Some(msg.include_managers);
+                break;
+            }
+            for report in msg.reports {
+                if let Some(existing) = self
+                    .pkg_reports
+                    .iter_mut()
+                    .find(|existing| existing.manager == report.manager)
+                {
+                    *existing = report;
+                } else {
+                    self.pkg_reports.push(report);
+                }
+            }
+            self.project_deps.extend(msg.project_deps);
+            self.packages_loaded = true;
         }
+        if !changed {
+            return false;
+        }
+        self.pkg_reports.sort_by_key(|report| {
+            packages::Manager::ALL
+                .iter()
+                .position(|manager| *manager == report.manager)
+        });
+        self.project_deps.sort_by(|left, right| {
+            right
+                .deps_size
+                .map(|size| size.allocated)
+                .cmp(&left.deps_size.map(|size| size.allocated))
+                .then(left.path.cmp(&right.path))
+                .then(left.manifest.cmp(&right.manifest))
+        });
+        self.rebuild_project_dep_search_text();
+        self.rebuild_flat_packages();
+        self.selected_pkg = self
+            .selected_pkg
+            .min(self.pkg_item_count().saturating_sub(1));
+        if let Some(include_managers) = finished {
+            let mut warnings: Vec<String> = self
+                .pkg_reports
+                .iter()
+                .filter_map(|report| report.warning.clone())
+                .collect();
+            if self.project_dep_errors > 0 {
+                warnings.push(format!(
+                    "{} project paths unreadable",
+                    self.project_dep_errors
+                ));
+            }
+            let base = format!(
+                "{} packages across {} managers · {} projects",
+                self.cached_flat_packages.len(),
+                self.pkg_reports
+                    .iter()
+                    .filter(|report| report.available)
+                    .count(),
+                self.project_deps.len()
+            );
+            self.status = if warnings.is_empty() {
+                base
+            } else {
+                format!("{base} ({})", warnings.join("; "))
+            };
+            if include_managers {
+                self.start_dep_scan();
+            }
+        } else if self.packages_loading {
+            self.status = self.package_progress();
+        }
+        true
     }
 
     pub fn load_packages(&mut self) {
-        if self.packages_loaded {
+        if self.packages_loaded && !self.package_scan_partial {
             if self.project_deps_cwd.as_deref() != Some(self.cwd.as_path()) {
                 self.reload_project_deps();
             }
@@ -3522,12 +3996,20 @@ impl App {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let reports = self.pkg_reports.clone();
+        let cancellation = bulkstat::ScanCancellation::new(
+            Arc::clone(&self.package_generation),
+            self.package_generation.load(AtomicOrdering::Relaxed),
+        );
         self.deps_loading = true;
         self.dep_scan_rx = Some(rx);
 
         thread::spawn(move || {
-            let graph = packages::scan_dep_graph(&reports);
-            let _ = tx.send(DepScanMsg { graph });
+            let graph = packages::with_scan_cancellation(&cancellation, || {
+                packages::scan_dep_graph(&reports)
+            });
+            if !cancellation.is_cancelled() {
+                let _ = tx.send(DepScanMsg { graph });
+            }
         });
     }
 
@@ -4817,6 +5299,262 @@ pub fn trash_only_report(root: &Path, allocated: u64) -> reclaim::ReclaimReport 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "streamed wide-directory latency and RSS protocol; run optimized"]
+    fn benchmark_streamed_listing() {
+        let root = test_root("wide_listing_benchmark");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..10_000 {
+            fs::write(root.join(format!("file-{index:05}")), b"x").unwrap();
+        }
+        let mut first_rows = Vec::new();
+        let mut totals = Vec::new();
+        let mut interactions = Vec::new();
+        let mut drains = Vec::new();
+        for _ in 0..12 {
+            let started = Instant::now();
+            let mut app = App::new_streaming(root.clone()).unwrap();
+            let mut first = None;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while app.listing_loading() {
+                let drain = Instant::now();
+                if app.drain_listing_results() {
+                    drains.push(drain.elapsed());
+                }
+                if first.is_none() && !app.entries.is_empty() {
+                    first = Some(started.elapsed());
+                }
+                let interaction = Instant::now();
+                app.move_cursor(1);
+                interactions.push(interaction.elapsed());
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            totals.push(started.elapsed());
+            first_rows.push(first.unwrap());
+            assert_eq!(app.entries.len(), 10_000);
+        }
+        for (label, mut samples) in [
+            ("first_row", first_rows),
+            ("listing_total", totals),
+            ("cursor", interactions),
+            ("UI_batch_drain", drains),
+        ] {
+            samples.sort_unstable();
+            let p95 = (samples.len() * 95).div_ceil(100) - 1;
+            eprintln!(
+                "{label}: median_us={} p95_us={} samples={}",
+                samples[samples.len() / 2].as_micros(),
+                samples[p95].as_micros(),
+                samples.len()
+            );
+        }
+        let mut usage: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::proc_pid_rusage(
+                    libc::getpid(),
+                    libc::RUSAGE_INFO_V2,
+                    (&mut usage as *mut libc::rusage_info_v2).cast(),
+                )
+            },
+            0
+        );
+        eprintln!("listing_harness_rss_bytes={}", usage.ri_resident_size);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_full_listing_and_stale_batches_cannot_become_a_fresh_empty_result() {
+        let root = test_root("listing_failure");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.listing_generation.store(2, AtomicOrdering::Relaxed);
+        app.listing_rx = Some(rx);
+        app.listing_state = ListingState::Loading;
+        app.listing_full_scan = true;
+        app.status = app.listing_progress();
+        tx.send(ListingBatch {
+            generation: 1,
+            cwd: root.clone(),
+            rows: Vec::new(),
+            hidden: 0,
+            errors: 0,
+            finished: true,
+            error: None,
+        })
+        .unwrap();
+        assert!(!app.drain_listing_results());
+        assert!(app.listing_loading());
+        tx.send(ListingBatch {
+            generation: 2,
+            cwd: root.clone(),
+            rows: Vec::new(),
+            hidden: 0,
+            errors: 1,
+            finished: true,
+            error: Some(String::from("cannot read: fixture denied")),
+        })
+        .unwrap();
+        assert!(app.drain_listing_results());
+        assert!(matches!(app.listing_state, ListingState::Unreadable(_)));
+        assert_eq!(app.cwd_enumeration_errors, 1);
+        assert!(app.status.contains("fixture denied"));
+        assert!(!app.status.contains("fresh"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn finish_listing(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.listing_loading() && Instant::now() < deadline {
+            app.drain_listing_results();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!app.listing_loading());
+    }
+
+    #[test]
+    fn directory_batches_are_bounded_and_arrive_before_enumeration_finishes() {
+        let root = test_root("listing_backpressure");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..1_000 {
+            fs::write(root.join(format!("file-{index:04}")), b"x").unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let worker_root = root.clone();
+        let worker = thread::spawn(move || {
+            enumerate_listing(
+                worker_root,
+                false,
+                None,
+                bulkstat::ScanCancellation::never(),
+                1,
+                tx,
+            );
+            finished_tx.send(()).unwrap();
+        });
+        let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!first.finished);
+        assert!(!first.rows.is_empty());
+        assert!(first.rows.len() <= 256);
+        assert!(finished_rx.try_recv().is_err());
+        let mut count = first.rows.len();
+        loop {
+            let batch = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            count += batch.rows.len();
+            if batch.finished {
+                break;
+            }
+        }
+        worker.join().unwrap();
+        assert_eq!(count, 1_000);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn streamed_refresh_preserves_filters_selection_and_rejects_cancelled_navigation() {
+        let root = test_root("streamed_listing_lifecycle");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..600 {
+            fs::write(root.join(format!("file-{index:04}")), b"x").unwrap();
+        }
+        let mut app = App::new_streaming(root.clone()).unwrap();
+        assert!(app.listing_loading());
+        assert!(matches!(app.listing_state, ListingState::Loading));
+        finish_listing(&mut app);
+        assert_eq!(app.entries.len(), 600);
+        app.search_query = String::from("file-05");
+        app.search_filter_pinned = true;
+        app.update_search();
+        app.selected = 55;
+        let selected = app.visible_entry(app.selected).unwrap().path.clone();
+        app.force_rescan();
+        finish_listing(&mut app);
+        assert_eq!(app.visible_entry_count(), 100);
+        assert_eq!(app.visible_entry(app.selected).unwrap().path, selected);
+
+        app.reload().unwrap();
+        let abandoned = app.listing_generation.load(AtomicOrdering::Relaxed);
+        app.cancel_listing();
+        assert!(matches!(app.listing_state, ListingState::Cancelled));
+        let next = root.join("next");
+        fs::create_dir(&next).unwrap();
+        fs::write(next.join("only-current"), b"new").unwrap();
+        app.cwd = next.clone();
+        app.clear_search();
+        app.reload().unwrap();
+        assert!(app.listing_generation.load(AtomicOrdering::Relaxed) > abandoned);
+        finish_listing(&mut app);
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.entries[0].path, next.join("only-current"));
+        app.begin_shutdown();
+        assert!(!app.listing_loading());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inventory_partial_messages_are_visible_and_cancellation_disconnects_late_results() {
+        let root = test_root("inventory_partial");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.pkg_scan_rx = Some(rx);
+        app.active_pkg_scan_id = 1;
+        app.packages_loading = true;
+        app.package_scan_partial = true;
+        tx.send(PkgScanMsg {
+            scan_id: 1,
+            cwd: root.clone(),
+            reports: Vec::new(),
+            project_deps: vec![ProjectDeps {
+                path: root.clone(),
+                manager_label: String::from("cargo"),
+                manifest: String::from("Cargo.toml"),
+                dep_count: 0usize.into(),
+                deps_size: None,
+                deps_dir: None,
+                coverage: Default::default(),
+            }],
+            project_dep_errors: 0,
+            project_scope: Default::default(),
+            include_managers: false,
+            finished: false,
+        })
+        .unwrap();
+        assert!(app.drain_package_results());
+        assert_eq!(app.project_deps.len(), 1);
+        assert!(app.packages_loading && app.package_scan_partial && app.packages_loaded);
+        app.cancel_package_scan();
+        assert!(!app.packages_loading);
+        assert!(app.package_scan_partial);
+        assert!(app.pkg_scan_rx.is_none());
+        assert_eq!(app.project_deps.len(), 1);
+        assert!(app.status.contains("partial"));
+        let (tx, rx) = channel();
+        app.pkg_scan_rx = Some(rx);
+        app.packages_loading = true;
+        tx.send(PkgScanMsg {
+            scan_id: 1,
+            cwd: root.clone(),
+            reports: Vec::new(),
+            project_deps: app.project_deps.clone(),
+            project_dep_errors: 0,
+            project_scope: Default::default(),
+            include_managers: false,
+            finished: true,
+        })
+        .unwrap();
+        assert!(app.drain_package_results());
+        assert!(!app.packages_loading);
+        assert!(
+            app.package_scan_partial,
+            "project-only completion cannot certify a cancelled manager inventory"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
 
     #[test]
@@ -6583,6 +7321,7 @@ mod tests {
             project_dep_errors: 0,
             project_scope: bulkstat::DiscoveryCoverage::default(),
             include_managers: false,
+            finished: true,
         })
         .unwrap();
 

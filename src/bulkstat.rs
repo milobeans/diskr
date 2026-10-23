@@ -48,6 +48,15 @@ const ATTRIBUTE_SET_LEN: usize = 20;
 const ATTR_REFERENCE_LEN: usize = 8;
 const DATA_VOLUME_ROOT: &str = "/System/Volumes/Data";
 
+#[cfg(test)]
+static SCANNER_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn count_scanner_syscall() {
+    #[cfg(test)]
+    SCANNER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+}
+
 // vnode types (sys/vnode.h)
 const VREG: u32 = 1;
 const VDIR: u32 = 2;
@@ -824,6 +833,7 @@ fn walk_task(mut dir: PathBuf, state: Arc<WalkState>, group: Arc<TaskGroup>) {
             return;
         }
         let mut opened = std::mem::MaybeUninit::<libc::stat>::uninit();
+        count_scanner_syscall();
         if unsafe { libc::fstat(current.0, opened.as_mut_ptr()) } != 0 {
             chain.inaccessible = chain.inaccessible.saturating_add(1);
             break;
@@ -889,6 +899,7 @@ struct DirFd(libc::c_int);
 
 impl Drop for DirFd {
     fn drop(&mut self) {
+        count_scanner_syscall();
         unsafe { libc::close(self.0) };
     }
 }
@@ -910,6 +921,7 @@ fn open_subdir(parent: &DirFd, name: &OsStr) -> Result<DirFd, Option<i32>> {
 }
 
 fn open_dir_c(path: &CString, dirfd: libc::c_int) -> Result<DirFd, Option<i32>> {
+    count_scanner_syscall();
     let fd = unsafe {
         libc::openat(
             dirfd,
@@ -962,6 +974,7 @@ fn scan_open_dir(
         let buf = &mut *buf_ref;
 
         loop {
+            count_scanner_syscall();
             let n = unsafe {
                 libc::getattrlistbulk(
                     fd,
@@ -1454,6 +1467,110 @@ fn read_attr_reference(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    struct BoundaryFixture {
+        root: PathBuf,
+        logical: u64,
+        allocated: u64,
+    }
+    impl BoundaryFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let root = test_root("filesystem_boundaries");
+            std::fs::create_dir_all(&root).unwrap();
+            let mut files = Vec::new();
+            let mut dir = root.join("deep");
+            for _ in 0..64 {
+                std::fs::create_dir_all(&dir).unwrap();
+                let file = dir.join("file");
+                std::fs::write(&file, b"x").unwrap();
+                files.push(file);
+                dir = dir.join("d");
+            }
+            let original = root.join("original");
+            std::fs::write(&original, b"fixture").unwrap();
+            std::fs::hard_link(&original, root.join("hardlink")).unwrap();
+            files.push(original);
+            let sparse = root.join("sparse");
+            std::fs::File::create(&sparse)
+                .unwrap()
+                .set_len(1 << 30)
+                .unwrap();
+            assert!(std::fs::metadata(&sparse).unwrap().blocks() * 512 < 1 << 30);
+            files.push(sparse);
+            let source = root.join("clone-source");
+            let clone = root.join("clone");
+            std::fs::write(&source, vec![1u8; 8192]).unwrap();
+            let source_c = CString::new(source.as_os_str().as_bytes()).unwrap();
+            let clone_c = CString::new(clone.as_os_str().as_bytes()).unwrap();
+            if unsafe { libc::clonefile(source_c.as_ptr(), clone_c.as_ptr(), 0) } == 0 {
+                files.push(clone);
+            } else {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.raw_os_error(), Some(libc::ENOTSUP));
+                eprintln!("clone fixture unavailable on this filesystem: {error}");
+            }
+            files.push(source);
+            let locked = root.join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::write(locked.join("unreadable"), b"hidden").unwrap();
+            std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let (logical, allocated) = files
+                .iter()
+                .map(|path| std::fs::metadata(path).unwrap())
+                .fold((0, 0), |(logical, allocated), meta| {
+                    (logical + meta.len(), allocated + meta.blocks() * 512)
+                });
+            Self {
+                root,
+                logical,
+                allocated,
+            }
+        }
+    }
+    impl Drop for BoundaryFixture {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                self.root.join("locked"),
+                std::fs::Permissions::from_mode(0o755),
+            );
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn deep_sparse_clone_and_hardlink_fixture_preserves_coverage_and_accounting() {
+        let fixture = BoundaryFixture::new();
+        let scan = scan_dir(&fixture.root, 10);
+        assert_eq!(scan.inaccessible, 1);
+        assert_eq!(scan.size, SizeInfo::new(fixture.logical, fixture.allocated));
+        assert_eq!(scan.skipped_mounts, 0);
+    }
+
+    #[test]
+    #[ignore = "filesystem boundary performance protocol; run optimized"]
+    fn benchmark_filesystem_boundaries() {
+        let fixture = BoundaryFixture::new();
+        let mut times = Vec::new();
+        let _ = scan_dir(&fixture.root, 10);
+        let mut calls = Vec::new();
+        for _ in 0..12 {
+            let before = SCANNER_SYSCALLS.load(Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            let scan = scan_dir(&fixture.root, 10);
+            times.push(started.elapsed());
+            calls.push(SCANNER_SYSCALLS.load(Ordering::Relaxed) - before);
+            assert_eq!(scan.size, SizeInfo::new(fixture.logical, fixture.allocated));
+            assert_eq!(scan.inaccessible, 1);
+        }
+        times.sort_unstable();
+        eprintln!(
+            "boundary_fixture: median_us={} p95_us={} direct_scanner_syscalls={calls:?}",
+            times[6].as_micros(),
+            times[11].as_micros()
+        );
+    }
 
     fn shared_job_for(root: &Path) -> Arc<SharedWalk> {
         recover_lock(shared_registry())

@@ -14,6 +14,38 @@ use crate::manifest::{self, bounded_text};
 use crate::pool;
 use crate::terminal_text;
 
+thread_local! {
+    static SCAN_CANCELLATION: std::cell::RefCell<Option<bulkstat::ScanCancellation>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn with_scan_cancellation<R>(
+    cancellation: &bulkstat::ScanCancellation,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<bulkstat::ScanCancellation>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCAN_CANCELLATION.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = SCAN_CANCELLATION.with(|slot| slot.replace(Some(cancellation.clone())));
+    let _restore = Restore(previous);
+    run()
+}
+
+fn current_cancellation() -> bulkstat::ScanCancellation {
+    SCAN_CANCELLATION
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(bulkstat::ScanCancellation::never)
+}
+
+fn scan_map<T: Send, R: Send>(items: Vec<T>, run: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let cancellation = current_cancellation();
+    pool::par_map(items, |item| {
+        with_scan_cancellation(&cancellation, || run(item))
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Package {
     pub name: String,
@@ -106,7 +138,23 @@ fn tree_footprint(
     path: Option<&Path>,
     scope: Option<&bulkstat::ScanScope>,
 ) -> (Option<SizeInfo>, FootprintCoverage) {
+    tree_footprint_cancellable(path, scope, &current_cancellation())
+}
+
+fn scan_inventory_tree(path: &Path) -> bulkstat::DirScan {
+    bulkstat::scan_dir_with_cancellation(path, 0, &current_cancellation()).unwrap_or_default()
+}
+
+fn tree_footprint_cancellable(
+    path: Option<&Path>,
+    scope: Option<&bulkstat::ScanScope>,
+    cancellation: &bulkstat::ScanCancellation,
+) -> (Option<SizeInfo>, FootprintCoverage) {
     let mut coverage = FootprintCoverage::new(FootprintBasis::Tree);
+    if cancellation.is_cancelled() {
+        coverage.inaccessible = 1;
+        return (None, coverage);
+    }
     let Some(path) = path else {
         coverage.missing_files = 1;
         return (None, coverage);
@@ -123,10 +171,8 @@ fn tree_footprint(
         }
     }
     let scan = match scope {
-        Some(scope) => {
-            bulkstat::scan_dir_in_scope(path, 0, &bulkstat::ScanCancellation::never(), Some(scope))
-        }
-        None => Some(bulkstat::scan_dir(path, 0)),
+        Some(scope) => bulkstat::scan_dir_in_scope(path, 0, cancellation, Some(scope)),
+        None => bulkstat::scan_dir_with_cancellation(path, 0, cancellation),
     };
     if let Some(scan) = scan {
         coverage.add_scan(&scan);
@@ -148,6 +194,24 @@ pub enum Manager {
 }
 
 impl Manager {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Brew => "brew",
+            Self::BrewCask => "brew-cask",
+            Self::Npm => "npm",
+            Self::Pip => "pip",
+            Self::Cargo => "cargo",
+            Self::Bun => "bun",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|manager| manager.key() == key)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Manager::Brew => "brew",
@@ -516,27 +580,86 @@ pub struct ProjectDepsReport {
     pub scope: bulkstat::DiscoveryCoverage,
 }
 
-pub fn scan_managers() -> Vec<ManagerReport> {
-    let mut handles = Vec::with_capacity(Manager::ALL.len());
-    for (index, manager) in Manager::ALL.iter().copied().enumerate() {
-        handles.push((index, manager, thread::spawn(move || scan_manager(manager))));
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventoryScope {
+    pub managers: Vec<Manager>,
+    pub projects: bool,
+    pub depth: usize,
+    pub excludes: Vec<PathBuf>,
+}
 
-    let mut reports = vec![None; Manager::ALL.len()];
-    for (index, manager, handle) in handles {
-        let report = handle.join().unwrap_or_else(|_| ManagerReport {
-            manager,
-            packages: Vec::new(),
-            total_size: SizeInfo::default(),
-            available: false,
-            warning: Some("scan thread panicked".into()),
-            state: ManagerScanState::Failed,
-            environment: None,
-        });
-        reports[index] = Some(report);
+impl Default for InventoryScope {
+    fn default() -> Self {
+        Self {
+            managers: Manager::ALL.to_vec(),
+            projects: true,
+            depth: 5,
+            excludes: Vec::new(),
+        }
     }
+}
 
-    reports.into_iter().flatten().collect()
+impl InventoryScope {
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({"managers":self.managers.iter().map(|manager| manager.key()).collect::<Vec<_>>(),
+            "projects":self.projects,"max_depth":self.depth,
+            "excludes":self.excludes.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+            "exclude_identities":self.excludes.iter().map(|path| crate::state::encode_path(path)).collect::<Vec<_>>()})
+    }
+}
+
+pub fn scan_selected_managers(managers: &[Manager]) -> Vec<ManagerReport> {
+    let reports = std::sync::Mutex::new(Vec::new());
+    scan_managers_streamed(managers, &bulkstat::ScanCancellation::never(), &|report| {
+        reports.lock().unwrap().push(report);
+    });
+    let mut reports = reports.into_inner().unwrap();
+    reports.sort_by_key(|report| {
+        Manager::ALL
+            .iter()
+            .position(|manager| *manager == report.manager)
+    });
+    reports
+}
+
+pub fn scan_managers_streamed(
+    managers: &[Manager],
+    cancellation: &bulkstat::ScanCancellation,
+    emit: &(impl Fn(ManagerReport) + Sync),
+) {
+    scan_managers_streamed_with(managers, cancellation, emit, &scan_manager);
+}
+
+fn scan_managers_streamed_with(
+    managers: &[Manager],
+    cancellation: &bulkstat::ScanCancellation,
+    emit: &(impl Fn(ManagerReport) + Sync),
+    runner: &(impl Fn(Manager) -> ManagerReport + Sync),
+) {
+    thread::scope(|scope| {
+        for manager in managers.iter().copied() {
+            scope.spawn(move || {
+                if cancellation.is_cancelled() {
+                    return;
+                }
+                let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_scan_cancellation(cancellation, || runner(manager))
+                }))
+                .unwrap_or_else(|_| ManagerReport {
+                    manager,
+                    packages: Vec::new(),
+                    total_size: SizeInfo::default(),
+                    available: false,
+                    warning: Some("scan thread panicked".into()),
+                    state: ManagerScanState::Failed,
+                    environment: None,
+                });
+                if !cancellation.is_cancelled() {
+                    emit(report);
+                }
+            });
+        }
+    });
 }
 
 pub fn scan_dep_graph(reports: &[ManagerReport]) -> DepGraph {
@@ -1052,7 +1175,7 @@ fn parse_brew_cask_json_with_app_roots(
         return Vec::new();
     };
 
-    pool::par_map(casks, |cask| {
+    scan_map(casks, |cask| {
         let token = cask
             .get("token")?
             .as_str()
@@ -1094,7 +1217,7 @@ fn parse_brew_cask_json_with_app_roots(
             FootprintBasis::AppAndMetadata
         });
         let mut size = if pkg_path.is_dir() {
-            let scan = bulkstat::scan_dir(&pkg_path, 0);
+            let scan = scan_inventory_tree(&pkg_path);
             coverage.add_scan(&scan);
             scan.size
         } else {
@@ -1106,7 +1229,7 @@ fn parse_brew_cask_json_with_app_roots(
         if !is_installer_based {
             for app_name in &app_names {
                 if let Some(app_path) = find_cask_app_path(app_name, app_roots) {
-                    let scan = bulkstat::scan_dir(&app_path, 0);
+                    let scan = scan_inventory_tree(&app_path);
                     coverage.add_scan(&scan);
                     let app_size = scan.size;
                     size.logical = size.logical.saturating_add(app_size.logical);
@@ -1180,9 +1303,9 @@ fn scan_brew_dir(install_dir: &Path) -> (Vec<Package>, Option<String>) {
         }
     }
 
-    let packages = pool::par_map(entries, |(name, pkg_path)| {
+    let packages = scan_map(entries, |(name, pkg_path)| {
         let version = latest_subdir_name(&pkg_path);
-        let scan = bulkstat::scan_dir(&pkg_path, 0);
+        let scan = scan_inventory_tree(&pkg_path);
         let mut coverage = FootprintCoverage::new(FootprintBasis::Tree);
         coverage.add_scan(&scan);
         let size = Some(scan.size);
@@ -1300,7 +1423,7 @@ fn npm_inventory_from_result(
         );
     }
 
-    let packages = pool::par_map(entries, |(name, version)| {
+    let packages = scan_map(entries, |(name, version)| {
         let pkg_path = global_root.as_ref().map(|root| root.join(&name));
         let (size, coverage) = tree_footprint(pkg_path.as_deref(), None);
         Package {
@@ -1403,7 +1526,7 @@ fn pip_inventory_from_result(
         );
     }
 
-    let measured = pool::par_map(entries, |(name, version, location)| {
+    let measured = scan_map(entries, |(name, version, location)| {
         let (size, path, problems) = if let Some(index) = location
             .as_ref()
             .and_then(|location| indexes.iter().find(|index| &index.root == location))
@@ -1675,7 +1798,7 @@ fn bun_inventory_from_result(
         warning = add_warning(warning, "bun: global package root unresolved");
     }
 
-    let packages = pool::par_map(entries, |(name, version)| {
+    let packages = scan_map(entries, |(name, version)| {
         let path = bun_global.map(|root| root.join(&name));
         let (size, coverage) = tree_footprint(path.as_deref(), None);
         let path = path.filter(|_| size.is_some());
@@ -1696,24 +1819,45 @@ pub fn find_project_deps(root: &Path, max_depth: usize) -> Vec<ProjectDeps> {
     scan_project_deps(root, max_depth).projects
 }
 
+#[cfg(test)]
 pub fn scan_project_deps(root: &Path, max_depth: usize) -> ProjectDepsReport {
+    let options = InventoryScope {
+        depth: max_depth,
+        ..Default::default()
+    };
+    scan_project_deps_streamed(
+        root,
+        &options,
+        &bulkstat::ScanCancellation::never(),
+        &|_| {},
+    )
+}
+
+pub fn scan_project_deps_streamed(
+    root: &Path,
+    options: &InventoryScope,
+    cancellation: &bulkstat::ScanCancellation,
+    emit: &(impl Fn(ProjectDeps) + Sync),
+) -> ProjectDepsReport {
     let results = std::sync::Mutex::new(Vec::new());
     let inaccessible = AtomicU32::new(0);
     let scope = bulkstat::ScanScope::new(root).ok();
     let coverage = std::sync::Mutex::new(bulkstat::DiscoveryCoverage {
-        depth_limit: max_depth,
+        depth_limit: options.depth,
         ..Default::default()
     });
+    let walk = ProjectWalk {
+        root,
+        options,
+        cancellation,
+        emit,
+        results: &results,
+        inaccessible: &inaccessible,
+        scope: scope.as_ref(),
+        coverage: &coverage,
+    };
     pool::par_drain(vec![(root.to_path_buf(), 0usize)], |(dir, depth), queue| {
-        scan_project_dir(
-            &dir,
-            depth,
-            max_depth,
-            &results,
-            &inaccessible,
-            queue,
-            (scope.as_ref(), &coverage),
-        );
+        scan_project_dir(&dir, depth, queue, &walk);
     });
     let mut results = results.into_inner().unwrap_or_default();
     results.sort_by(|a, b| {
@@ -1769,19 +1913,44 @@ impl ProjectManifestGroup {
     }
 }
 
+struct ProjectWalk<'a> {
+    root: &'a Path,
+    options: &'a InventoryScope,
+    cancellation: &'a bulkstat::ScanCancellation,
+    emit: &'a (dyn Fn(ProjectDeps) + Sync),
+    results: &'a std::sync::Mutex<Vec<ProjectDeps>>,
+    inaccessible: &'a AtomicU32,
+    scope: Option<&'a bulkstat::ScanScope>,
+    coverage: &'a std::sync::Mutex<bulkstat::DiscoveryCoverage>,
+}
+
 fn scan_project_dir(
     dir: &Path,
     depth: usize,
-    max_depth: usize,
-    results: &std::sync::Mutex<Vec<ProjectDeps>>,
-    inaccessible: &AtomicU32,
     queue: &pool::WorkQueue<(PathBuf, usize)>,
-    policy: (
-        Option<&bulkstat::ScanScope>,
-        &std::sync::Mutex<bulkstat::DiscoveryCoverage>,
-    ),
+    walk: &ProjectWalk<'_>,
 ) {
-    let (scope, coverage) = policy;
+    let ProjectWalk {
+        options,
+        cancellation,
+        emit,
+        results,
+        inaccessible,
+        scope,
+        coverage,
+        ..
+    } = walk;
+    if cancellation.is_cancelled() {
+        return;
+    }
+    if options
+        .excludes
+        .iter()
+        .any(|excluded| dir.starts_with(walk.root.join(excluded)))
+    {
+        coverage.lock().unwrap().excluded_policy += 1;
+        return;
+    }
     if let (Some(policy), Ok(meta)) = (scope, std::fs::symlink_metadata(dir)) {
         if !policy.accepts(dir, &meta) {
             coverage.lock().unwrap().skipped_mounts += 1;
@@ -1801,6 +1970,9 @@ fn scan_project_dir(
     let mut found_manifests: Vec<(usize, &str, &str, &str)> = Vec::new();
 
     for entry in read {
+        if cancellation.is_cancelled() {
+            return;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1855,12 +2027,15 @@ fn scan_project_dir(
         }
     }
 
-    let new_deps = pool::par_map(groups, |group| {
+    let new_deps = scan_map(groups, |group| {
         let dep_count = manifest::count(dir, &group.manifests);
         let (deps_size, deps_dir, coverage) = match group.deps_path {
             Some(deps_path) => {
-                let (size, coverage) =
-                    tree_footprint(Some(&deps_path), scope.map(|scope| scope.fresh()).as_ref());
+                let (size, coverage) = tree_footprint_cancellable(
+                    Some(&deps_path),
+                    scope.map(|scope| scope.fresh()).as_ref(),
+                    cancellation,
+                );
                 (size, size.map(|_| deps_path), coverage)
             }
             None => (None, None, FootprintCoverage::default()),
@@ -1876,11 +2051,17 @@ fn scan_project_dir(
         }
     });
 
+    if cancellation.is_cancelled() {
+        return;
+    }
     if !new_deps.is_empty() {
+        for project in &new_deps {
+            emit(project.clone());
+        }
         results.lock().unwrap().extend(new_deps);
     }
 
-    if depth < max_depth {
+    if depth < options.depth {
         for child in children {
             queue.push((child, depth + 1));
         }
@@ -2048,6 +2229,15 @@ fn run_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Comm
 const MAX_COMMAND_OUTPUT: usize = 16 * 1024 * 1024;
 
 pub(crate) fn run_process(mut command: Command, timeout: Duration) -> CommandResult {
+    let cancellation = current_cancellation();
+    if cancellation.is_cancelled() {
+        return CommandResult {
+            stdout: String::new(),
+            stderr: String::from("scan cancelled"),
+            success: false,
+            timed_out: false,
+        };
+    }
     command.process_group(0);
     let mut child = match command
         .stdin(Stdio::null())
@@ -2091,6 +2281,10 @@ pub(crate) fn run_process(mut command: Command, timeout: Duration) -> CommandRes
     let mut failed = None;
     let mut timed_out = false;
     loop {
+        if cancellation.is_cancelled() {
+            failed = Some(String::from("scan cancelled"));
+            break;
+        }
         if let Err(err) = drain_pipe(&mut stdout_pipe, &mut stdout)
             .and_then(|_| drain_pipe(&mut stderr_pipe, &mut stderr))
         {
@@ -2396,8 +2590,13 @@ fn parse_pip_record_size(
     let mut logical = 0u64;
     let mut allocated = 0u64;
     let mut problems = PipRecordProblems::default();
+    let cancellation = current_cancellation();
 
     for row in record.lines().filter(|line| !line.trim().is_empty()) {
+        if cancellation.is_cancelled() {
+            problems.unreadable_files = problems.unreadable_files.saturating_add(1);
+            break;
+        }
         let fields = split_csv_row(row);
         if fields.len() < 3 {
             continue;
@@ -2486,6 +2685,125 @@ fn allocated_size_from_metadata(meta: &std::fs::Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manager_stream_emits_ready_reports_without_waiting_for_a_slow_manager() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                scan_managers_streamed_with(
+                    &[Manager::Brew, Manager::Npm],
+                    &bulkstat::ScanCancellation::never(),
+                    &|report| {
+                        tx.send(report.manager).unwrap();
+                    },
+                    &|manager| {
+                        if manager == Manager::Brew {
+                            release_rx
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(5))
+                                .unwrap();
+                        }
+                        ManagerReport {
+                            manager,
+                            packages: Vec::new(),
+                            total_size: Default::default(),
+                            available: false,
+                            warning: None,
+                            state: ManagerScanState::Absent,
+                            environment: None,
+                        }
+                    },
+                )
+            });
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Manager::Npm
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Manager::Brew
+            );
+            worker.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn project_stream_honors_depth_exclusions_and_cancellation() {
+        let root = test_root("project_scope_stream");
+        for relative in ["", "keep", "keep/deep", "archive"] {
+            let dir = root.join(relative);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("Cargo.toml"), "[package]\nname='fixture'\n").unwrap();
+        }
+        let options = InventoryScope {
+            depth: 1,
+            excludes: vec![PathBuf::from("archive")],
+            ..Default::default()
+        };
+        let emitted = std::sync::Mutex::new(Vec::new());
+        let report = scan_project_deps_streamed(
+            &root,
+            &options,
+            &bulkstat::ScanCancellation::never(),
+            &|project| {
+                emitted.lock().unwrap().push(project);
+            },
+        );
+        assert_eq!(report.projects.len(), 2);
+        assert_eq!(emitted.into_inner().unwrap().len(), 2);
+        assert_eq!(report.scope.depth_limited, 1);
+        assert_eq!(report.scope.excluded_policy, 1);
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let report = scan_project_deps_streamed(
+            &root,
+            &options,
+            &bulkstat::ScanCancellation::new(generation, 0),
+            &|_| panic!("cancelled scan emitted a project"),
+        );
+        assert!(report.projects.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_context_cancels_commands_and_propagates_to_sizing_workers() {
+        let root = test_root("command_cancel");
+        std::fs::create_dir_all(&root).unwrap();
+        let ready = root.join("ready");
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancellation = bulkstat::ScanCancellation::new(std::sync::Arc::clone(&generation), 0);
+        let worker_cancellation = cancellation.clone();
+        let worker_ready = ready.clone();
+        let worker = thread::spawn(move || {
+            with_scan_cancellation(&worker_cancellation, || {
+                let mut command = Command::new("/bin/sh");
+                command
+                    .args(["-c", "printf ready > \"$1\"; exec /bin/sleep 30", "fixture"])
+                    .arg(worker_ready);
+                run_process(command, Duration::from_secs(10))
+            })
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(ready.exists());
+        generation.fetch_add(1, Ordering::Relaxed);
+        let result = worker.join().unwrap();
+        assert!(!result.success);
+        assert!(!result.timed_out);
+        assert!(result.stderr.contains("cancelled"));
+        let cancelled = with_scan_cancellation(&cancellation, || {
+            scan_map(vec![1, 2, 3, 4], |_| current_cancellation().is_cancelled())
+        });
+        assert!(cancelled.into_iter().all(|cancelled| cancelled));
+        assert!(!current_cancellation().is_cancelled());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn cargo_install_root_follows_environment_config_and_home_precedence() {

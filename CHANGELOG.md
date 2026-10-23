@@ -6,6 +6,33 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Package report scope controls select projects only, specific managers, no
+  projects, discovery depth and root-relative subtree exclusions; JSON and text
+  disclose the requested inventory scope.
+- Immutable named baselines support listing, pinning, explicit prune previews,
+  recoverable prune backups and bounded export/import without replacing latest
+  root baselines. Saved package profiles retain roots and inventory scopes.
+  Imported records retain source machine/raw-root identities; foreign profile
+  execution requires creating an explicit local profile.
+
+### Changed
+
+- The TUI streams ready manager and project results while remaining inventory
+  work continues, showing elapsed/stage progress and partial-state labels.
+  Esc/Ctrl+C cancels read-only inventory and retains ready results as partial.
+- Startup paints before state loading and supports immediate cancellation.
+  Directory listings arrive in bounded, generation-tagged batches off the UI
+  loop; stale batches cannot replace a refreshed or navigated listing.
+
+### Fixed
+
+- Failed or partially unreadable directory enumeration keeps its uncertainty
+  visible instead of reporting an empty, fully refreshed directory.
+- A project-only refresh cannot clear the partial marker left by a cancelled
+  manager inventory.
+
 ## [0.1.82] - 2026-10-22
 
 ### Added
