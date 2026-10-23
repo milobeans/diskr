@@ -3014,19 +3014,21 @@ impl App {
             || self.history_jobs.load(AtomicOrdering::Relaxed) > 0
     }
 
-    pub fn begin_shutdown(&mut self) {
+    pub fn cancel_read_only_work(&mut self) {
         self.cancel_listing();
         self.cancel_reclaim_scan();
         self.cancel_package_scan();
-        self.shutting_down = true;
-        self.scanner.cancel_current();
-        self.pending_scan_dirs.clear();
+        self.invalidate_pending_scan_results();
+        self.sort_dirty = false;
+        self.top_files_loading = false;
+        self.disk_info_loading = false;
         self.top_files_generation
             .fetch_add(1, AtomicOrdering::Relaxed);
         if !self.history_saving {
             self.history_generation
                 .fetch_add(1, AtomicOrdering::Relaxed);
             self.history_rx = None;
+            self.history_loading = false;
         }
         self.reclaim_scan_rx = None;
         self.top_files_scan_rx = None;
@@ -3036,6 +3038,11 @@ impl App {
         self.pkg_scan_rx = None;
         self.dep_scan_rx = None;
         self.file_info_rx = None;
+    }
+
+    pub fn begin_shutdown(&mut self) {
+        self.cancel_read_only_work();
+        self.shutting_down = true;
         self.status = String::from("finishing active operations before quit…");
     }
 

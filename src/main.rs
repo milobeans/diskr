@@ -1797,6 +1797,16 @@ fn dirs_home() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
+fn prepare_quit(app: &mut App) -> bool {
+    let wait = app.has_pending_shutdown_work();
+    if wait {
+        app.begin_shutdown();
+    } else {
+        app.cancel_read_only_work();
+    }
+    wait
+}
+
 fn run<B>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
 where
     B: ratatui_core::backend::Backend<Error = io::Error>,
@@ -2291,8 +2301,7 @@ where
                             true
                         }
                         KeyCode::Char('q') => {
-                            if app.has_pending_shutdown_work() {
-                                app.begin_shutdown();
+                            if prepare_quit(app) {
                                 shutting_down = true;
                                 true
                             } else {
@@ -2769,6 +2778,24 @@ mod tests {
 
     fn parse(parts: &[&str]) -> Result<CliAction> {
         parse_args(parts.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn fast_quit_cancels_streamed_read_only_work_without_mutation_shutdown_output() {
+        let root = test_root("fast_quit_reads");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file"), b"fixture").unwrap();
+        let mut app = App::new_streaming(root.clone()).unwrap();
+        app.reclaim_loading = true;
+        app.packages_loading = true;
+        assert!(app.listing_loading());
+        assert!(!prepare_quit(&mut app));
+        assert!(!app.listing_loading());
+        assert!(!app.reclaim_loading);
+        assert!(!app.packages_loading);
+        assert!(!app.has_pending_scan_work());
+        assert!(app.shutdown_summary().is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

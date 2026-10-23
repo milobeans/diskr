@@ -32,6 +32,8 @@ All notable changes to diskr are documented here. The format follows
   visible instead of reporting an empty, fully refreshed directory.
 - A project-only refresh cannot clear the partial marker left by a cancelled
   manager inventory.
+- Quiet fast quit cancels read-only scan generations and pending results before
+  returning, while the mutation-draining quit path remains unchanged.
 
 ## [0.1.82] - 2026-10-22
 
