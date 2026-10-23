@@ -67,6 +67,7 @@ impl Scanner {
             return Ok(());
         }
         let remaining = Arc::new(AtomicUsize::new(dirs.len()));
+        let interactive = dirs.len() == 1;
         let epoch = crate::state::next_epoch();
         // The shared injector is FIFO, so directories start in listing order.
         for dir in dirs {
@@ -78,6 +79,7 @@ impl Scanner {
                 dir.clone(),
                 0,
                 cancellation.clone(),
+                interactive,
                 move || {
                     let _ = started_tx.send(ScanMsg::DirStarted {
                         scan_id,

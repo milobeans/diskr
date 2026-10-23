@@ -489,6 +489,7 @@ pub struct App {
     pending_scan_dirs: Vec<PathBuf>,
 
     active_reclaim_scan_id: ScanId,
+    reclaim_generation: Arc<AtomicU64>,
     reclaim_scan_rx: Option<Receiver<ReclaimMsg>>,
     pub reclaim_report: Option<reclaim::ReclaimReport>,
     reclaim_cwd: Option<PathBuf>,
@@ -781,6 +782,7 @@ impl App {
             active_scan_paths: HashSet::new(),
             pending_scan_dirs: Vec::new(),
             active_reclaim_scan_id: 0,
+            reclaim_generation: Arc::new(AtomicU64::new(0)),
             reclaim_scan_rx: None,
             reclaim_report: None,
             reclaim_cwd: None,
@@ -1434,6 +1436,7 @@ impl App {
     }
 
     fn enqueue_scan_dir(&mut self, path: PathBuf) {
+        bulkstat::prioritize_scan(&path);
         if self.active_scan_paths.contains(&path) || self.pending_scan_dirs.contains(&path) {
             return;
         }
@@ -1472,6 +1475,7 @@ impl App {
         if self.confirming_delete {
             return;
         }
+        bulkstat::invalidate_shared_scans(&self.cwd);
         self.fda_limited = full_disk_access_missing();
         self.invalidate_pending_scan_results();
         let previous_selected = self
@@ -2195,12 +2199,27 @@ impl App {
     }
 
     pub fn request_reclaim_scan(&mut self) {
+        self.request_reclaim_scan_with(reclaim::report_with_cancellation);
+    }
+
+    fn request_reclaim_scan_with(
+        &mut self,
+        runner: impl FnOnce(&Path, &bulkstat::ScanCancellation) -> Option<reclaim::ReclaimReport>
+            + Send
+            + 'static,
+    ) {
         if self.reclaim_loading {
             return;
         }
         self.fda_limited = full_disk_access_missing();
         let cwd = self.cwd.clone();
         let scan_id = self.next_reclaim_scan_id();
+        let generation = self
+            .reclaim_generation
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            .saturating_add(1);
+        let cancellation =
+            bulkstat::ScanCancellation::new(Arc::clone(&self.reclaim_generation), generation);
         let (tx, rx) = std::sync::mpsc::channel();
 
         self.reclaim_loading = true;
@@ -2214,13 +2233,24 @@ impl App {
         self.status = String::from("scanning reclaim recommendations…");
 
         thread::spawn(move || {
-            let report = reclaim::report(&cwd);
+            let Some(report) = runner(&cwd, &cancellation) else {
+                return;
+            };
             let _ = tx.send(ReclaimMsg {
                 scan_id,
                 root: cwd,
                 report,
             });
         });
+    }
+
+    pub fn cancel_reclaim_scan(&mut self) {
+        self.reclaim_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.reclaim_loading = false;
+        self.reclaim_scan_rx = None;
+        self.status =
+            String::from("reclaim scan cancelled; incomplete findings were not published");
     }
 
     pub fn open_selected_reclaim_paths(&mut self) {
@@ -2633,6 +2663,7 @@ impl App {
     }
 
     pub fn begin_shutdown(&mut self) {
+        self.cancel_reclaim_scan();
         self.shutting_down = true;
         self.scanner.cancel_current();
         self.pending_scan_dirs.clear();
@@ -3233,6 +3264,7 @@ impl App {
     /// When a path changes (deletion, write), its own cache entry and every
     /// ancestor's cached size are now stale.
     fn invalidate_cache_for(&mut self, path: &Path) {
+        bulkstat::invalidate_shared_scans(path);
         self.invalidate_pending_scan_results();
         self.remove_cached_subtree(path);
         let mut p = path.parent();
@@ -3297,7 +3329,11 @@ impl App {
         let Some(entry) = self.entries.get(entry_idx) else {
             return;
         };
-        if !entry_needs_scan(entry) || entry.scanning {
+        if entry.scanning {
+            bulkstat::prioritize_scan(&entry.path);
+            return;
+        }
+        if !entry_needs_scan(entry) {
             return;
         }
         let name = entry.name.clone();
@@ -4424,6 +4460,12 @@ fn modal_page_selection(selected: usize, count: usize, max_rows: usize, pages: i
 /// True when a TCC-protected directory exists but cannot be listed — the
 /// telltale of a terminal running without Full Disk Access. ENOENT (dir
 /// absent) is not evidence either way, so only PermissionDenied counts.
+#[cfg(test)]
+fn full_disk_access_missing() -> bool {
+    false
+}
+
+#[cfg(not(test))]
 fn full_disk_access_missing() -> bool {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return false;
@@ -6430,6 +6472,48 @@ mod tests {
 
         fs::remove_dir_all(root_a).unwrap();
         fs::remove_dir_all(root_b).unwrap();
+    }
+
+    #[test]
+    fn cancelling_reclaim_disconnects_old_results_without_cancelling_the_next_scan() {
+        let root = test_root("reclaim_cancel_lifecycle");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        app.request_reclaim_scan_with(move |root, cancellation| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(cancellation.is_cancelled());
+            finished_tx.send(()).unwrap();
+            Some(trash_only_report(root, 999))
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(app.reclaim_loading);
+        app.cancel_reclaim_scan();
+        assert!(!app.reclaim_loading);
+        assert!(app.reclaim_scan_rx.is_none());
+        assert!(app.reclaim_report.is_none());
+
+        let (next_tx, next_rx) = std::sync::mpsc::channel();
+        app.request_reclaim_scan_with(move |root, cancellation| {
+            assert!(!cancellation.is_cancelled());
+            next_tx.send(()).unwrap();
+            Some(trash_only_report(root, 42))
+        });
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        next_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.reclaim_loading && Instant::now() < deadline {
+            app.drain_reclaim_results();
+            thread::yield_now();
+        }
+        assert!(!app.reclaim_loading);
+        assert_eq!(app.reclaim_report.as_ref().unwrap().total.allocated, 42);
+        assert_eq!(app.status, "reclaim scan complete");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

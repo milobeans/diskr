@@ -309,14 +309,40 @@ fn artifact_evidence(path: &Path, name: &str) -> bool {
 
 /// Same as [`report`], but with an explicit home directory (used in tests).
 pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
+    report_with_home_cancellation(root, home, &bulkstat::ScanCancellation::never())
+        .expect("uncancelled reclaim report")
+}
+
+pub fn report_with_cancellation(
+    root: &Path,
+    cancellation: &bulkstat::ScanCancellation,
+) -> Option<ReclaimReport> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    report_with_home_cancellation(root, home.as_deref(), cancellation)
+}
+
+fn report_with_home_cancellation(
+    root: &Path,
+    home: Option<&Path>,
+    cancellation: &bulkstat::ScanCancellation,
+) -> Option<ReclaimReport> {
+    if cancellation.is_cancelled() {
+        return None;
+    }
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let home = home.map(|home| home.canonicalize().unwrap_or_else(|_| home.to_path_buf()));
     let mut builds = Vec::new();
 
     if let Some(home) = home.as_deref() {
-        builds.extend(fixed_findings(&root, home));
+        builds.extend(fixed_findings(&root, home, cancellation));
     }
-    let (artifact_builds, artifact_search_errors, scope) = artifact_findings(&root);
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    let (artifact_builds, artifact_search_errors, scope) = artifact_findings(&root, cancellation);
+    if cancellation.is_cancelled() {
+        return None;
+    }
     builds.extend(artifact_builds);
 
     for build in &mut builds {
@@ -352,14 +378,14 @@ pub fn report_with_home(root: &Path, home: Option<&Path>) -> ReclaimReport {
     // are active — no hardcoding required.
     mark_rollups(&mut findings);
 
-    ReclaimReport {
+    Some(ReclaimReport {
         root,
         findings,
         total,
         inaccessible,
         skipped_mounts,
         scope,
-    }
+    })
 }
 
 /// Sum the minimal set of non-overlapping roots. Per-path contributions retain
@@ -439,7 +465,11 @@ fn is_strict_prefix(ancestor: &Path, descendant: &Path) -> bool {
     descendant.starts_with(ancestor)
 }
 
-fn fixed_findings(root: &Path, home: &Path) -> Vec<FindingBuild> {
+fn fixed_findings(
+    root: &Path,
+    home: &Path,
+    cancellation: &bulkstat::ScanCancellation,
+) -> Vec<FindingBuild> {
     FIXED_CATEGORIES
         .iter()
         .filter_map(|category| {
@@ -449,6 +479,9 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<FindingBuild> {
             let mut paths = Vec::new();
             let mut contributions = Vec::new();
             for rel in category.paths {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
                 let known = home.join(rel);
                 let candidate = if root.starts_with(&known) {
                     root.to_path_buf()
@@ -459,13 +492,9 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<FindingBuild> {
                     continue;
                 }
                 let scope = bulkstat::ScanScope::new(root).ok().map(|s| s.fresh());
-                let scanned = bulkstat::scan_dir_in_scope(
-                    &candidate,
-                    0,
-                    &bulkstat::ScanCancellation::never(),
-                    scope.as_ref(),
-                )
-                .unwrap_or_default();
+                let scanned =
+                    bulkstat::scan_dir_in_scope(&candidate, 0, cancellation, scope.as_ref())
+                        .unwrap_or_default();
                 size.logical = size.logical.saturating_add(scanned.size.logical);
                 size.allocated = size.allocated.saturating_add(scanned.size.allocated);
                 inaccessible = inaccessible.saturating_add(scanned.inaccessible);
@@ -500,8 +529,11 @@ fn fixed_findings(root: &Path, home: &Path) -> Vec<FindingBuild> {
         .collect()
 }
 
-fn artifact_findings(root: &Path) -> (Vec<FindingBuild>, u32, bulkstat::DiscoveryCoverage) {
-    let search = find_artifacts(root);
+fn artifact_findings(
+    root: &Path,
+    cancellation: &bulkstat::ScanCancellation,
+) -> (Vec<FindingBuild>, u32, bulkstat::DiscoveryCoverage) {
+    let search = find_artifacts_cancellable(root, cancellation);
     // Preserve the declared ARTIFACTS order so output is stable before sorting.
     let findings = ARTIFACTS
         .iter()
@@ -512,14 +544,12 @@ fn artifact_findings(root: &Path) -> (Vec<FindingBuild>, u32, bulkstat::Discover
             let mut paths = Vec::new();
             let mut contributions = Vec::new();
             for path in search.hits.iter().filter(|(hit_name, _)| hit_name == name) {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
                 let scope = bulkstat::ScanScope::new(root).ok().map(|s| s.fresh());
-                let scanned = bulkstat::scan_dir_in_scope(
-                    &path.1,
-                    0,
-                    &bulkstat::ScanCancellation::never(),
-                    scope.as_ref(),
-                )
-                .unwrap_or_default();
+                let scanned = bulkstat::scan_dir_in_scope(&path.1, 0, cancellation, scope.as_ref())
+                    .unwrap_or_default();
                 size.logical = size.logical.saturating_add(scanned.size.logical);
                 size.allocated = size.allocated.saturating_add(scanned.size.allocated);
                 inaccessible = inaccessible.saturating_add(scanned.inaccessible);
@@ -565,7 +595,15 @@ struct ArtifactSearch {
 /// but not descended into, symlinks are never followed, and the `Library` tree and
 /// unrelated hidden directories are skipped to keep the walk fast and focused on
 /// project trees.
+#[cfg(test)]
 fn find_artifacts(root: &Path) -> ArtifactSearch {
+    find_artifacts_cancellable(root, &bulkstat::ScanCancellation::never())
+}
+
+fn find_artifacts_cancellable(
+    root: &Path,
+    cancellation: &bulkstat::ScanCancellation,
+) -> ArtifactSearch {
     let mut hits = Vec::new();
     let mut inaccessible = 0u32;
     let scan_scope = bulkstat::ScanScope::new(root).ok();
@@ -590,6 +628,9 @@ fn find_artifacts(root: &Path) -> ArtifactSearch {
     }
 
     while let Some((dir, depth)) = stack.pop() {
+        if cancellation.is_cancelled() {
+            break;
+        }
         if let (Some(policy), Ok(meta)) = (&scan_scope, std::fs::symlink_metadata(&dir)) {
             if !policy.accepts(&dir, &meta) {
                 scope.skipped_mounts = scope.skipped_mounts.saturating_add(1);
@@ -605,6 +646,9 @@ fn find_artifacts(root: &Path) -> ArtifactSearch {
             }
         };
         for entry in read {
+            if cancellation.is_cancelled() {
+                break;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -663,6 +707,19 @@ fn should_descend(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_reclaim_never_becomes_a_confident_empty_report() {
+        let root = test_root("cancelled_reclaim");
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[package]\nname='fixture'\n").unwrap();
+        std::fs::write(root.join("target/file"), b"fixture").unwrap();
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let cancellation = bulkstat::ScanCancellation::new(generation, 0);
+        assert!(report_with_home_cancellation(&root, None, &cancellation).is_none());
+        assert!(!report_with_home(&root, None).findings.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use std::fs;
 
     #[test]

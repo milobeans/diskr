@@ -2,9 +2,8 @@
 //!
 //! Instead of `readdir` + one `stat` per file (the usual pattern), this issues a
 //! single syscall that returns packed attributes for dozens of entries at once.
-//! On directories like ~/Library or node_modules that have thousands of small
-//! files, this is 3-10x faster than stat-per-file because each syscall has a
-//! fixed kernel-mode overhead that dominates when files are small.
+//! Batching reduces per-file kernel crossings. Actual throughput depends on
+//! the filesystem, tree shape and cache state; benchmark representative trees.
 //!
 //! Layout of a fully valid entry. Invalid attributes have no physical slot;
 //! the parser advances only over returned bits (PACK_INVAL_ATTRS is not used).
@@ -114,6 +113,7 @@ impl DiscoveryCoverage {
 pub struct ScanCancellation {
     generation: Arc<AtomicU64>,
     expected: u64,
+    clients: Option<Arc<Mutex<Vec<ScanCancellation>>>>,
 }
 
 impl ScanCancellation {
@@ -121,6 +121,7 @@ impl ScanCancellation {
         Self {
             generation,
             expected,
+            clients: None,
         }
     }
 
@@ -129,6 +130,13 @@ impl ScanCancellation {
     }
 
     pub fn is_cancelled(&self) -> bool {
+        if let Some(clients) = &self.clients {
+            return clients
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .all(Self::is_cancelled);
+        }
         self.generation.load(Ordering::Relaxed) != self.expected
     }
 }
@@ -163,7 +171,7 @@ pub fn scan_dir_with_cancellation(
     top_file_limit: usize,
     cancellation: &ScanCancellation,
 ) -> Option<DirScan> {
-    scan_dir_in_scope(root, top_file_limit, cancellation, None)
+    shared_scan_sync(root, top_file_limit, cancellation, None)
 }
 
 pub(crate) fn scan_dir_in_scope(
@@ -172,6 +180,14 @@ pub(crate) fn scan_dir_in_scope(
     cancellation: &ScanCancellation,
     scope: Option<&ScanScope>,
 ) -> Option<DirScan> {
+    if scope.is_none_or(|scope| scope.independent) {
+        return shared_scan_sync(
+            root,
+            top_file_limit,
+            cancellation,
+            scope.map(|scope| scope.context.policy),
+        );
+    }
     if cancellation.is_cancelled() {
         return None;
     }
@@ -218,9 +234,36 @@ pub fn scan_dir_async(
     root: PathBuf,
     top_file_limit: usize,
     cancellation: ScanCancellation,
+    interactive: bool,
     on_start: impl FnOnce() + Send + 'static,
     on_done: impl FnOnce(Option<DirScan>) + Send + 'static,
 ) {
+    let group = TaskGroup::new();
+    let task = group.spawn_promotable(move || {
+        shared_scan_async(
+            root,
+            top_file_limit,
+            cancellation,
+            None,
+            interactive,
+            on_start,
+            on_done,
+        )
+    });
+    if interactive {
+        task.promote();
+    }
+    group.arm();
+}
+
+fn scan_dir_async_unshared(
+    root: PathBuf,
+    top_file_limit: usize,
+    cancellation: ScanCancellation,
+    policy: Option<ScanPolicy>,
+    on_start: impl FnOnce() + Send + 'static,
+    on_done: impl FnOnce(Option<DirScan>) + Send + 'static,
+) -> crate::pool::Promotion {
     let result_state: Arc<Mutex<Option<Arc<WalkState>>>> = Arc::new(Mutex::new(None));
     let finish_state = Arc::clone(&result_state);
     let finish_cancellation = cancellation.clone();
@@ -238,7 +281,7 @@ pub fn scan_dir_async(
         on_done(Some(state.map(|state| state.finish()).unwrap_or_default()));
     });
     let walk_group = Arc::clone(&group);
-    group.spawn(move || {
+    let promotion = group.spawn_promotable(move || {
         if cancellation.is_cancelled() {
             return;
         }
@@ -264,7 +307,7 @@ pub fn scan_dir_async(
         }
         let policy_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let state = Arc::new(WalkState::new(
-            ScanPolicy::new(&policy_root, meta.dev()),
+            policy.unwrap_or_else(|| ScanPolicy::new(&policy_root, meta.dev())),
             top_file_limit,
             cancellation.clone(),
         ));
@@ -274,6 +317,292 @@ pub fn scan_dir_async(
         walk_task(root, state, walk_group);
     });
     group.arm();
+    promotion
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SharedScanKey {
+    root: PathBuf,
+    device: u64,
+    inode: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+    policy: ScanPolicy,
+    limit: usize,
+}
+
+type StartCallback = Box<dyn FnOnce() + Send>;
+type DoneCallback = Box<dyn FnOnce(Option<DirScan>) + Send>;
+type SharedRegistry = Mutex<HashMap<SharedScanKey, std::sync::Weak<SharedWalk>>>;
+
+#[derive(Default)]
+struct SharedCallbacks {
+    started: bool,
+    finished: bool,
+    subscribers: Vec<Arc<ScanSubscriber>>,
+}
+
+struct ScanSubscriber {
+    cancellation: ScanCancellation,
+    start: Mutex<Option<StartCallback>>,
+    done: Mutex<Option<DoneCallback>>,
+}
+
+impl ScanSubscriber {
+    fn start(&self) {
+        let mut start = recover_lock(&self.start);
+        if let Some(callback) = start.take() {
+            if !self.cancellation.is_cancelled() {
+                callback();
+            }
+        }
+    }
+
+    fn finish(&self, result: &Option<DirScan>) {
+        self.start();
+        let callback = recover_lock(&self.done).take();
+        if let Some(callback) = callback {
+            callback(if self.cancellation.is_cancelled() {
+                None
+            } else {
+                result.clone()
+            });
+        }
+    }
+}
+
+struct SharedWalk {
+    clients: Arc<Mutex<Vec<ScanCancellation>>>,
+    callbacks: Mutex<SharedCallbacks>,
+    promotion: Mutex<Option<crate::pool::Promotion>>,
+    interactive: std::sync::atomic::AtomicBool,
+}
+
+fn shared_registry() -> &'static SharedRegistry {
+    static REGISTRY: std::sync::OnceLock<SharedRegistry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn recover_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+impl SharedWalk {
+    fn new() -> Self {
+        Self {
+            clients: Arc::new(Mutex::new(Vec::new())),
+            callbacks: Mutex::new(SharedCallbacks::default()),
+            promotion: Mutex::new(None),
+            interactive: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn promote(&self) {
+        self.interactive.store(true, Ordering::Relaxed);
+        if let Some(promotion) = recover_lock(&self.promotion).clone() {
+            promotion.promote();
+        }
+    }
+
+    fn start(&self) {
+        let subscribers = {
+            let mut callbacks = recover_lock(&self.callbacks);
+            callbacks.started = true;
+            callbacks.subscribers.clone()
+        };
+        for subscriber in subscribers {
+            subscriber.start();
+        }
+    }
+
+    fn finish(&self) -> Vec<Arc<ScanSubscriber>> {
+        let mut callbacks = recover_lock(&self.callbacks);
+        callbacks.finished = true;
+        std::mem::take(&mut callbacks.subscribers)
+    }
+}
+
+pub(crate) fn invalidate_shared_scans(path: &Path) {
+    recover_lock(shared_registry())
+        .retain(|key, _| !key.root.starts_with(path) && !path.starts_with(&key.root));
+}
+
+pub(crate) fn prioritize_scan(path: &Path) {
+    let jobs: Vec<_> = recover_lock(shared_registry())
+        .iter()
+        .filter(|(key, _)| key.root == path)
+        .filter_map(|(_, job)| job.upgrade())
+        .collect();
+    for job in jobs {
+        job.promote();
+    }
+}
+
+fn shared_scan_sync(
+    root: &Path,
+    limit: usize,
+    cancellation: &ScanCancellation,
+    policy: Option<ScanPolicy>,
+) -> Option<DirScan> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    shared_scan_async(
+        root.to_path_buf(),
+        limit,
+        cancellation.clone(),
+        policy,
+        false,
+        || {},
+        move |result| {
+            let _ = tx.send(result);
+        },
+    );
+    loop {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        match rx.try_recv() {
+            Ok(result) => {
+                return if cancellation.is_cancelled() {
+                    None
+                } else {
+                    result
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if !crate::pool::help_once() {
+            match rx.recv_timeout(std::time::Duration::from_millis(2)) {
+                Ok(result) => {
+                    return if cancellation.is_cancelled() {
+                        None
+                    } else {
+                        result
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+}
+
+fn shared_scan_async(
+    root: PathBuf,
+    limit: usize,
+    cancellation: ScanCancellation,
+    policy: Option<ScanPolicy>,
+    interactive: bool,
+    on_start: impl FnOnce() + Send + 'static,
+    on_done: impl FnOnce(Option<DirScan>) + Send + 'static,
+) {
+    if cancellation.is_cancelled() {
+        on_done(None);
+        return;
+    }
+    let meta = match std::fs::symlink_metadata(&root) {
+        Ok(meta) if meta.is_dir() => meta,
+        _ => {
+            let promotion =
+                scan_dir_async_unshared(root, limit, cancellation, policy, on_start, on_done);
+            if interactive {
+                promotion.promote();
+            }
+            return;
+        }
+    };
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let policy = policy.unwrap_or_else(|| ScanPolicy::new(&canonical, meta.dev()));
+    let key = SharedScanKey {
+        root: root.clone(),
+        device: meta.dev(),
+        inode: meta.ino(),
+        modified: (meta.mtime(), meta.mtime_nsec()),
+        changed: (meta.ctime(), meta.ctime_nsec()),
+        policy,
+        limit,
+    };
+    let mut registry = recover_lock(shared_registry());
+    registry.retain(|_, job| job.strong_count() > 0);
+    let existing = registry
+        .get(&key)
+        .and_then(std::sync::Weak::upgrade)
+        .filter(|job| {
+            if recover_lock(&job.callbacks).finished {
+                return false;
+            }
+            let mut clients = recover_lock(&job.clients);
+            if clients.iter().all(ScanCancellation::is_cancelled) {
+                return false;
+            }
+            clients.push(cancellation.clone());
+            true
+        });
+    let leader = existing.is_none();
+    if leader && registry.len() >= 512 {
+        drop(registry);
+        let promotion =
+            scan_dir_async_unshared(root, limit, cancellation, Some(policy), on_start, on_done);
+        if interactive {
+            promotion.promote();
+        }
+        return;
+    }
+    let job = existing.unwrap_or_else(|| Arc::new(SharedWalk::new()));
+    registry.insert(key.clone(), Arc::downgrade(&job));
+    if leader {
+        recover_lock(&job.clients).push(cancellation.clone());
+    }
+    let subscriber = Arc::new(ScanSubscriber {
+        cancellation: cancellation.clone(),
+        start: Mutex::new(Some(Box::new(on_start))),
+        done: Mutex::new(Some(Box::new(on_done))),
+    });
+    let started = {
+        let mut callbacks = recover_lock(&job.callbacks);
+        callbacks.subscribers.push(Arc::clone(&subscriber));
+        callbacks.started
+    };
+    drop(registry);
+    if started {
+        subscriber.start();
+    }
+    if interactive {
+        job.promote();
+    }
+    if !leader {
+        return;
+    }
+    let mut shared_cancellation = ScanCancellation::never();
+    shared_cancellation.clients = Some(Arc::clone(&job.clients));
+    let start_job = Arc::clone(&job);
+    let finish_job = Arc::clone(&job);
+    let promotion = scan_dir_async_unshared(
+        root,
+        limit,
+        shared_cancellation,
+        Some(policy),
+        move || start_job.start(),
+        move |result| {
+            let mut registry = recover_lock(shared_registry());
+            let subscribers = finish_job.finish();
+            if registry
+                .get(&key)
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|current| Arc::ptr_eq(&current, &finish_job))
+            {
+                registry.remove(&key);
+            }
+            drop(registry);
+            for subscriber in subscribers {
+                subscriber.finish(&result);
+            }
+        },
+    );
+    *recover_lock(&job.promotion) = Some(promotion.clone());
+    if job.interactive.load(Ordering::Relaxed) {
+        promotion.promote();
+    }
 }
 
 /// Shared accumulator for one walk. Sizes and counters are relaxed atomics
@@ -389,12 +718,14 @@ struct ScanContext {
 #[derive(Clone)]
 pub(crate) struct ScanScope {
     context: Arc<ScanContext>,
+    independent: bool,
 }
 
 impl ScanScope {
     pub(crate) fn new(root: &Path) -> std::io::Result<Self> {
         let meta = std::fs::symlink_metadata(root)?;
         Ok(Self {
+            independent: false,
             context: Arc::new(ScanContext {
                 policy: ScanPolicy::new(root, meta.dev()),
                 seen_hard_links: Mutex::new(HashMap::new()),
@@ -403,6 +734,7 @@ impl ScanScope {
     }
     pub(crate) fn fresh(&self) -> Self {
         Self {
+            independent: true,
             context: Arc::new(ScanContext {
                 policy: self.context.policy,
                 seen_hard_links: Mutex::new(HashMap::new()),
@@ -430,7 +762,7 @@ impl ScanScope {
 
 type FileIdentity = (u64, u64);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ScanPolicy {
     root_dev: u64,
     /// Device of the APFS Data volume (`/System/Volumes/Data`) when it resolves.
@@ -818,11 +1150,11 @@ fn parse_bulk_batch(
                         partial.inaccessible = partial.inaccessible.saturating_add(1);
                         continue;
                     };
-                    push_largest_file(
+                    push_largest_file_lazy(
                         &mut partial.largest_files,
                         top_file_limit,
-                        dir.join(OsStr::from_bytes(name_bytes)),
                         size,
+                        || dir.join(OsStr::from_bytes(name_bytes)),
                     );
                 }
             }
@@ -975,6 +1307,29 @@ struct FileCandidate {
     path: PathBuf,
 }
 
+fn candidate_may_enter(
+    heap: &BinaryHeap<Reverse<FileCandidate>>,
+    limit: usize,
+    size: SizeInfo,
+) -> bool {
+    limit > 0
+        && (heap.len() < limit
+            || heap.peek().is_none_or(|Reverse(smallest)| {
+                (size.allocated, size.logical) >= (smallest.allocated, smallest.logical)
+            }))
+}
+
+fn push_largest_file_lazy(
+    heap: &mut BinaryHeap<Reverse<FileCandidate>>,
+    limit: usize,
+    size: SizeInfo,
+    path: impl FnOnce() -> PathBuf,
+) {
+    if candidate_may_enter(heap, limit, size) {
+        push_largest_file(heap, limit, path(), size);
+    }
+}
+
 fn push_largest_file(
     heap: &mut BinaryHeap<Reverse<FileCandidate>>,
     limit: usize,
@@ -1098,6 +1453,413 @@ fn read_attr_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn shared_job_for(root: &Path) -> Arc<SharedWalk> {
+        recover_lock(shared_registry())
+            .iter()
+            .find(|(key, _)| key.root == root)
+            .and_then(|(_, job)| job.upgrade())
+            .expect("registered shared walk")
+    }
+
+    #[test]
+    #[ignore = "on-disk scan and path-construction performance protocol"]
+    fn benchmark_shared_scan_and_heap_paths() {
+        use std::time::Instant;
+        let root = test_root("scan_performance");
+        std::fs::create_dir_all(&root).unwrap();
+        for directory in 0..100 {
+            let child = root.join(format!("directory-{directory:03}"));
+            std::fs::create_dir(&child).unwrap();
+            for file in 0..100 {
+                std::fs::write(child.join(format!("file-{file:03}")), b"fixture").unwrap();
+            }
+        }
+        let run_raw = |root: PathBuf| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            scan_dir_async_unshared(
+                root,
+                0,
+                ScanCancellation::never(),
+                None,
+                || {},
+                move |scan| {
+                    tx.send(scan.unwrap()).unwrap();
+                },
+            );
+            rx.recv_timeout(Duration::from_secs(30)).unwrap()
+        };
+        let expected = run_raw(root.clone());
+        assert_eq!(expected.size.logical, 70_000);
+        let mut raw_times = Vec::new();
+        let mut broker_times = Vec::new();
+        let mut raw_overlap_times = Vec::new();
+        let mut shared_overlap_times = Vec::new();
+        for _ in 0..12 {
+            let started = Instant::now();
+            assert_eq!(run_raw(root.clone()), expected);
+            raw_times.push(started.elapsed());
+            let started = Instant::now();
+            assert_eq!(scan_dir(&root, 0), expected);
+            broker_times.push(started.elapsed());
+
+            let started = Instant::now();
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..4)
+                    .map(|_| scope.spawn(|| run_raw(root.clone())))
+                    .collect();
+                for worker in workers {
+                    assert_eq!(worker.join().unwrap(), expected);
+                }
+            });
+            raw_overlap_times.push(started.elapsed());
+
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let started = Instant::now();
+            let first_tx = tx.clone();
+            shared_scan_async(
+                root.clone(),
+                0,
+                ScanCancellation::never(),
+                None,
+                false,
+                move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                },
+                move |scan| {
+                    first_tx.send(scan.unwrap()).unwrap();
+                },
+            );
+            started_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            for _ in 0..3 {
+                let tx = tx.clone();
+                shared_scan_async(
+                    root.clone(),
+                    0,
+                    ScanCancellation::never(),
+                    None,
+                    false,
+                    || {},
+                    move |scan| {
+                        tx.send(scan.unwrap()).unwrap();
+                    },
+                );
+            }
+            assert_eq!(recover_lock(&shared_job_for(&root).clients).len(), 4);
+            release_tx.send(()).unwrap();
+            for _ in 0..4 {
+                assert_eq!(rx.recv_timeout(Duration::from_secs(30)).unwrap(), expected);
+            }
+            shared_overlap_times.push(started.elapsed());
+        }
+        for (label, mut times) in [
+            ("raw_single", raw_times),
+            ("broker_single", broker_times),
+            ("raw_four", raw_overlap_times),
+            ("shared_four", shared_overlap_times),
+        ] {
+            times.sort_unstable();
+            eprintln!(
+                "{label}: median_us={} p95_us={} samples={}",
+                times[times.len() / 2].as_micros(),
+                times[times.len() - 1].as_micros(),
+                times.len()
+            );
+        }
+
+        let parent = root.join("long-path-component-for-a-rejected-small-file");
+        for lazy in [false, true] {
+            let mut times = Vec::new();
+            for _ in 0..12 {
+                let mut heap = BinaryHeap::new();
+                push_largest_file(&mut heap, 1, root.join("largest"), SizeInfo::new(100, 8192));
+                let started = Instant::now();
+                for _ in 0..200_000 {
+                    let size = std::hint::black_box(SizeInfo::new(1, 4096));
+                    if lazy {
+                        push_largest_file_lazy(&mut heap, 1, size, || parent.join("file"));
+                    } else {
+                        push_largest_file(&mut heap, 1, parent.join("file"), size);
+                    }
+                }
+                times.push(started.elapsed());
+                assert_eq!(heap.len(), 1);
+            }
+            times.sort_unstable();
+            eprintln!(
+                "heap_lazy={lazy}: median_us={} p95_us={}",
+                times[6].as_micros(),
+                times[11].as_micros()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_scans_share_one_walk_but_cancel_independently() {
+        let root = test_root("shared_scan_clients");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), b"fixture").unwrap();
+        let generation = Arc::new(AtomicU64::new(0));
+        let first = ScanCancellation::new(Arc::clone(&generation), 0);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        shared_scan_async(
+            root.clone(),
+            0,
+            first,
+            None,
+            false,
+            move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            },
+            move |result| {
+                first_tx.send(result).unwrap();
+            },
+        );
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let initial_job = shared_job_for(&root);
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        shared_scan_async(
+            root.clone(),
+            0,
+            ScanCancellation::never(),
+            None,
+            true,
+            || {},
+            move |result| {
+                second_tx.send(result).unwrap();
+            },
+        );
+        assert!(Arc::ptr_eq(&initial_job, &shared_job_for(&root)));
+        assert_eq!(recover_lock(&initial_job.clients).len(), 2);
+        assert!(initial_job.interactive.load(Ordering::Relaxed));
+        generation.fetch_add(1, Ordering::Relaxed);
+        release_tx.send(()).unwrap();
+        assert!(first_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            second_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .size
+                .logical,
+            7
+        );
+        assert!(!recover_lock(shared_registry())
+            .keys()
+            .any(|key| key.root == root));
+        std::fs::write(root.join("file"), b"longer fixture").unwrap();
+        assert_eq!(scan_dir(&root, 0).size.logical, 14);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_scan_keys_separate_policy_limits_and_invalidated_work() {
+        let root = test_root("shared_scan_policy");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), b"fixture").unwrap();
+        let device = std::fs::symlink_metadata(&root).unwrap().dev();
+        let policy = ScanPolicy::new(&root, device);
+        let mut alternate_policy = policy;
+        alternate_policy.skip_data_volume = !policy.skip_data_volume;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        for (limit, policy) in [(0, policy), (1, policy), (0, alternate_policy)] {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            releases.push(release_tx);
+            let done_tx = done_tx.clone();
+            shared_scan_async(
+                root.clone(),
+                limit,
+                ScanCancellation::never(),
+                Some(policy),
+                false,
+                move || {
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                },
+                move |result| {
+                    done_tx.send(result).unwrap();
+                },
+            );
+        }
+        assert_eq!(
+            recover_lock(shared_registry())
+                .keys()
+                .filter(|key| key.root == root)
+                .count(),
+            3
+        );
+        let old_jobs: Vec<_> = recover_lock(shared_registry())
+            .iter()
+            .filter(|(key, _)| key.root == root)
+            .filter_map(|(_, job)| job.upgrade())
+            .collect();
+        invalidate_shared_scans(&root.join("file"));
+        assert!(!recover_lock(shared_registry())
+            .keys()
+            .any(|key| key.root == root));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        releases.push(release_tx);
+        shared_scan_async(
+            root.clone(),
+            0,
+            ScanCancellation::never(),
+            Some(policy),
+            true,
+            move || {
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            },
+            move |result| {
+                done_tx.send(result).unwrap();
+            },
+        );
+        let replacement = shared_job_for(&root);
+        assert!(old_jobs.iter().all(|old| !Arc::ptr_eq(old, &replacement)));
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for _ in 0..4 {
+            assert_eq!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .size
+                    .logical,
+                7
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_job_cannot_absorb_or_remove_a_new_live_request() {
+        let root = test_root("shared_scan_replace_cancelled");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), b"fixture").unwrap();
+        let generation = Arc::new(AtomicU64::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_old_tx, release_old_rx) = std::sync::mpsc::channel();
+        let (old_tx, old_rx) = std::sync::mpsc::channel();
+        shared_scan_async(
+            root.clone(),
+            0,
+            ScanCancellation::new(Arc::clone(&generation), 0),
+            None,
+            false,
+            move || {
+                started_tx.send(()).unwrap();
+                release_old_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            },
+            move |result| {
+                old_tx.send(result).unwrap();
+            },
+        );
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let old = shared_job_for(&root);
+        generation.fetch_add(1, Ordering::Relaxed);
+        let (release_new_tx, release_new_rx) = std::sync::mpsc::channel();
+        let (new_tx, new_rx) = std::sync::mpsc::channel();
+        shared_scan_async(
+            root.clone(),
+            0,
+            ScanCancellation::never(),
+            None,
+            true,
+            move || {
+                release_new_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            },
+            move |result| {
+                new_tx.send(result).unwrap();
+            },
+        );
+        let new = shared_job_for(&root);
+        assert!(!Arc::ptr_eq(&old, &new));
+        release_old_tx.send(()).unwrap();
+        assert!(old_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_none());
+        assert!(Arc::ptr_eq(&new, &shared_job_for(&root)));
+        release_new_tx.send(()).unwrap();
+        assert_eq!(
+            new_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .size
+                .logical,
+            7
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_subscriber_orders_start_before_done_even_when_completion_races() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let start_events = Arc::clone(&events);
+        let done_events = Arc::clone(&events);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let subscriber = Arc::new(ScanSubscriber {
+            cancellation: ScanCancellation::never(),
+            start: Mutex::new(Some(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                recover_lock(&start_events).push("start");
+            }))),
+            done: Mutex::new(Some(Box::new(move |_| {
+                recover_lock(&done_events).push("done");
+            }))),
+        });
+        let start = Arc::clone(&subscriber);
+        let start_thread = std::thread::spawn(move || start.start());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let done_thread = std::thread::spawn(move || subscriber.finish(&Some(DirScan::default())));
+        release_tx.send(()).unwrap();
+        start_thread.join().unwrap();
+        done_thread.join().unwrap();
+        assert_eq!(*recover_lock(&events), ["start", "done"]);
+    }
+
+    #[test]
+    fn heap_rejection_skips_smaller_sizes_but_keeps_path_ties_comparable() {
+        let mut heap = BinaryHeap::new();
+        push_largest_file(
+            &mut heap,
+            1,
+            PathBuf::from("first"),
+            SizeInfo::new(12, 4096),
+        );
+        assert!(!candidate_may_enter(&heap, 1, SizeInfo::new(8, 4096)));
+        assert!(!candidate_may_enter(&heap, 1, SizeInfo::new(100, 0)));
+        assert!(candidate_may_enter(&heap, 1, SizeInfo::new(12, 4096)));
+        assert!(candidate_may_enter(&heap, 1, SizeInfo::new(8, 8192)));
+        assert!(!candidate_may_enter(&heap, 0, SizeInfo::new(8, 8192)));
+        let builds = std::cell::Cell::new(0);
+        for _ in 0..10_000 {
+            push_largest_file_lazy(&mut heap, 1, SizeInfo::new(8, 4096), || {
+                builds.set(builds.get() + 1);
+                PathBuf::from("rejected")
+            });
+        }
+        assert_eq!(builds.get(), 0);
+        push_largest_file_lazy(&mut heap, 1, SizeInfo::new(12, 4096), || {
+            builds.set(builds.get() + 1);
+            PathBuf::from("path tie")
+        });
+        assert_eq!(builds.get(), 1);
+    }
     use std::fs;
     use std::os::unix::fs::symlink;
 

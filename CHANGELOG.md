@@ -6,6 +6,25 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- JSON reports share a versioned schema with canonical root/scope, completeness,
+  warnings, elapsed time and numeric semantics while retaining report fields.
+  `--strict` exits 2 after printing partial reports; default status is unchanged.
+- `--min-size` filters Top Files, reclaim and package rows; `--class` filters
+  reclaim categories. Unknown or limited footprints remain visible and filters
+  do not change underlying totals or completeness.
+
+### Changed
+
+- Compatible independent scans share bounded in-flight work with per-caller
+  cancellation and fresh root/identity/policy checks. Interactive roots can be
+  promoted ahead of background work without adding scanner workers; shared
+  hardlink-accounting scopes remain isolated.
+- Top Files avoids constructing full paths for size-rejected bulk records.
+  Reclaim discovery and sizing are cancellable with Esc/Ctrl+C and on quit;
+  cancelled scans do not publish confident empty results.
+
 ## [0.1.81] - 2026-10-22
 
 ### Added

@@ -6,7 +6,7 @@ A fast, macOS-native terminal file explorer and disk analyzer built in Rust.
 
 Most disk usage tools show you a tree of sizes and leave you to figure out the rest. diskr goes further: it tells you *what changed*, *what's reclaimable*, and *why your free space doesn't match what Finder says*.
 
-**Fast, lazy scanning.** Directory sizing uses `getattrlistbulk(2)`, a macOS syscall that returns attributes for many entries in a single kernel crossing. Where the typical `readdir` + `stat` pattern makes one syscall per file, diskr batches them -- 3-10x faster on directories with thousands of small files like `node_modules` or `~/Library/Caches`. Scans run on a thread pool and are started in small batches around the current selection, so opening `/` or another broad directory does not immediately walk every child subtree. Press `S` when you want to fill in every missing or stale visible directory size without refreshing the directory or invalidating known fresh sizes. Cached sizes persist between runs; on relaunch diskr replays macOS FSEvents since the previous session to revalidate only the directories that actually changed, so unchanged trees stay fresh without a rescan.
+**Fast, lazy scanning.** Directory sizing uses `getattrlistbulk(2)`, a macOS syscall that returns attributes for many entries in a single kernel crossing. Where the typical `readdir` + `stat` pattern makes one syscall per file, diskr batches them. Performance depends on the filesystem, tree shape and cache state; no fixed speedup is promised. Scans run on a thread pool and are started in small batches around the current selection, so opening `/` or another broad directory does not immediately walk every child subtree. Press `S` when you want to fill in every missing or stale visible directory size without refreshing the directory or invalidating known fresh sizes. Cached sizes persist between runs; on relaunch diskr replays macOS FSEvents since the previous session to revalidate only the directories that actually changed, so unchanged trees stay fresh without a rescan.
 
 **Allocated vs. apparent size.** APFS clones, sparse files, and compressed files mean logical size and on-disk size often diverge. diskr tracks both, sorts by allocated size, and shows apparent size when they differ. This is the number you actually care about when reclaiming space.
 
@@ -108,6 +108,30 @@ diskr ~/Downloads   # starts in a specific directory
 ### CLI reports
 
 All report modes support `--json` for scripting and automation.
+
+JSON reports use `schema_version: 1` and include a common `report`, `root`,
+`root_identity`, `scope`, `coverage`, `warnings`, `timing` and
+`numeric_semantics` contract while retaining earlier report-specific fields.
+`coverage.complete` is false for unreadable/skipped data, utility failures,
+unknown dependency counts, or incomplete/limited package footprints. Explicit
+discovery depth and policy exclusions remain visible in scope metadata.
+Byte counts are unsigned 64-bit JSON integers; use an integer-capable parser
+when values may exceed JavaScript's safe-number range. Signed byte deltas are
+decimal strings, timestamps are Unix seconds, and elapsed time is monotonic
+milliseconds. `root_identity` is a reversible Unix path encoding; `root` is
+the human-readable path.
+
+Default report exit status remains 0 for usable partial reports and 1 for
+errors. `--strict` prints the report, then exits 2 if incomplete, with its
+diagnostic on stderr. It does not undo a requested `--save`. JSON stdout stays
+parseable and contains no progress or error prose; closed output pipes still
+finish normally.
+
+`--min-size SIZE` filters allocated-size rows in `--top`, `--reclaim` and
+`--packages`; `--class safe|regenerable|risky` filters reclaim categories.
+Unknown, partial or limited-scope sizes are retained. Filters affect rows, not
+scan totals or completeness; JSON includes filter settings and counts of removed rows.
+
 Follow-up commands printed by reports quote paths for macOS `zsh`; paths
 containing control or non-UTF-8 bytes use `$'\\xNN'` byte escapes.
 
@@ -132,7 +156,7 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | --- | --- |
 | ? | Show full keyboard help |
 | q | Quit |
-| Esc, Ctrl+C | Focus the Files pane, or close a modal and clear search/filter |
+| Esc, Ctrl+C | Cancel a focused reclaim scan, focus Files, close a modal or clear a filter |
 | Up/Down, j/k | Move selection, or scroll keyboard help and detail drawers |
 | PageUp/PageDown | Move by a page, including in keyboard help and detail drawers |
 | Home/End | Jump to first or last item in lists, help, and detail drawers |
@@ -194,7 +218,30 @@ directories or entries that cannot be read are flagged as lower bounds rather
 than counted as zero. Human terminal output escapes control characters from
 filenames and external tools; JSON retains normal structured escaping.
 
-The reclaimable-space detector runs two passes: a fixed-location pass that checks well-known paths (`~/Library/Caches`, Xcode DerivedData, Homebrew, Docker, etc.) and a bounded recursive pass that finds repeated build-artifact directories (`node_modules`, `target`, `.venv`, `__pycache__`, `.next`, `.gradle`). Both use the same fast bulk scanner for sizing.
+The reclaimable-space detector runs two passes: a fixed-location pass that checks well-known paths (`~/Library/Caches`, Xcode DerivedData, Homebrew, Docker, etc.) and a bounded recursive pass that finds repeated build-artifact directories (`node_modules`, `target`, `.venv`, `__pycache__`, `.next`, `.gradle`). Both use the same fast bulk scanner for sizing. Esc/Ctrl+C cancels a focused reclaim scan; quit also cancels its read-only work. Cancelled findings are not published as a complete report.
+
+Independent scans of the same root, identity, policy, freshness and requested
+Top Files capacity share in-flight work. Each subscriber retains its own
+cancellation; one cancelled caller cannot cancel another. Completed broker
+results are not retained as a cache, and refresh/mutation invalidates matching
+in-flight registrations. History's shared hardlink-accounting scopes remain
+separate. Interactive queued roots can be promoted without increasing worker
+count; descendants retain the pool's locality-aware traversal.
+
+Repeatable optimized performance checks (temporary fixtures only):
+
+```sh
+cargo test --release --locked benchmark_shared_scan_and_heap_paths -- --ignored --nocapture
+cargo test --release --locked benchmark_package_viewport_frames -- --ignored --nocapture
+```
+
+The scan check creates 10,000 small files, warms the fixture, and reports
+median/p95 wall time over 12 samples for direct versus brokered scans, four
+independent versus shared requests, and eager versus size-gated Top Files path
+construction. Its p95 is the largest sample (nearest-rank percentile). It is a
+warm-cache local comparison, not a cold-disk or universal throughput claim.
+The viewport check reports frame latency and allocation counts at a fixed
+terminal size. Neither benchmark enforces machine-dependent timing thresholds.
 
 Artifact classifications require supporting project/environment markers; a name
 such as `target` alone is not a cleanup recommendation. Simulator devices and

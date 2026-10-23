@@ -136,6 +136,41 @@ fn try_pop_job() -> Option<Job> {
     find_job(pool, WORKER_INDEX.with(|cell| cell.get()))
 }
 
+pub(crate) fn help_once() -> bool {
+    if let Some(job) = try_pop_job() {
+        run_job(job);
+        true
+    } else {
+        false
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Promotion {
+    job: Arc<Mutex<Option<Job>>>,
+    promoted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Promotion {
+    fn run(&self) {
+        let job = lock(&self.job).take();
+        if let Some(job) = job {
+            job();
+        }
+    }
+
+    pub(crate) fn promote(&self) {
+        if self.promoted.swap(true, Ordering::SeqCst) || lock(&self.job).is_none() {
+            return;
+        }
+        let task = self.clone();
+        let pool = pool();
+        lock(&pool.injector).push_front(Box::new(move || task.run()));
+        let _guard = lock(&pool.sleep);
+        pool.available.notify_one();
+    }
+}
+
 /// Pushes a batch under one queue lock: a pool worker keeps its tasks on
 /// its own deque, external threads go through the shared injector.
 fn push_jobs(jobs: impl IntoIterator<Item = Job>) {
@@ -211,6 +246,24 @@ impl TaskGroup {
             let _guard = guard;
             job();
         }) as Job]);
+    }
+
+    pub(crate) fn spawn_promotable(
+        self: &Arc<Self>,
+        job: impl FnOnce() + Send + 'static,
+    ) -> Promotion {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        let guard = FinishGuard(Arc::clone(self));
+        let promotion = Promotion {
+            job: Arc::new(Mutex::new(Some(Box::new(move || {
+                let _guard = guard;
+                job();
+            })))),
+            promoted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let task = promotion.clone();
+        push_jobs([Box::new(move || task.run()) as Job]);
+        promotion
     }
 
     /// Spawns a batch of tasks with a single queue lock acquisition.
@@ -471,5 +524,20 @@ mod tests {
         let seen = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(seen, 16);
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn promoting_a_queued_task_never_runs_it_twice() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let task_count = Arc::clone(&count);
+        let group = TaskGroup::new();
+        let promotion = group.spawn_promotable(move || {
+            task_count.fetch_add(1, Ordering::SeqCst);
+        });
+        for _ in 0..100 {
+            promotion.promote();
+        }
+        group.wait();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

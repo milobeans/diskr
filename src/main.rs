@@ -39,6 +39,48 @@ use terminal_text::{InputEdit, SafePath};
 thread_local! {
     static CLI_OUTPUT: RefCell<io::BufWriter<io::Stdout>> =
         RefCell::new(io::BufWriter::new(io::stdout()));
+    static REPORT_CONTEXT: RefCell<ReportContext> = RefCell::new(ReportContext::default());
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReportOptions {
+    strict: bool,
+    min_bytes: u64,
+    class: Option<reclaim::Reclaimability>,
+}
+
+struct ReportContext {
+    options: ReportOptions,
+    started: std::time::Instant,
+    complete: bool,
+}
+
+impl Default for ReportContext {
+    fn default() -> Self {
+        Self {
+            options: ReportOptions::default(),
+            started: std::time::Instant::now(),
+            complete: true,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IncompleteReport;
+impl fmt::Display for IncompleteReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .write_str("report is incomplete; --strict requires complete measurements (exit 2)")
+    }
+}
+impl std::error::Error for IncompleteReport {}
+
+fn report_options() -> ReportOptions {
+    REPORT_CONTEXT.with(|context| context.borrow().options)
+}
+
+fn note_report_completeness(complete: bool) {
+    REPORT_CONTEXT.with(|context| context.borrow_mut().complete &= complete);
 }
 
 fn write_cli(args: fmt::Arguments<'_>) -> io::Result<()> {
@@ -78,12 +120,27 @@ fn main() {
             return;
         }
         eprintln!("error: {}", terminal_text::sanitize(&format!("{err:#}")));
-        std::process::exit(1);
+        std::process::exit(if err.downcast_ref::<IncompleteReport>().is_some() {
+            2
+        } else {
+            1
+        });
     }
 }
 
 fn run_main() -> Result<()> {
-    let result = match parse_args(std::env::args_os().skip(1))? {
+    let (action, options) = match parse_args(std::env::args_os().skip(1))? {
+        CliAction::Configured { action, options } => (*action, options),
+        action => (action, ReportOptions::default()),
+    };
+    REPORT_CONTEXT.with(|context| {
+        *context.borrow_mut() = ReportContext {
+            options,
+            ..ReportContext::default()
+        }
+    });
+    let result = match action {
+        CliAction::Configured { .. } => bail!("nested report configuration is unsupported"),
         CliAction::Help => print_help(),
         CliAction::Version => {
             cli_println!("diskr {}", env!("CARGO_PKG_VERSION"));
@@ -104,6 +161,9 @@ fn run_main() -> Result<()> {
     };
     result?;
     flush_cli()?;
+    if options.strict && !REPORT_CONTEXT.with(|context| context.borrow().complete) {
+        return Err(IncompleteReport.into());
+    }
     Ok(())
 }
 
@@ -174,6 +234,10 @@ fn shell_quote_path(path: &Path) -> String {
 }
 
 enum CliAction {
+    Configured {
+        action: Box<CliAction>,
+        options: ReportOptions,
+    },
     Run(PathBuf),
     Top {
         path: PathBuf,
@@ -222,6 +286,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
     let mut confirmed = false;
     let mut json = false;
     let mut separator_seen = false;
+    let mut options = ReportOptions::default();
 
     while let Some(arg) = args.next() {
         if separator_seen {
@@ -231,6 +296,22 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
 
         let arg_text = arg.to_string_lossy().into_owned();
         match arg_text.as_str() {
+            "--strict" => options.strict = true,
+            "--min-size" => {
+                let value = args.next().context("--min-size requires a byte size")?;
+                options.min_bytes = space::parse_byte_size(&value.to_string_lossy())?;
+            }
+            "--class" => {
+                let value = args
+                    .next()
+                    .context("--class requires safe, regenerable or risky")?;
+                options.class = Some(match value.to_str() {
+                    Some("safe") => reclaim::Reclaimability::Safe,
+                    Some("regenerable") => reclaim::Reclaimability::Regenerable,
+                    Some("risky") => reclaim::Reclaimability::Risky,
+                    _ => bail!("--class requires safe, regenerable or risky"),
+                });
+            }
             "-h" | "--help" => return Ok(CliAction::Help),
             "-V" | "--version" => return Ok(CliAction::Version),
             "--" => {
@@ -313,7 +394,16 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
         bail!("choose only one of --top, --reclaim, --save, --diff, --space, --packages, or --thin-snapshots");
     }
 
-    match top_limit {
+    if options.strict && (mode_count == 0 || thin_snapshots.is_some()) {
+        bail!("--strict requires a report mode");
+    }
+    if options.min_bytes > 0 && top_limit.is_none() && !reclaim_report && !packages_report {
+        bail!("--min-size requires --top, --reclaim or --packages");
+    }
+    if options.class.is_some() && !reclaim_report {
+        bail!("--class requires --reclaim");
+    }
+    let action: Result<CliAction> = match top_limit {
         Some(limit) => Ok(CliAction::Top {
             path: path.unwrap_or_else(dirs_home),
             limit,
@@ -345,7 +435,16 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
             confirmed,
         }),
         None => Ok(CliAction::Run(path.unwrap_or_else(dirs_home))),
-    }
+    };
+    let action = action?;
+    Ok(if options == ReportOptions::default() {
+        action
+    } else {
+        CliAction::Configured {
+            action: Box::new(action),
+            options,
+        }
+    })
 }
 
 fn set_cli_path(path: &mut Option<PathBuf>, value: OsString) -> Result<()> {
@@ -383,6 +482,11 @@ Usage:
   diskr --packages [--json] [PATH]
   diskr --thin-snapshots SIZE [--yes] [PATH]
 
+Report options:
+  --strict             Exit 2 after printing an incomplete report (default: 0)
+  --min-size SIZE      Filter rows in --top, --reclaim or --packages
+  --class CLASS        Filter --reclaim: safe, regenerable or risky
+
 Terminal preferences:
   DISKR_THEME=dark|light|high-contrast|mono
   DISKR_REDUCED_MOTION=1; DISKR_ASCII=1; NO_COLOR selects monochrome.
@@ -404,10 +508,81 @@ fn print_key_help() -> Result<()> {
     Ok(())
 }
 
+fn emit_report(
+    kind: &str,
+    root: &Path,
+    mut value: serde_json::Value,
+    complete: bool,
+    warnings: Vec<String>,
+) -> Result<()> {
+    note_report_completeness(complete);
+    value["schema_version"] = serde_json::json!(1);
+    value["report"] = serde_json::json!(kind);
+    value["root"] = serde_json::json!(root.to_string_lossy());
+    value["root_identity"] = serde_json::json!(state::encode_path(root));
+    if !value["scope"].is_object() {
+        value["scope"] = serde_json::json!({});
+    }
+    value["scope"]["root"] = serde_json::json!(root.to_string_lossy());
+    if !value["coverage"].is_object() {
+        value["coverage"] = serde_json::json!({
+            "inaccessible": value["inaccessible"].as_u64().unwrap_or(0),
+            "skipped_mounts": value["skipped_mounts"].as_u64().unwrap_or(0),
+        });
+    }
+    value["coverage"]["complete"] = serde_json::json!(complete);
+    value["coverage"]["status"] = serde_json::json!(if complete { "complete" } else { "partial" });
+    value["warnings"] = serde_json::json!(warnings);
+    let elapsed = REPORT_CONTEXT.with(|context| {
+        context
+            .borrow()
+            .started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    });
+    value["timing"] = serde_json::json!({"elapsed_ms": elapsed});
+    value["numeric_semantics"] = serde_json::json!({"bytes": "unsigned 64-bit integer byte counts", "signed_deltas": "base-10 signed integer strings, no floating-point conversion", "timestamps": "Unix epoch seconds", "elapsed_ms": "monotonic elapsed milliseconds"});
+    let options = report_options();
+    value["filters"] = serde_json::json!({"min_allocated_bytes": options.min_bytes, "class": options.class.map(|class| class.label())});
+    value["scope"]["totals"] =
+        serde_json::json!("unfiltered requested scope; filters affect rows only");
+    cli_println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn scan_warnings(inaccessible: u32, skipped_mounts: u32) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if inaccessible > 0 {
+        warnings.push(format!(
+            "{inaccessible} unreadable paths; measurements are lower bounds"
+        ));
+    }
+    if skipped_mounts > 0 {
+        warnings.push(format!("{skipped_mounts} mounted filesystems skipped"));
+    }
+    warnings
+}
+
+fn print_filter_notice() -> Result<()> {
+    let options = report_options();
+    if options.min_bytes > 0 || options.class.is_some() {
+        cli_println!("Row filters are active; totals and completeness describe the unfiltered scan. Unknown/partial sizes remain visible.");
+    }
+    Ok(())
+}
+
 fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
     let path = canonical_dir(path)?;
 
-    let scan = bulkstat::scan_dir(&path, limit);
+    let mut scan = bulkstat::scan_dir(&path, limit);
+    let complete = scan.inaccessible == 0 && scan.skipped_mounts == 0;
+    let warnings = scan_warnings(scan.inaccessible, scan.skipped_mounts);
+    note_report_completeness(complete);
+    let min_bytes = report_options().min_bytes;
+    let unfiltered_count = scan.largest_files.len();
+    scan.largest_files
+        .retain(|file| file.size.allocated >= min_bytes);
     if json {
         let files: Vec<_> = scan
             .largest_files
@@ -428,9 +603,10 @@ fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
             "inaccessible": scan.inaccessible,
             "skipped_mounts": scan.skipped_mounts,
             "files": files,
+            "filtered_out": unfiltered_count - scan.largest_files.len(),
+            "scope": {"policy": "same selected filesystem; regular-file content; no symlink traversal"},
         });
-        cli_println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
+        return emit_report("top", &path, report, complete, warnings);
     }
 
     cli_println!(
@@ -455,8 +631,16 @@ fn print_top(path: PathBuf, limit: usize, json: bool) -> Result<()> {
             scan.skipped_mounts
         );
     }
+    print_filter_notice()?;
     if scan.largest_files.is_empty() {
-        cli_println!("No regular files found.");
+        cli_println!(
+            "{}",
+            if unfiltered_count > 0 {
+                "No regular files match the row filter."
+            } else {
+                "No regular files found."
+            }
+        );
         return Ok(());
     }
     for (index, file) in scan.largest_files.iter().enumerate() {
@@ -494,7 +678,18 @@ fn reclaim_size_label(finding: &reclaim::Finding) -> String {
 fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
     let path = canonical_dir(path)?;
 
-    let report = reclaim::report(&path);
+    let mut report = reclaim::report(&path);
+    let complete = report.inaccessible == 0 && report.skipped_mounts == 0;
+    let warnings = scan_warnings(report.inaccessible, report.skipped_mounts);
+    note_report_completeness(complete);
+    let options = report_options();
+    let unfiltered_count = report.findings.len();
+    report.findings.retain(|finding| {
+        options.class.is_none_or(|class| finding.class == class)
+            && (finding.size.allocated >= options.min_bytes
+                || finding.inaccessible > 0
+                || finding.skipped_mounts > 0)
+    });
     if json {
         let findings: Vec<_> = report
             .findings
@@ -528,12 +723,13 @@ fn print_reclaim(path: PathBuf, json: bool) -> Result<()> {
             "scope": report.scope.json(),
             "measurement": "candidate allocated bytes, not guaranteed freed space",
             "estimated_freed_bytes": null,
+            "filtered_out": unfiltered_count - report.findings.len(),
         });
-        cli_println!("{}", serde_json::to_string_pretty(&value)?);
-        return Ok(());
+        return emit_report("reclaim", &path, value, complete, warnings);
     }
 
     cli_println!("Cleanup candidates under {}", SafePath(&report.root));
+    print_filter_notice()?;
     cli_println!(
         "Total: {} disk / {} apparent",
         human(report.total.allocated),
@@ -585,6 +781,9 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
     let path = canonical_dir(path)?;
     let record = history::save(&path)?;
     let total = record.total();
+    let complete = record.inaccessible() == 0 && record.skipped_mounts() == 0;
+    let warnings = scan_warnings(record.inaccessible(), record.skipped_mounts());
+    note_report_completeness(complete);
     if json {
         let children: Vec<_> = record
             .children
@@ -595,6 +794,8 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
                     "is_dir": child.is_dir,
                     "logical": child.size.logical,
                     "allocated": child.size.allocated,
+                    "inaccessible": child.inaccessible,
+                    "skipped_mounts": child.skipped_mounts,
                 })
             })
             .collect();
@@ -604,10 +805,11 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
             "total_logical": total.logical,
             "total_allocated": total.allocated,
             "inaccessible": record.inaccessible(),
+            "skipped_mounts": record.skipped_mounts(),
+            "scope": {"policy": "root children measured on the selected filesystem; hardlinks deduplicated; no symlink traversal"},
             "children": children,
         });
-        cli_println!("{}", serde_json::to_string_pretty(&value)?);
-        return Ok(());
+        return emit_report("save", &path, value, complete, warnings);
     }
 
     cli_println!("Saved baseline for {}", SafePath(&record.path));
@@ -633,6 +835,16 @@ fn save_baseline(path: PathBuf, json: bool) -> Result<()> {
 fn print_diff(path: PathBuf, json: bool) -> Result<()> {
     let path = canonical_dir(path)?;
     let report = history::diff(&path)?;
+    let complete = report.complete();
+    let warnings = scan_warnings(
+        report
+            .baseline_inaccessible
+            .saturating_add(report.current_inaccessible),
+        report
+            .baseline_skipped_mounts
+            .saturating_add(report.current_skipped_mounts),
+    );
+    note_report_completeness(complete);
     if json {
         let changes: Vec<_> = report
             .changes
@@ -673,9 +885,10 @@ fn print_diff(path: PathBuf, json: bool) -> Result<()> {
             "total_delta_logical": report.total_delta_logical().to_string(),
             "total_delta_allocated": report.total_delta_allocated().to_string(),
             "changes": changes,
+            "scope": {"policy": "saved and current root children on the selected filesystem; no symlink traversal"},
+            "coverage": {"baseline_inaccessible": report.baseline_inaccessible, "current_inaccessible": report.current_inaccessible, "baseline_skipped_mounts": report.baseline_skipped_mounts, "current_skipped_mounts": report.current_skipped_mounts},
         });
-        cli_println!("{}", serde_json::to_string_pretty(&value)?);
-        return Ok(());
+        return emit_report("diff", &path, value, complete, warnings);
     }
 
     cli_println!("Diff for {}", SafePath(&report.path));
@@ -749,6 +962,15 @@ fn format_signed_bytes(delta: i128) -> String {
 fn print_space(path: PathBuf, json: bool) -> Result<()> {
     let path = canonical_dir(path)?;
     let report = space::report_for_path(&path)?;
+    let mut warnings = Vec::new();
+    if let Some(error) = &report.apfs_error {
+        warnings.push(error.to_string());
+    }
+    if let Some(error) = &report.local_snapshots.error {
+        warnings.push(format!("snapshot discovery: {error}"));
+    }
+    let complete = warnings.is_empty();
+    note_report_completeness(complete);
     if json {
         let snapshots: Vec<_> = report
             .local_snapshots
@@ -778,9 +1000,10 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
             "apfs_diagnostic": report.apfs_error.as_ref().map(|error| error.json()),
             "local_snapshots": snapshots,
             "local_snapshot_error": report.local_snapshots.error,
+            "scope": {"policy": "owning volume statfs, APFS and snapshot utility queries", "mount": report.mount.to_string_lossy()},
+            "coverage": {"utility_failures": warnings.len()},
         });
-        cli_println!("{}", serde_json::to_string_pretty(&value)?);
-        return Ok(());
+        return emit_report("space", &path, value, complete, warnings);
     }
 
     cli_println!("Space report for {}", SafePath(&report.path));
@@ -838,15 +1061,73 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
 
 fn print_packages(path: PathBuf, json: bool) -> Result<()> {
     let path = canonical_dir(path)?;
-    let reports = packages::scan_managers();
-    let project_scan = packages::scan_project_deps(&path, 5);
-    let project_deps = &project_scan.projects;
+    let mut reports = packages::scan_managers();
+    let mut project_scan = packages::scan_project_deps(&path, 5);
     let graph = packages::scan_dep_graph(&reports);
+    let mut warnings = scan_warnings(project_scan.inaccessible, project_scan.scope.skipped_mounts);
+    let unknown = reports
+        .iter()
+        .map(|report| report.unknown_sizes())
+        .sum::<usize>();
+    let partial = reports
+        .iter()
+        .map(|report| report.partial_sizes())
+        .sum::<usize>();
+    let scope_limited = reports
+        .iter()
+        .map(|report| report.limited_sizes())
+        .sum::<usize>();
+    for report in &reports {
+        if let Some(warning) = &report.warning {
+            warnings.push(format!("{}: {warning}", report.manager.label()));
+        }
+    }
+    if unknown > 0 || partial > 0 || scope_limited > 0 {
+        warnings.push(format!("package footprints: {unknown} unknown, {partial} partial, {scope_limited} limited scope"));
+    }
+    for warning in graph.warnings() {
+        warnings.push(format!(
+            "{} dependency graph: {}",
+            warning.manager.label(),
+            warning.message
+        ));
+    }
+    for dep in &project_scan.projects {
+        warnings.extend(
+            dep.dep_count
+                .warnings
+                .iter()
+                .map(|warning| format!("{}: {warning}", dep.path.display())),
+        );
+        if dep.coverage.is_partial() || dep.deps_size.is_none() {
+            warnings.push(format!(
+                "{}: project footprint incomplete or unavailable",
+                dep.path.display()
+            ));
+        }
+    }
+    let complete = warnings.is_empty();
+    note_report_completeness(complete);
+    let min_bytes = report_options().min_bytes;
+    let inventory_counts: Vec<_> = reports.iter().map(|report| report.packages.len()).collect();
+    for report in &mut reports {
+        report.packages.retain(|package| {
+            package.size.is_none_or(|size| size.allocated >= min_bytes)
+                || package.coverage.is_partial()
+                || package.coverage.basis.is_limited()
+        });
+    }
+    let project_count = project_scan.projects.len();
+    project_scan.projects.retain(|dep| {
+        dep.deps_size.is_none_or(|size| size.allocated >= min_bytes) || dep.coverage.is_partial()
+    });
+    let project_deps = &project_scan.projects;
 
     if json {
         let managers: Vec<_> = reports
             .iter()
-            .map(|r| {
+            .enumerate()
+            .map(|(index, r)| {
                 let pkgs: Vec<_> = r
                     .packages
                     .iter()
@@ -875,6 +1156,8 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
                     "scan_state": r.state.label(),
                     "environment": r.environment.as_ref().map(|environment| environment.json()),
                     "count": r.packages.len(),
+                    "inventory_count": inventory_counts[index],
+                    "filtered_out": inventory_counts[index] - r.packages.len(),
                     "total_logical": r.total_size.logical,
                     "total_allocated": r.total_size.allocated,
                     "total_basis": "sum of known package footprints",
@@ -910,16 +1193,20 @@ fn print_packages(path: PathBuf, json: bool) -> Result<()> {
             "project_scope": project_scan.scope.json(),
             "system_packages": managers,
             "project_dependencies": projects,
+            "project_inventory_count": project_count,
+            "project_filtered_out": project_count - project_deps.len(),
+            "scope": {"policy": "retained manager environments and bounded project discovery", "project": project_scan.scope.json()},
+            "coverage": {"project_inaccessible": project_scan.inaccessible, "project_skipped_mounts": project_scan.scope.skipped_mounts, "unknown_footprints": unknown, "partial_footprints": partial, "scope_limited_footprints": scope_limited},
             "dependency_graph_warnings": graph.warnings().iter().map(|warning| serde_json::json!({
                 "manager": warning.manager.label(),
                 "message": warning.message,
             })).collect::<Vec<_>>(),
         });
-        cli_println!("{}", serde_json::to_string_pretty(&value)?);
-        return Ok(());
+        return emit_report("packages", &path, value, complete, warnings);
     }
 
     cli_println!("Package report");
+    print_filter_notice()?;
     cli_println!();
 
     let mut any_manager = false;
@@ -1971,7 +2258,12 @@ fn cancel_active_state(app: &mut App) {
         ActiveModal::FileInfo => app.close_file_info(),
         ActiveModal::Input => app.exit_input_mode(),
         ActiveModal::None => {
-            if app.focus == Focus::Packages && (app.pkg_search_mode || app.pkg_filter_active()) {
+            if app.focus == Focus::Reclaim && app.reclaim_loading {
+                app.cancel_reclaim_scan();
+                app.focus = Focus::Files;
+            } else if app.focus == Focus::Packages
+                && (app.pkg_search_mode || app.pkg_filter_active())
+            {
                 app.clear_pkg_search();
             } else if app.search_mode || app.search_filter_active() {
                 app.clear_search();
@@ -2121,6 +2413,40 @@ mod tests {
 
     fn parse(parts: &[&str]) -> Result<CliAction> {
         parse_args(parts.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn report_options_are_explicit_and_reject_incompatible_modes() {
+        let CliAction::Configured { action, options } = parse(&[
+            "--reclaim",
+            "--strict",
+            "--min-size",
+            "1GiB",
+            "--class",
+            "risky",
+        ])
+        .unwrap() else {
+            panic!("configured report")
+        };
+        assert!(matches!(*action, CliAction::Reclaim { .. }));
+        assert!(options.strict);
+        assert_eq!(options.min_bytes, 1_073_741_824);
+        assert_eq!(options.class, Some(reclaim::Reclaimability::Risky));
+        for arguments in [
+            vec!["--strict"],
+            vec!["--strict", "--thin-snapshots", "1GiB"],
+            vec!["--space", "--min-size", "1MiB"],
+            vec!["--top", "5", "--class", "safe"],
+            vec!["--reclaim", "--class", "unknown"],
+            vec!["--reclaim", "--min-size", "0"],
+            vec!["--reclaim", "--min-size"],
+            vec!["--reclaim", "--class"],
+            vec!["--reclaim", "--min-size", "18446744073709551616"],
+        ] {
+            assert!(parse(&arguments).is_err(), "accepted {arguments:?}");
+        }
+        assert!(matches!(parse(&["--top", "5", "--", "--strict"]).unwrap(),
+            CliAction::Top { path, .. } if path == Path::new("--strict")));
     }
 
     #[test]
