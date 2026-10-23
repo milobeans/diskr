@@ -6,6 +6,8 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.83] - 2026-10-22
+
 ### Added
 
 - Package report scope controls select projects only, specific managers, no
