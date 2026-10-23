@@ -6,6 +6,18 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Releases provide native Apple Silicon and Intel macOS executables with
+  SHA-256 checksums, built and smoke-tested on their matching architectures.
+- Compatibility CI exercises macOS 15 and 26 on both architectures, read-only
+  volume discovery, and an explicit unsupported-platform build diagnostic.
+
+### Changed
+
+- GitHub release notes use the released changelog section rather than generated
+  commit summaries.
+
 ## [0.1.80] - 2026-10-22
 
 ### Added

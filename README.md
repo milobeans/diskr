@@ -51,6 +51,40 @@ read/parse failures show unknown or lower-bound counts with warnings. JSON uses
 
 ## Install
 
+Verified binary archives are available from [GitHub Releases](https://github.com/milobeans/diskr/releases)
+for Apple Silicon (`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`).
+They target macOS 15 or newer. In a new, empty working directory:
+
+```sh
+case "$(uname -m)" in
+  arm64) target=aarch64-apple-darwin ;;
+  x86_64) target=x86_64-apple-darwin ;;
+  *) echo "Unsupported architecture" >&2; exit 1 ;;
+esac
+archive="diskr-$target.tar.gz"
+curl --fail --location --remote-name "https://github.com/milobeans/diskr/releases/latest/download/$archive"
+curl --fail --location --remote-name "https://github.com/milobeans/diskr/releases/latest/download/SHA256SUMS"
+checksum=$(awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS)
+test -n "$checksum" && printf '%s\n' "$checksum" | shasum -a 256 -c -
+```
+
+Only after checksum verification succeeds, extract and install:
+
+```sh
+tar -xzf "$archive"
+mkdir -p "$HOME/.local/bin"
+install -m 755 diskr "$HOME/.local/bin/diskr"
+"$HOME/.local/bin/diskr" --help
+```
+
+Add `$HOME/.local/bin` to your shell's `PATH` if needed. Archives are not
+Developer ID signed or notarized; macOS or organization policy may require a
+different installation route. No quarantine/security-policy bypass is required
+or recommended by these instructions. A maintained Homebrew formula is not
+currently provided.
+
+To build from source with Rust 1.88 or newer:
+
 ```sh
 cargo install diskr
 ```
@@ -175,7 +209,24 @@ APFS space reporting combines `statfs(2)` for mount-level stats, a narrow parser
 
 ## Notes
 
-diskr is macOS-only. The minimum supported Rust version is 1.88.0.
+diskr is macOS-only on Apple Silicon and Intel; the minimum supported Rust
+version is 1.88.0. CI's maintained runtime floor is macOS 15, with native tests
+on macOS 15 and 26 for both architectures. Older macOS source builds are
+unverified, not deliberately blocked. The macOS-only target guard reports a
+clear error on Linux, Windows and unsupported CPU targets.
+
+The filesystem baseline is local APFS. Hardlinks, sparse files, inaccessible
+entries, filesystem identity and tool-output variations have fixture coverage;
+other filesystems/network volumes are best-effort and mount exclusions remain
+visible. Snapshot/APFS utilities use the owning mount and preserve failures.
+Container allocation is not exclusive per-file ownership or a freed-space
+guarantee.
+
+Use a UTF-8, VT-compatible terminal; 80×24 or larger is recommended. Headless
+frame tests cover 40/80/120 columns and short/tall viewports; native PTY smoke
+tests exercise keyboard input and clean shutdown. ASCII decoration preferences
+do not transliterate Unicode filenames. No promise of identical glyph widths
+across every terminal/font or multiplexor is made.
 
 Planned work lives in [ROADMAP.md](ROADMAP.md), and release history lives in
 [CHANGELOG.md](CHANGELOG.md). Private maintenance trackers, audit notes, and

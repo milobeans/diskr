@@ -71,38 +71,33 @@ published in this repository.
 - Saved roots and profiles: let users pin common scan targets and switch between
   named views such as `dev`, `media`, `downloads`, and external volumes.
 
-## TUI Density and Declutter (2026-06 UI/UX review)
+## TUI Density and Declutter
 
-Direction from the 2026-06-12 UI/UX review: the screen budget is
-misallocated. Always-on chrome (a fixed 38% side column that is usually idle,
-a static 22-binding help strip, header text restating default settings)
-makes the TUI feel cluttered, while the differentiated intelligence (reclaim
-classification, diff deltas, top files) hides behind stacked modals. The fix
-is not more panels — it is moving the intelligence into the file list itself
-and making every other element earn its pixels.
+Shipped behavior:
 
-- Fix the share-bar/percentage denominators, which today are computed over
-  the scroll window instead of the directory.
-- Context-sensitive help strip plus a `?` keymap overlay, driven by one
-  shared keymap table.
-- Files-pane density: column header with sort indicator, always-on modified
-  column, magnitude-coded size colors, summary title with cwd total and scan
-  coverage, visible mark totals.
-- Inline reclaim classification chips in the browser — the product-defining
-  move; the same product thesis applied to the main surface instead of a
-  modal.
-- Declutter the header and status line (show deviations, not defaults; stop
-  duplicating the selected row); collapsible side column with one-line disk
-  rows.
-- Two overlay patterns — full-screen selectable list views and a single
-  detail drawer — replacing six modal types; top-files becomes a flat-view
-  toggle of the files pane.
+- Size-share denominators cover the filtered directory, not its scroll window.
+- Context-sensitive footer and scrollable `?` help use a shared keymap table.
+- Files has magnitude-coded sizes, a sort/coverage summary and mark totals.
+  Modified time appears when sorting by time or when width permits; there is
+  no separate column-header row and no always-visible modified column.
+- Reclaim classification and growth chips are inline in Files. Independently
+  measured child sizes remain distinct from a unique-inode root total.
+- `b` toggles full-width active views and side panels. Compact disks use one
+  line per volume; package lists format only their viewport. Root-relative
+  project/Top Files rows retain full paths in details or the selected footer.
+- `t` toggles the full-width Top Files browser; `t` or Esc returns. Reclaim
+  retains a selectable panel and a separate paths view, not a second Files mode.
+- File, disk and package details share scrolling with pinned action footers.
+  Confirmations remain separate, target-bound overlays. The product does not
+  have only two internal modal types.
+- Rename/mkdir/search use a shared grapheme-aware caret editor. Terminal
+  palettes, monochrome/ASCII decorations and static activity indicators are
+  configurable without altering filesystem names.
 
-Sequencing: denominator and help-strip fixes are quick wins; files-pane density
-and inline reclaim classification are the value core and ship sub-item by
-sub-item; header, side-column, and overlay cleanup follow. The
-correctness/safety burn-down still takes precedence for destructive-action and
-state-integrity work.
+Remaining design choices include a dedicated Files column-header row and a
+uniform full-screen reclaim-paths browser. These are not completed promises;
+responsive column visibility remains intentional. Correctness and safe action
+targets continue to take precedence over additional chrome.
 
 ## Scriptability and Reports
 
@@ -143,15 +138,15 @@ state-integrity work.
 6. Done: add developer-cache detection and reclaimability scoring (`--reclaim`).
 7. Done: add JSON/reporting commands for `--top`, `--reclaim`, `--save`,
    `--diff`, and `--space`.
-8. Done: bring the intelligence into the TUI — reclaim pane, top-files modal,
+8. Done: bring the intelligence into the TUI — reclaim pane, Top Files browser,
    disk details, history diff header, file operations, size-share bars,
    persistent size cache.
 9. Done: correctness/safety burn-down covering state integrity,
    destructive-action responsiveness, traversal accuracy, terminal safety, and
    recursive cache invalidation.
-10. Done: TUI density and declutter pass — corrected denominators,
-    context-sensitive and scrollable help, files-pane density and inline reclaim
-    classification, side-column collapse, and shared overlay primitives.
+10. Shipped density improvements: corrected denominators, context-sensitive
+    and scrollable help, inline reclaim classification, full-width views and
+    shared scrolling details. Remaining layout choices are listed above.
 11. Next: stale-file finder (size combined with last-used metadata); pairs
     with age-dimming and reclaim classification chips.
 12. Next: duplicate finder with APFS clone-based dedupe (`clonefile(2)`).
