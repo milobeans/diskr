@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::bulkstat::{self, DirScan, SizeInfo};
 use crate::packages::{self, DepGraph, ManagerReport, ProjectDeps};
 use crate::scanner::{ScanId, ScanMsg, Scanner};
+use crate::terminal_text::{InputEdit, TextCursor};
 use crate::{fsevents, history, reclaim, space, state};
 
 const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -399,12 +400,15 @@ fn lookup_group_name(gid: u32) -> String {
 pub struct App {
     pub cwd: PathBuf,
     pub entries: Vec<Entry>,
+    file_aggregates: Option<(u64, u64, usize)>,
+    package_aggregates: Option<(u64, bool, u64, bool)>,
     pub selected: usize,
     pub selected_disk: usize,
     pub selected_pkg: usize,
     pub show_hidden: bool,
     pub sort: SortMode,
     pub focus: Focus,
+    pub full_width: bool,
     pub disks: Vec<DiskInfo>,
     pub status: String,
     pub cwd_enumeration_errors: u32,
@@ -427,16 +431,19 @@ pub struct App {
     pub input_mode: InputMode,
     pub input_prompt: String,
     pub input_buffer: String,
+    pub input_cursor: TextCursor,
     pub input_on_commit: Option<InputAction>,
 
     pub search_mode: bool,
     search_filter_pinned: bool,
     pub search_query: String,
+    pub search_cursor: TextCursor,
     pub search_matches: Vec<usize>,
 
     pub pkg_search_mode: bool,
     pkg_filter_pinned: bool,
     pub pkg_search_query: String,
+    pub pkg_search_cursor: TextCursor,
     pub pkg_search_matches: Vec<usize>,
     cached_pkg_visible_indices: Option<Vec<usize>>,
     cached_pkg_search_text: Vec<String>,
@@ -699,12 +706,15 @@ impl App {
         let mut app = App {
             cwd,
             entries: Vec::new(),
+            file_aggregates: None,
+            package_aggregates: None,
             selected: 0,
             selected_disk: 0,
             selected_pkg: 0,
             show_hidden: false,
             sort: SortMode::SizeDesc,
             focus: Focus::Files,
+            full_width: false,
             disks: Vec::new(),
             status: String::from("i info · f Finder · O open"),
             cwd_enumeration_errors: 0,
@@ -725,14 +735,17 @@ impl App {
             input_mode: InputMode::None,
             input_prompt: String::new(),
             input_buffer: String::new(),
+            input_cursor: TextCursor::default(),
             input_on_commit: None,
             search_mode: false,
             search_filter_pinned: false,
             search_query: String::new(),
+            search_cursor: TextCursor::default(),
             search_matches: Vec::new(),
             pkg_search_mode: false,
             pkg_filter_pinned: false,
             pkg_search_query: String::new(),
+            pkg_search_cursor: TextCursor::default(),
             pkg_search_matches: Vec::new(),
             cached_pkg_visible_indices: None,
             cached_pkg_search_text: Vec::new(),
@@ -942,6 +955,7 @@ impl App {
     }
 
     fn rebuild_entries(&mut self) -> Result<()> {
+        self.file_aggregates = None;
         self.reclaim_classes.clear();
         self.entries.clear();
         self.entry_index.clear();
@@ -1060,6 +1074,7 @@ impl App {
     }
 
     pub fn apply_sort(&mut self) {
+        self.file_aggregates = None;
         match self.sort {
             SortMode::Name => self.entries.sort_by(|a, b| {
                 b.is_dir
@@ -1273,6 +1288,20 @@ impl App {
 
     fn visible_entries(&self) -> impl Iterator<Item = &Entry> {
         (0..self.visible_entry_count()).filter_map(|index| self.visible_entry(index))
+    }
+
+    pub fn file_aggregates(&mut self) -> (u64, u64, usize) {
+        if let Some(aggregates) = self.file_aggregates {
+            return aggregates;
+        }
+        let aggregates = self
+            .visible_entries()
+            .filter_map(|entry| entry.size.map(size_sort_key))
+            .fold((0u64, 0u64, 0), |(max, total, count), size| {
+                (max.max(size), total.saturating_add(size), count + 1)
+            });
+        self.file_aggregates = Some(aggregates);
+        aggregates
     }
 
     pub fn enter(&mut self) -> Result<()> {
@@ -1624,6 +1653,9 @@ impl App {
         changed |= self.drain_external_action_results();
         changed |= self.drain_empty_trash_results();
         changed |= self.drain_batch_delete_results();
+        if changed {
+            self.file_aggregates = None;
+        }
         changed
     }
 
@@ -1665,6 +1697,10 @@ impl App {
 
     pub fn top_files_loading(&self) -> bool {
         self.top_files_loading
+    }
+
+    pub fn top_files_visible(&self) -> bool {
+        self.top_files_open
     }
 
     pub fn disk_info_loading(&self) -> bool {
@@ -3753,6 +3789,7 @@ impl App {
     }
 
     pub fn enter_pkg_search(&mut self) {
+        self.pkg_search_cursor.end(&self.pkg_search_query);
         self.pkg_search_mode = true;
         self.pkg_filter_pinned = false;
         if self.pkg_search_query.is_empty() {
@@ -3789,12 +3826,14 @@ impl App {
     }
 
     pub fn pkg_search_push(&mut self, ch: char) {
-        self.pkg_search_query.push(ch);
+        self.pkg_search_cursor
+            .edit(&mut self.pkg_search_query, InputEdit::Insert(ch));
         self.update_pkg_search();
     }
 
     pub fn pkg_search_pop(&mut self) {
-        self.pkg_search_query.pop();
+        self.pkg_search_cursor
+            .edit(&mut self.pkg_search_query, InputEdit::Backspace);
         if self.pkg_search_query.is_empty() {
             self.pkg_search_matches.clear();
             self.selected_pkg = 0;
@@ -3841,6 +3880,29 @@ impl App {
             .sum()
     }
 
+    pub fn package_aggregates(&mut self) -> (u64, bool, u64, bool) {
+        if let Some(aggregates) = self.package_aggregates {
+            return aggregates;
+        }
+        let aggregates = (
+            self.total_pkg_size(),
+            self.pkg_reports.iter().any(|report| {
+                report.warning.is_some()
+                    || report.unknown_sizes() > 0
+                    || report.partial_sizes() > 0
+                    || report.limited_sizes() > 0
+            }),
+            self.total_project_deps_size(),
+            self.project_dep_errors > 0
+                || self
+                    .project_deps
+                    .iter()
+                    .any(|dep| dep.coverage.is_partial()),
+        );
+        self.package_aggregates = Some(aggregates);
+        aggregates
+    }
+
     pub fn total_project_deps_size(&self) -> u64 {
         self.project_deps
             .iter()
@@ -3849,6 +3911,7 @@ impl App {
     }
 
     pub fn rebuild_flat_packages(&mut self) {
+        self.package_aggregates = None;
         let mut pkgs: Vec<(packages::Package, packages::Manager)> = Vec::new();
         for report in &self.pkg_reports {
             if !report.available {
@@ -3876,6 +3939,7 @@ impl App {
     }
 
     fn rebuild_project_dep_search_text(&mut self) {
+        self.package_aggregates = None;
         self.cached_project_dep_search_text = self
             .project_deps
             .iter()
@@ -3897,6 +3961,7 @@ impl App {
     }
 
     pub fn enter_search(&mut self) {
+        self.search_cursor.end(&self.search_query);
         self.search_mode = true;
         self.search_filter_pinned = false;
         if self.search_query.is_empty() {
@@ -3923,6 +3988,7 @@ impl App {
     }
 
     pub fn clear_search(&mut self) {
+        self.file_aggregates = None;
         let selected_path = self
             .visible_entry_index(self.selected)
             .map(|entry_idx| self.entries.get(entry_idx).map(|entry| entry.path.clone()));
@@ -3943,12 +4009,15 @@ impl App {
     }
 
     pub fn search_push(&mut self, ch: char) {
-        self.search_query.push(ch);
+        self.search_cursor
+            .edit(&mut self.search_query, InputEdit::Insert(ch));
         self.update_search();
     }
 
     pub fn search_pop(&mut self) {
-        self.search_query.pop();
+        self.file_aggregates = None;
+        self.search_cursor
+            .edit(&mut self.search_query, InputEdit::Backspace);
         if self.search_query.is_empty() {
             self.search_matches.clear();
             self.selected = 0;
@@ -3959,6 +4028,7 @@ impl App {
     }
 
     fn update_search(&mut self) {
+        self.file_aggregates = None;
         let query = self.search_query.to_lowercase();
         self.search_matches = self
             .entries
@@ -3981,6 +4051,7 @@ impl App {
         self.input_mode = mode;
         self.input_prompt = prompt.to_string();
         self.input_buffer = initial.to_string();
+        self.input_cursor.end(&self.input_buffer);
         self.input_on_commit = Some(action);
     }
 
@@ -3995,18 +4066,53 @@ impl App {
         if ch == '/' || ch == '\0' {
             return;
         }
-        self.input_buffer.push(ch);
+        self.input_cursor
+            .edit(&mut self.input_buffer, InputEdit::Insert(ch));
     }
 
     pub fn input_pop(&mut self) {
-        self.input_buffer.pop();
+        self.input_cursor
+            .edit(&mut self.input_buffer, InputEdit::Backspace);
+    }
+
+    pub fn edit_active_input(&mut self, edit: InputEdit) {
+        if self.input_mode != InputMode::None {
+            self.input_cursor.edit(&mut self.input_buffer, edit);
+        } else if self.pkg_search_mode {
+            self.pkg_search_cursor
+                .edit(&mut self.pkg_search_query, edit);
+            if self.pkg_search_query.is_empty() {
+                self.pkg_search_matches.clear();
+                self.selected_pkg = 0;
+            } else {
+                self.update_pkg_search();
+            }
+        } else if self.search_mode {
+            self.file_aggregates = None;
+            self.search_cursor.edit(&mut self.search_query, edit);
+            if self.search_query.is_empty() {
+                self.search_matches.clear();
+                self.selected = 0;
+                self.file_list_offset = 0;
+            } else {
+                self.update_search();
+            }
+        }
     }
 
     pub fn input_commit(&mut self) -> Result<()> {
         if let Some(action) = self.input_on_commit.take() {
             match action {
                 InputAction::Rename(old_path) => {
-                    let new_name = self.input_buffer.trim();
+                    let new_name = self.input_buffer.as_str();
+                    if old_path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy() == new_name)
+                    {
+                        self.status = String::from("name unchanged");
+                        self.exit_input_mode();
+                        return Ok(());
+                    }
                     if new_name.is_empty() {
                         self.status = String::from("rename cancelled: empty name");
                         self.exit_input_mode();
@@ -4042,7 +4148,7 @@ impl App {
                     }
                 }
                 InputAction::Mkdir(parent) => {
-                    let new_name = self.input_buffer.trim();
+                    let new_name = self.input_buffer.as_str();
                     if new_name.is_empty() {
                         self.status = String::from("mkdir cancelled: empty name");
                         self.exit_input_mode();
@@ -6827,6 +6933,89 @@ mod tests {
         assert_eq!(app.entries[app.selected].path, root.join("aardvark"));
         assert_eq!(app.entries[app.selected].name, "aardvark");
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_file_totals_follow_filter_clear_refresh_and_scan_results() {
+        let root = test_root("file_aggregate_cache");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("alpha"), b"one").unwrap();
+        fs::write(root.join("beta"), b"two").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        let expected = app
+            .entries
+            .iter()
+            .filter_map(|entry| entry.size.map(size_sort_key))
+            .fold((0u64, 0u64, 0), |(max, total, count), size| {
+                (max.max(size), total + size, count + 1)
+            });
+        assert_eq!(app.file_aggregates(), expected);
+        assert_eq!(app.file_aggregates, Some(expected));
+        app.enter_search();
+        for ch in "alpha".chars() {
+            app.search_push(ch);
+        }
+        assert_eq!(app.file_aggregates().2, 1);
+        app.search_pop();
+        app.clear_search();
+        assert_eq!(app.file_aggregates(), expected);
+        fs::write(root.join("third"), b"three").unwrap();
+        app.reload().unwrap();
+        assert_eq!(app.file_aggregates().2, 3);
+        let path = app.entries[0].path.clone();
+        let scan_id = app.active_scan_id;
+        let (tx, rx) = channel();
+        app.scan_rx = rx;
+        tx.send(ScanMsg::DirSize {
+            scan_id,
+            epoch: 0,
+            path,
+            size: SizeInfo::new(8192, 8192),
+            inaccessible: 0,
+            skipped_mounts: 0,
+        })
+        .unwrap();
+        app.drain_scan_results();
+        assert_eq!(app.file_aggregates().0, 8192);
+        app.invalidate_pending_scan_results();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filename_edits_preserve_spaces_and_unchanged_raw_os_names() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = test_root("exact_filename_input");
+        fs::create_dir_all(&root).unwrap();
+        let original = root.join("original");
+        fs::write(&original, b"fixture").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.enter_input_mode(
+            InputMode::Rename,
+            "Rename:",
+            " padded ",
+            InputAction::Rename(original),
+        );
+        app.input_commit().unwrap();
+        assert_eq!(fs::read(root.join(" padded ")).unwrap(), b"fixture");
+        app.request_mkdir();
+        for ch in " spaced dir ".chars() {
+            app.input_push(ch);
+        }
+        app.input_commit().unwrap();
+        assert!(root.join(" spaced dir ").is_dir());
+        let raw = root.join(std::ffi::OsString::from_vec(b"raw\xff".to_vec()));
+        let display = raw.file_name().unwrap().to_string_lossy();
+        app.enter_input_mode(
+            InputMode::Rename,
+            "Rename:",
+            &display,
+            InputAction::Rename(raw.clone()),
+        );
+        app.input_commit().unwrap();
+        assert_eq!(app.status, "name unchanged");
+        assert!(!root.join(display.as_ref()).exists());
+        app.invalidate_pending_scan_results();
         fs::remove_dir_all(root).unwrap();
     }
 

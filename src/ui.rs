@@ -24,6 +24,35 @@ use crate::packages::{DepEvidence, PackageUseStatus};
 use crate::reclaim::Reclaimability;
 use crate::terminal_text;
 
+fn decoration<'a>(unicode: &'a str, ascii: &'a str) -> &'a str {
+    if crate::terminal_backend::Appearance::configured().ascii {
+        ascii
+    } else {
+        unicode
+    }
+}
+
+fn themed_block<'a>() -> Block<'a> {
+    block_with_ascii(crate::terminal_backend::Appearance::configured().ascii)
+}
+
+fn block_with_ascii<'a>(ascii: bool) -> Block<'a> {
+    let block = Block::default();
+    if !ascii {
+        return block;
+    }
+    block.border_set(ratatui_core::symbols::border::Set {
+        top_left: "+",
+        top_right: "+",
+        bottom_left: "+",
+        bottom_right: "+",
+        vertical_left: "|",
+        vertical_right: "|",
+        horizontal_top: "-",
+        horizontal_bottom: "-",
+    })
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -54,6 +83,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     let (disk_height, package_height) =
         side_panel_heights(body[1].height, app.disks.len(), packages_visible);
+    let disk_expanded = app.focus == Focus::Disks;
+    let (disk_height, package_height) = if disk_expanded {
+        (disk_height, package_height)
+    } else {
+        let height = (app.disks.len() as u16)
+            .saturating_add(2)
+            .max(3)
+            .min(body[1].height);
+        (height, body[1].height.saturating_sub(height))
+    };
 
     let side = Layout::default()
         .direction(Direction::Vertical)
@@ -63,9 +102,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ])
         .split(body[1]);
 
-    draw_files(f, body[0], app);
-    draw_disks(f, side[0], app, side_expanded);
-    draw_packages(f, side[1], app);
+    if app.top_files_visible() {
+        draw_top_files(f, app);
+    } else if app.full_width {
+        match app.focus {
+            Focus::Files => draw_files(f, root[1], app),
+            Focus::Disks => draw_disks(f, root[1], app, true),
+            Focus::Packages => draw_packages(f, root[1], app),
+            Focus::Reclaim => {}
+        }
+    } else {
+        draw_files(f, body[0], app);
+        draw_disks(f, side[0], app, disk_expanded);
+        draw_packages(f, side[1], app);
+    }
 
     draw_status(f, root[2], app);
     draw_help(f, root[3], app.focus);
@@ -78,7 +128,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ActiveModal::Delete => draw_confirm(f, app),
         ActiveModal::Uninstall => draw_uninstall_confirm(f, app),
         ActiveModal::EmptyTrash => draw_empty_trash_confirm(f, app),
-        ActiveModal::TopFiles => draw_top_files(f, app),
+        ActiveModal::TopFiles => {}
         ActiveModal::ReclaimPaths => draw_reclaim_paths(f, app),
         ActiveModal::DiskInfo => draw_disk_info_modal(f, app),
         ActiveModal::Package => match app.pkg_view {
@@ -93,10 +143,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_input_overlay(f: &mut Frame, app: &App) {
     let area = centered_rect(50, 20, 40, 6, f.area());
-    let block = Block::default()
+    let block = themed_block()
         .title(app.input_prompt.as_str())
         .borders(Borders::ALL);
-    let text = vec![Line::from(""), Line::from(format!("{}▏", app.input_buffer))];
+    let text = vec![
+        Line::from(""),
+        Line::from(
+            app.input_cursor
+                .viewport(&app.input_buffer, area.width.saturating_sub(2) as usize),
+        ),
+    ];
     let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
     f.render_widget(Clear, area);
     f.render_widget(paragraph, area);
@@ -163,7 +219,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     let content_width = area.width.saturating_sub(4);
     let visible_count = app.visible_entry_count();
     if visible_count == 0 {
-        let block = Block::default()
+        let block = themed_block()
             .borders(Borders::ALL)
             .title("files · 0 items")
             .border_style(Style::default().fg(border_color));
@@ -187,20 +243,8 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     let (offset, end) =
         file_window_bounds(app.selected, visible_count, app.file_list_offset, max_rows);
     app.file_list_offset = offset;
-    let max_visible_size = (0..visible_count)
-        .filter_map(|i| app.visible_entry(i))
-        .filter_map(|entry| entry.size.map(size_sort_key))
-        .max()
-        .unwrap_or(0);
-    let total_visible_size: u64 = (0..visible_count)
-        .filter_map(|i| app.visible_entry(i))
-        .filter_map(|entry| entry.size.map(size_sort_key))
-        .sum();
-    let sized_count = (0..visible_count)
-        .filter_map(|i| app.visible_entry(i))
-        .filter(|entry| entry.size.is_some())
-        .count();
-    let block = Block::default()
+    let (max_visible_size, total_visible_size, sized_count) = app.file_aggregates();
+    let block = themed_block()
         .borders(Borders::ALL)
         .title(files_pane_title(
             app,
@@ -253,16 +297,16 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
             let marked = app.is_marked(&e.path);
             let icon = if marked {
                 if e.is_dir {
-                    "✓▸"
+                    decoration("✓▸", "*>")
                 } else if e.is_symlink {
-                    "✓↪"
+                    decoration("✓↪", "*@")
                 } else {
-                    "✓ "
+                    decoration("✓ ", "* ")
                 }
             } else if e.is_dir {
-                "▸ "
+                decoration("▸ ", "> ")
             } else if e.is_symlink {
-                "↪ "
+                decoration("↪ ", "@ ")
             } else {
                 "  "
             };
@@ -361,7 +405,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(decoration("▶ ", "> "));
 
     let mut state = ListState::default();
     state.select(Some(app.selected.saturating_sub(offset)));
@@ -403,7 +447,7 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &mut App, expanded: bool) {
     } else {
         Color::DarkGray
     };
-    let block = Block::default()
+    let block = themed_block()
         .borders(Borders::ALL)
         .title(format!("disks ({})", app.disks.len()))
         .border_style(Style::default().fg(border_color));
@@ -490,7 +534,7 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &mut App, expanded: bool) {
             gauge_style = gauge_style.add_modifier(Modifier::BOLD);
         }
         let gauge = Gauge::default()
-            .block(Block::default().title(label))
+            .block(themed_block().title(label))
             .gauge_style(gauge_style)
             .percent(pct.min(100));
         f.render_widget(gauge, rows[visible_i]);
@@ -498,12 +542,16 @@ fn draw_disks(f: &mut Frame, area: Rect, app: &mut App, expanded: bool) {
 }
 
 fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
-    let area = centered_rect(70, 70, 72, 22, f.area());
+    let area = if app.full_width {
+        browser_area(f)
+    } else {
+        centered_rect(70, 70, 72, 22, f.area())
+    };
     f.render_widget(Clear, area);
 
     if app.reclaim_loading {
         app.reclaim_page_rows = area.height.saturating_sub(2).max(1) as usize;
-        let inner = Block::default().borders(Borders::ALL).title(" reclaim ");
+        let inner = themed_block().borders(Borders::ALL).title(" reclaim ");
         let body = Paragraph::new(vec![
             Line::from(""),
             Line::from(vec![
@@ -529,7 +577,7 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
         Some(report) => report,
         None => {
             app.reclaim_page_rows = area.height.saturating_sub(2).max(1) as usize;
-            let inner = Block::default().borders(Borders::ALL).title(" reclaim ");
+            let inner = themed_block().borders(Borders::ALL).title(" reclaim ");
             let body = Paragraph::new("press R to scan reclaim recommendations")
                 .block(inner)
                 .alignment(Alignment::Center);
@@ -541,7 +589,7 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
     let item_count = report.findings.len();
     if item_count == 0 {
         app.reclaim_page_rows = area.height.saturating_sub(2).max(1) as usize;
-        let inner = Block::default().borders(Borders::ALL).title(" reclaim ");
+        let inner = themed_block().borders(Borders::ALL).title(" reclaim ");
         let body = Paragraph::new(format!(
             "no cleanup candidates found within scope\n{}",
             report.scope.summary()
@@ -610,7 +658,7 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
 
     let list = List::new(items)
         .block(
-            Block::default()
+            themed_block()
                 .borders(Borders::ALL)
                 .title(format!(
                     " cleanup {} · {} candidate disk bytes ",
@@ -624,7 +672,7 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(decoration("▶ ", "> "));
 
     let mut state = ListState::default();
     state.select(Some(app.selected_reclaim.min(item_count.saturating_sub(1))));
@@ -670,7 +718,7 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
             )));
         }
         lines.push(Line::from(""));
-        let block = Block::default()
+        let block = themed_block()
             .borders(Borders::ALL)
             .title(" reclaim finding ")
             .border_style(Style::default().fg(Color::DarkGray));
@@ -710,8 +758,22 @@ const MODAL_LIST_HINT: &str = "f/enter: reveal  ·  O: open  ·  d: trash  ·  e
 /// overlays so their placement and chrome stay identical.
 fn modal_list_regions(f: &mut Frame, title: &str) -> Option<(Rect, Rect)> {
     let area = centered_rect(70, 70, 74, 20, f.area());
+    list_regions(f, title, area, 2)
+}
+
+fn browser_area(f: &Frame) -> Rect {
+    let area = f.area();
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1).min(area.bottom()),
+        area.width,
+        area.height.saturating_sub(3),
+    )
+}
+
+fn list_regions(f: &mut Frame, title: &str, area: Rect, footer_rows: u16) -> Option<(Rect, Rect)> {
     f.render_widget(Clear, area);
-    let block = Block::default()
+    let block = themed_block()
         .borders(Borders::ALL)
         .title(title.to_string())
         .border_style(Style::default().fg(Color::DarkGray));
@@ -722,7 +784,7 @@ fn modal_list_regions(f: &mut Frame, title: &str) -> Option<(Rect, Rect)> {
     }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .constraints([Constraint::Min(1), Constraint::Length(footer_rows)])
         .split(inner);
     Some((chunks[0], chunks[1]))
 }
@@ -732,7 +794,7 @@ fn modal_list_regions(f: &mut Frame, title: &str) -> Option<(Rect, Rect)> {
 fn draw_modal_message(f: &mut Frame, title: &str, lines: Vec<Line<'static>>) {
     let area = centered_rect(70, 70, 74, 20, f.area());
     f.render_widget(Clear, area);
-    let block = Block::default()
+    let block = themed_block()
         .borders(Borders::ALL)
         .title(title.to_string());
     f.render_widget(
@@ -759,7 +821,7 @@ fn render_modal_list(
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(decoration("▶ ", "> "));
     let mut state = ListState::default();
     state.select(Some(selected_in_window));
     f.render_stateful_widget(list, list_area, &mut state);
@@ -842,6 +904,20 @@ fn draw_reclaim_paths(f: &mut Frame, app: &mut App) {
     );
 }
 
+fn draw_top_files_message(f: &mut Frame, lines: Vec<Line<'static>>) {
+    let area = browser_area(f);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                themed_block()
+                    .borders(Borders::ALL)
+                    .title(" top files · t/Esc return "),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn draw_top_files(f: &mut Frame, app: &mut App) {
     if app.top_files_loading() {
         let mut lines = vec![
@@ -857,7 +933,7 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
         if let Some(path) = app.top_files_path() {
             lines.push(Line::from(format!("path: {}", path.display())));
         }
-        draw_modal_message(f, " top files ", lines);
+        draw_top_files_message(f, lines);
         return;
     }
 
@@ -873,7 +949,7 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
         } else {
             "no scan in progress"
         };
-        draw_modal_message(f, " top files ", vec![Line::from(message)]);
+        draw_top_files_message(f, vec![Line::from(message)]);
         return;
     }
 
@@ -881,7 +957,7 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
         .top_files_path()
         .map(|path| format!(" top files · {} ", path.display()))
         .unwrap_or_else(|| String::from(" top files "));
-    let Some((list_area, footer_area)) = modal_list_regions(f, &title) else {
+    let Some((list_area, footer_area)) = list_regions(f, &title, browser_area(f), 3) else {
         return;
     };
     let max_rows = list_area.height.max(1) as usize;
@@ -913,7 +989,12 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
                 ),
                 Span::styled(
                     truncate(
-                        &file.path.display().to_string(),
+                        &file
+                            .path
+                            .strip_prefix(app.top_files_path().unwrap_or(&app.cwd))
+                            .unwrap_or(&file.path)
+                            .display()
+                            .to_string(),
                         list_area.width.saturating_sub(34) as usize,
                     ),
                     Style::default().fg(Color::White),
@@ -952,7 +1033,13 @@ fn draw_top_files(f: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
-        Line::from(MODAL_LIST_HINT),
+        Line::from(truncate_start(
+            &app.selected_top_file_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            footer_area.width as usize,
+        )),
+        Line::from("↑↓ select · Enter/f Finder · O open · d Trash · t/Esc return"),
     ];
     render_modal_list(
         f,
@@ -985,7 +1072,7 @@ fn render_detail_modal(
     footer: Line<'_>,
     scroll: usize,
 ) {
-    let block = Block::default()
+    let block = themed_block()
         .borders(Borders::ALL)
         .title(title.to_string())
         .border_style(Style::default().fg(border));
@@ -1418,16 +1505,12 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
         )
     };
 
+    let (system_total, system_partial, project_total, project_partial) = app.package_aggregates();
     let total_str = if app.packages_loaded {
         match app.pkg_view {
             PkgView::SystemManagers => {
-                let total = app.total_pkg_size();
-                let partial = app.pkg_reports.iter().any(|report| {
-                    report.warning.is_some()
-                        || report.unknown_sizes() > 0
-                        || report.partial_sizes() > 0
-                        || report.limited_sizes() > 0
-                });
+                let total = system_total;
+                let partial = system_partial;
                 if total > 0 || partial || !app.flat_packages().is_empty() {
                     format!(
                         " · {}{} known",
@@ -1439,9 +1522,8 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
                 }
             }
             PkgView::ProjectDeps => {
-                let total = app.total_project_deps_size();
-                let partial = app.project_dep_errors > 0
-                    || app.project_deps.iter().any(|dep| dep.coverage.is_partial());
+                let total = project_total;
+                let partial = project_partial;
                 if total > 0 || partial || !app.project_deps.is_empty() {
                     format!(
                         " · {}{} known",
@@ -1484,7 +1566,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
         },
     ]);
 
-    let block = Block::default()
+    let block = themed_block()
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(border_color));
@@ -1581,8 +1663,12 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
+    let selected = app.selected_pkg.min(item_count.saturating_sub(1));
+    let offset = selected.saturating_sub(area.height.saturating_sub(3) as usize);
     let items: Vec<ListItem> = visible_indices
         .iter()
+        .skip(offset)
+        .take(area.height.saturating_sub(2) as usize)
         .copied()
         .filter_map(|real_i| match app.pkg_view {
             PkgView::SystemManagers => {
@@ -1631,7 +1717,10 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
                     "{} · {} deps · {}",
                     dep.manager_label,
                     dep.dep_count,
-                    dep.path.display()
+                    dep.path
+                        .strip_prefix(&app.cwd)
+                        .unwrap_or(&dep.path)
+                        .display()
                 );
                 let (name_width, size_width) = package_columns(inner_width);
                 Some(package_line(&label, &size, name_width, size_width))
@@ -1646,10 +1735,10 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(decoration("▶ ", "> "));
 
     let mut state = ListState::default();
-    state.select(Some(app.selected_pkg.min(item_count.saturating_sub(1))));
+    state.select(Some(selected.saturating_sub(offset)));
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -1724,11 +1813,11 @@ fn package_line(
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     if app.search_mode {
-        let query = if app.search_query.is_empty() {
-            String::from("/")
-        } else {
-            format!("/{}", app.search_query)
-        };
+        let query = format!(
+            "/{}",
+            app.search_cursor
+                .viewport(&app.search_query, area.width.saturating_sub(9) as usize)
+        );
         let count = app.visible_entry_count();
         let text = Line::from(vec![
             Span::styled("search ", Style::default().fg(Color::DarkGray)),
@@ -1747,11 +1836,13 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     if app.pkg_search_mode {
-        let query = if app.pkg_search_query.is_empty() {
-            String::from("/")
-        } else {
-            format!("/{}", app.pkg_search_query)
-        };
+        let query = format!(
+            "/{}",
+            app.pkg_search_cursor.viewport(
+                &app.pkg_search_query,
+                area.width.saturating_sub(18) as usize
+            )
+        );
         let count = app.pkg_item_count();
         let text = Line::from(vec![
             Span::styled("filter packages ", Style::default().fg(Color::DarkGray)),
@@ -1884,7 +1975,7 @@ fn draw_help_overlay(f: &mut Frame, app: &mut App) {
     let area = centered_rect(84, 80, 64, 22, f.area());
     f.render_widget(Clear, area);
 
-    let block = Block::default()
+    let block = themed_block()
         .borders(Borders::ALL)
         .title(" keyboard help ")
         .border_style(Style::default().fg(Color::Cyan));
@@ -2054,7 +2145,7 @@ fn help_paragraph(sections: &[&KeySection]) -> Paragraph<'static> {
 
 fn render_confirm_modal(f: &mut Frame, area: Rect, title: &str, body: Vec<Line<'_>>) {
     f.render_widget(Clear, area);
-    let block = Block::default()
+    let block = themed_block()
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(Color::Red));
@@ -3276,8 +3367,8 @@ fn file_size_bar(
     };
     let bar_text = format!(
         "{}{}",
-        "█".repeat(filled),
-        "░".repeat(bar_width.saturating_sub(filled)),
+        decoration("█", "#").repeat(filled),
+        decoration("░", "-").repeat(bar_width.saturating_sub(filled)),
     );
     (bar_text, format!("{percent_of_sum:>3}%"), style)
 }
@@ -3286,6 +3377,246 @@ fn file_size_bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_borders_leave_unicode_data_intact() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(30, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new("界▶ filename")
+                        .block(block_with_ascii(true).borders(Borders::ALL)),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "+");
+        assert_eq!(buffer.cell((0, 1)).unwrap().symbol(), "|");
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("界 ▶ filename"));
+        assert!(!text.contains('┌'));
+    }
+
+    #[test]
+    fn full_width_views_hide_inactive_panes_and_top_files_fill_the_browser() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+        let root = std::env::temp_dir().join(format!("diskr_full_width_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/payload"), b"fixture").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.full_width = true;
+        for width in [40, 80, 120] {
+            app.focus = Focus::Files;
+            render_app(&mut app, width, 24);
+            assert_eq!(app.files_area.width, width);
+            app.focus = Focus::Packages;
+            let frame = render_app(&mut app, width, 24);
+            assert!(frame.contains("packages"));
+            assert!(!frame.contains("files ·"));
+            app.focus = Focus::Disks;
+            let frame = render_app(&mut app, width, 24);
+            assert!(frame.contains("disks"));
+            assert!(!frame.contains("files ·"));
+        }
+        app.focus = Focus::Files;
+        app.open_top_files_for_path(root.clone());
+        for _ in 0..200 {
+            app.drain_scan_results();
+            if !app.top_files_loading() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!app.top_files_loading());
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((0, 1)).unwrap().symbol(), "┌");
+        assert_eq!(buffer.cell((119, 1)).unwrap().symbol(), "┐");
+        let frame: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(frame.contains("nested/payload"));
+        assert!(frame.contains("t/Esc return"));
+        app.close_top_files();
+        assert!(!app.top_files_visible());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    struct MeasuredAllocator;
+    thread_local! {
+        static ALLOCATION_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    fn record_allocation() {
+        let _ = ALLOCATION_COUNT.try_with(|count| {
+            if let Some(value) = count.get() {
+                count.set(Some(value + 1));
+            }
+        });
+    }
+    unsafe impl std::alloc::GlobalAlloc for MeasuredAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            record_allocation();
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            record_allocation();
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+            record_allocation();
+            unsafe { std::alloc::System.realloc(ptr, layout, size) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+    #[global_allocator]
+    static ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
+
+    fn measured<T>(operation: impl FnOnce() -> T) -> (T, std::time::Duration, usize) {
+        ALLOCATION_COUNT.with(|count| count.set(Some(0)));
+        let start = std::time::Instant::now();
+        let result = operation();
+        let elapsed = start.elapsed();
+        let allocations = ALLOCATION_COUNT.with(|count| count.replace(None).unwrap());
+        (result, elapsed, allocations)
+    }
+
+    fn package_fixture(app: &mut App, count: usize) {
+        app.pkg_reports = vec![crate::packages::ManagerReport {
+            manager: crate::packages::Manager::Cargo,
+            packages: (0..count)
+                .map(|index| crate::packages::Package {
+                    name: format!("pkg-{index:05}"),
+                    version: String::from("1.0"),
+                    size: Some(SizeInfo::new(100, 100)),
+                    path: None,
+                    metadata_path: None,
+                    coverage: Default::default(),
+                })
+                .collect(),
+            total_size: SizeInfo::new(count as u64 * 100, count as u64 * 100),
+            available: true,
+            warning: None,
+            state: crate::packages::ManagerScanState::Complete,
+            environment: None,
+        }];
+        app.packages_loaded = true;
+        app.focus = Focus::Packages;
+        app.rebuild_flat_packages();
+    }
+
+    #[test]
+    fn package_viewport_keeps_last_selection_visible_and_bounds_allocations() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+        let root = std::env::temp_dir().join(format!("diskr_virtual_rows_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        package_fixture(&mut app, 100);
+        terminal
+            .draw(|frame| draw_packages(frame, frame.area(), &mut app))
+            .unwrap();
+        let (_, _, small_allocations) = measured(|| {
+            terminal
+                .draw(|frame| draw_packages(frame, frame.area(), &mut app))
+                .unwrap()
+        });
+        package_fixture(&mut app, 10_000);
+        app.selected_pkg = 9_999;
+        terminal
+            .draw(|frame| draw_packages(frame, frame.area(), &mut app))
+            .unwrap();
+        let (_, _, large_allocations) = measured(|| {
+            terminal
+                .draw(|frame| draw_packages(frame, frame.area(), &mut app))
+                .unwrap()
+        });
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("pkg-09999"));
+        assert!(!text.contains("pkg-00000"));
+        assert!(
+            large_allocations <= small_allocations + 20,
+            "small {small_allocations}, large {large_allocations}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual rendering benchmark; run optimized with --nocapture"]
+    fn benchmark_package_viewport_frames() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+        let root =
+            std::env::temp_dir().join(format!("diskr_frame_benchmark_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), b"fixture").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        for count in [100, 10_000] {
+            package_fixture(&mut app, count);
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let mut durations = Vec::new();
+            let mut allocations = Vec::new();
+            for index in 0..200 {
+                app.selected_pkg = index * (count - 1) / 199;
+                let (_, duration, allocated) =
+                    measured(|| terminal.draw(|frame| draw(frame, &mut app)).unwrap());
+                durations.push(duration.as_micros());
+                allocations.push(allocated);
+            }
+            durations.sort_unstable();
+            allocations.sort_unstable();
+            eprintln!(
+                "packages={count} frames=200 frame_p50_us={} frame_p95_us={} allocations_p95={}",
+                durations[100], durations[190], allocations[190]
+            );
+        }
+        app.focus = Focus::Files;
+        let entry = app.entries[0].clone();
+        app.entries = vec![entry; 100_000];
+        app.apply_sort();
+        let (_, cold, cold_allocations) = measured(|| app.file_aggregates());
+        let mut durations = Vec::new();
+        let mut allocations = 0;
+        for _ in 0..200 {
+            let (_, elapsed, allocated) = measured(|| std::hint::black_box(app.file_aggregates()));
+            durations.push(elapsed.as_nanos());
+            allocations += allocated;
+        }
+        durations.sort_unstable();
+        eprintln!("files=100000 aggregate_cold_us={} cold_allocations={cold_allocations} cached_p95_ns={} cached_allocations={allocations}", cold.as_micros(), durations[190]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn long_inputs_keep_the_caret_visible_in_real_frames() {
+        let root =
+            std::env::temp_dir().join(format!("diskr_input_viewport_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        for width in [40, 80, 120] {
+            app.request_mkdir();
+            for ch in "界e\u{301}".repeat(100).chars() {
+                app.input_push(ch);
+            }
+            assert!(render_app(&mut app, width, 24).contains('|'));
+            app.exit_input_mode();
+            app.enter_search();
+            for ch in "界e\u{301}".repeat(100).chars() {
+                app.search_push(ch);
+            }
+            assert!(render_app(&mut app, width, 24).contains('|'));
+            app.clear_search();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn detail_modal_scrolls_all_rows_without_losing_action_footer() {
@@ -3885,11 +4216,20 @@ fn scan_frame_at(ms: u128) -> &'static str {
 }
 
 fn scan_frame() -> &'static str {
+    let appearance = crate::terminal_backend::Appearance::configured();
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    scan_frame_at(ms)
+    scan_frame_for_preferences(ms, appearance.reduced_motion, appearance.ascii)
+}
+
+fn scan_frame_for_preferences(ms: u128, reduced_motion: bool, ascii: bool) -> &'static str {
+    if reduced_motion || ascii {
+        "scan"
+    } else {
+        scan_frame_at(ms)
+    }
 }
 
 fn big_spinner_char() -> char {

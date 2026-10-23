@@ -34,7 +34,7 @@ use std::{
 
 use app::{format_elapsed, human, ActiveModal, App, Focus};
 use terminal_backend::CrosstermBackend;
-use terminal_text::SafePath;
+use terminal_text::{InputEdit, SafePath};
 
 thread_local! {
     static CLI_OUTPUT: RefCell<io::BufWriter<io::Stdout>> =
@@ -382,6 +382,10 @@ Usage:
   diskr --space [--json] [PATH]
   diskr --packages [--json] [PATH]
   diskr --thin-snapshots SIZE [--yes] [PATH]
+
+Terminal preferences:
+  DISKR_THEME=dark|light|high-contrast|mono
+  DISKR_REDUCED_MOTION=1; DISKR_ASCII=1; NO_COLOR selects monochrome.
 
 Keys:
 ",
@@ -1359,7 +1363,7 @@ where
                     }
                     if app.active_modal() == ActiveModal::TopFiles {
                         let handled = match key.code {
-                            KeyCode::Esc => {
+                            KeyCode::Esc | KeyCode::Char('t') => {
                                 app.close_top_files();
                                 true
                             }
@@ -1571,7 +1575,7 @@ where
                                 app.input_push(ch);
                                 true
                             }
-                            _ => false,
+                            _ => handle_text_navigation(app, key.code),
                         };
                         if handled {
                             needs_draw = true;
@@ -1609,18 +1613,18 @@ where
                                 true
                             }
                             KeyCode::Home => {
-                                app.move_to_start();
+                                app.edit_active_input(InputEdit::Home);
                                 true
                             }
                             KeyCode::End => {
-                                app.move_to_end();
+                                app.edit_active_input(InputEdit::End);
                                 true
                             }
                             KeyCode::Char(ch) => {
                                 app.search_push(ch);
                                 true
                             }
-                            _ => false,
+                            _ => handle_text_navigation(app, key.code),
                         };
                         if handled {
                             needs_draw = true;
@@ -1634,6 +1638,15 @@ where
                         continue;
                     }
                     let handled = match key.code {
+                        KeyCode::Char('b') => {
+                            app.full_width = !app.full_width;
+                            app.status = if app.full_width {
+                                String::from("full-width view · b restore side panels")
+                            } else {
+                                String::from("side panels visible")
+                            };
+                            true
+                        }
                         KeyCode::Char('?') => {
                             app.open_help();
                             true
@@ -1971,6 +1984,19 @@ fn cancel_active_state(app: &mut App) {
     }
 }
 
+fn handle_text_navigation(app: &mut App, code: KeyCode) -> bool {
+    let edit = match code {
+        KeyCode::Left => InputEdit::Left,
+        KeyCode::Right => InputEdit::Right,
+        KeyCode::Home => InputEdit::Home,
+        KeyCode::End => InputEdit::End,
+        KeyCode::Delete => InputEdit::Delete,
+        _ => return false,
+    };
+    app.edit_active_input(edit);
+    true
+}
+
 fn handle_pkg_search_key(app: &mut App, code: KeyCode) -> bool {
     match code {
         KeyCode::Esc => {
@@ -2002,24 +2028,56 @@ fn handle_pkg_search_key(app: &mut App, code: KeyCode) -> bool {
             true
         }
         KeyCode::Home => {
-            app.move_to_start();
+            app.edit_active_input(InputEdit::Home);
             true
         }
         KeyCode::End => {
-            app.move_to_end();
+            app.edit_active_input(InputEdit::End);
             true
         }
         KeyCode::Char(ch) => {
             app.pkg_search_push(ch);
             true
         }
-        _ => false,
+        _ => handle_text_navigation(app, code),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_and_package_filter_keys_edit_at_the_caret() {
+        let root = test_root("input_caret_filters");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.enter_search();
+        for ch in "a界e\u{301}".chars() {
+            app.search_push(ch);
+        }
+        assert!(handle_text_navigation(&mut app, KeyCode::Home));
+        assert!(handle_text_navigation(&mut app, KeyCode::Delete));
+        assert_eq!(app.search_query, "界e\u{301}");
+        assert!(handle_text_navigation(&mut app, KeyCode::Right));
+        app.search_pop();
+        assert_eq!(app.search_query, "e\u{301}");
+        app.clear_search();
+        app.focus = Focus::Packages;
+        app.enter_pkg_search();
+        for ch in "ab".chars() {
+            handle_pkg_search_key(&mut app, KeyCode::Char(ch));
+        }
+        handle_pkg_search_key(&mut app, KeyCode::Left);
+        handle_pkg_search_key(&mut app, KeyCode::Char('界'));
+        assert_eq!(app.pkg_search_query, "a界b");
+        handle_pkg_search_key(&mut app, KeyCode::Delete);
+        assert_eq!(app.pkg_search_query, "a界");
+        handle_pkg_search_key(&mut app, KeyCode::Home);
+        handle_pkg_search_key(&mut app, KeyCode::Delete);
+        assert_eq!(app.pkg_search_query, "界");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn escape_key_clears_the_active_kept_filter() {

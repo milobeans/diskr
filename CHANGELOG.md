@@ -6,6 +6,31 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.80] - 2026-10-22
+
+### Added
+
+- Rename, mkdir and file/package search share grapheme-aware caret editing:
+  Left/Right, Home/End, Backspace and Delete. Long input scrolls horizontally
+  to keep its caret visible without splitting wide characters.
+- `b` toggles full-width active views and side panels. Top Files is a full-width
+  browser toggled with `t`; compact disks use a one-line-per-volume row budget.
+  Project and Top Files rows show root-relative paths while retaining full paths.
+- Terminal appearance supports dark, light, high-contrast and monochrome palettes,
+  `NO_COLOR`, static scan indicators and ASCII decoration fallbacks through
+  documented environment preferences. Textual selection and warning markers remain.
+
+### Fixed
+
+- Rename and mkdir preserve intentional leading/trailing spaces. Accepting an
+  unchanged rename preserves the original raw filename, including names that
+  cannot be represented as UTF-8.
+
+### Changed
+
+- Package lists format only viewport rows, and Files reuses measured totals
+  between data/filter changes.
+
 ## [0.1.79] - 2026-10-22
 
 ### Fixed

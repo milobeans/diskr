@@ -105,14 +105,16 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | Backspace | Go to parent directory |
 | Left/Right, h/l | Switch pane or package view |
 | Tab, Shift+Tab | Cycle panes |
+| b | Toggle full-width active view and side panels |
 | / | Search files in the current directory or filter packages; Enter keeps, Esc clears |
+| Left/Right, Home/End (input) | Move the caret in rename, mkdir and search; Backspace/Delete erase a grapheme |
 | i | Show details for the selected file, package, or disk |
 | . | Toggle hidden files in the Files pane |
 | o | Cycle sort mode in the Files pane |
 | r | Refresh the current view and rescan all visible directory sizes |
 | S | Scan every missing, stale, or incomplete visible directory size in the Files pane |
 | B | Save a history baseline for the current Files directory |
-| t | Open the top-files list for the selection |
+| t | Toggle the full-width Top Files browser for the selection; Esc also returns |
 | c | Rename the selected file |
 | n | Create a directory |
 | v | Toggle a mark on the selected file |
@@ -134,6 +136,14 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | Home/End (details) | Jump to the start or end of detail content |
 
 ## How it works
+
+For terminal accessibility, set `DISKR_THEME=dark` (default), `light`,
+`high-contrast` or `mono`. A non-empty `NO_COLOR` selects monochrome, preserving
+selection gutters and textual warning/coverage markers. `DISKR_REDUCED_MOTION=1`
+replaces animated scan glyphs with a static `scan` label. `DISKR_ASCII=1` uses
+ASCII alternatives for common TUI decorations and also disables animation;
+Unicode filenames remain Unicode. These preferences affect terminal rendering,
+not filesystem names, action targets or JSON data.
 
 diskr uses `ratatui`, `crossterm`, `libc`, `anyhow`, `serde_json`, `toml`, and the
 Unicode segmentation/width crates. The size cache and history baselines are
@@ -182,6 +192,17 @@ cargo test --locked
 cargo package --locked
 cargo audit
 ```
+
+The opt-in rendering benchmark uses isolated fixtures, 100 and 10,000 packages,
+120×40 frames, and 100,000 synthetic file rows. It reports frame p50/p95,
+thread-local allocation events (alloc/realloc), and cold/cached aggregate time:
+
+```sh
+cargo test --release --locked benchmark_package_viewport_frames -- --ignored --nocapture
+```
+
+These are rendering measurements, not filesystem throughput claims. Record the
+macOS version, CPU, terminal dimensions and build profile when comparing runs.
 
 ## Releases
 

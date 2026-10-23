@@ -17,13 +17,96 @@ use ratatui_core::{
 
 use crate::terminal_text;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Theme {
+    Dark,
+    Light,
+    HighContrast,
+    Monochrome,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Appearance {
+    theme: Theme,
+    pub reduced_motion: bool,
+    pub ascii: bool,
+}
+
+impl Appearance {
+    fn from_settings(theme: &str, no_color: bool, reduced_motion: bool, ascii: bool) -> Self {
+        Self {
+            theme: if no_color {
+                Theme::Monochrome
+            } else {
+                match theme {
+                    "light" => Theme::Light,
+                    "high-contrast" => Theme::HighContrast,
+                    "mono" | "monochrome" => Theme::Monochrome,
+                    _ => Theme::Dark,
+                }
+            },
+            reduced_motion,
+            ascii,
+        }
+    }
+
+    pub fn configured() -> &'static Self {
+        static APPEARANCE: std::sync::OnceLock<Appearance> = std::sync::OnceLock::new();
+        APPEARANCE.get_or_init(|| {
+            Self::from_settings(
+                &std::env::var("DISKR_THEME").unwrap_or_default(),
+                std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+                std::env::var("DISKR_REDUCED_MOTION").is_ok_and(|value| value == "1"),
+                std::env::var("DISKR_ASCII").is_ok_and(|value| value == "1"),
+            )
+        })
+    }
+
+    fn color(self, color: Color, background: bool) -> Color {
+        if self.theme == Theme::Monochrome {
+            return Color::Reset;
+        }
+        if background {
+            return match (self.theme, color) {
+                (Theme::Light, Color::Reset) => Color::White,
+                (Theme::Dark | Theme::HighContrast, Color::Reset) => Color::Black,
+                (Theme::Light, Color::DarkGray) => Color::Indexed(253),
+                (Theme::Dark, Color::DarkGray) => Color::Indexed(235),
+                (Theme::HighContrast, Color::DarkGray) => Color::Black,
+                _ => color,
+            };
+        }
+        match (self.theme, color) {
+            (Theme::Light, Color::Reset) => Color::Black,
+            (Theme::Dark | Theme::HighContrast, Color::Reset) => Color::White,
+            (Theme::Light, Color::White | Color::Gray) => Color::Black,
+            (Theme::Light, Color::DarkGray) => Color::Indexed(238),
+            (Theme::Light, Color::Yellow) => Color::Indexed(130),
+            (Theme::Light, Color::Green) => Color::Indexed(28),
+            (Theme::Light, Color::Cyan) => Color::Indexed(23),
+            (Theme::HighContrast, Color::DarkGray | Color::Gray) => Color::White,
+            (Theme::HighContrast, Color::Blue | Color::Cyan) => Color::LightCyan,
+            (Theme::HighContrast, Color::Red) => Color::LightRed,
+            (Theme::HighContrast, Color::Green) => Color::LightGreen,
+            (Theme::HighContrast, Color::Yellow) => Color::LightYellow,
+            (Theme::Dark, Color::Blue) => Color::LightBlue,
+            (Theme::Dark, Color::DarkGray) => Color::Indexed(246),
+            _ => color,
+        }
+    }
+}
+
 pub struct CrosstermBackend<W: Write> {
     writer: W,
+    appearance: Appearance,
 }
 
 impl<W: Write> CrosstermBackend<W> {
-    pub const fn new(writer: W) -> Self {
-        Self { writer }
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            appearance: *Appearance::configured(),
+        }
     }
 }
 
@@ -61,13 +144,15 @@ impl<W: Write> Backend for CrosstermBackend<W> {
                 fg = Color::Reset;
                 bg = Color::Reset;
             }
-            if cell.fg != fg {
-                queue!(self.writer, SetForegroundColor(to_term_color(cell.fg)))?;
-                fg = cell.fg;
+            let cell_fg = self.appearance.color(cell.fg, false);
+            let cell_bg = self.appearance.color(cell.bg, true);
+            if cell_fg != fg {
+                queue!(self.writer, SetForegroundColor(to_term_color(cell_fg)))?;
+                fg = cell_fg;
             }
-            if cell.bg != bg {
-                queue!(self.writer, SetBackgroundColor(to_term_color(cell.bg)))?;
-                bg = cell.bg;
+            if cell_bg != bg {
+                queue!(self.writer, SetBackgroundColor(to_term_color(cell_bg)))?;
+                bg = cell_bg;
             }
             queue!(
                 self.writer,
@@ -206,4 +291,49 @@ fn queue_modifier<W: Write>(writer: &mut W, modifier: Modifier) -> io::Result<()
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palettes_map_metadata_highlights_and_no_color_consistently() {
+        let dark = Appearance::from_settings("dark", false, false, false);
+        let light = Appearance::from_settings("light", false, false, false);
+        let contrast = Appearance::from_settings("high-contrast", false, false, false);
+        assert_eq!(dark.color(Color::DarkGray, false), Color::Indexed(246));
+        assert_eq!(light.color(Color::DarkGray, false), Color::Indexed(238));
+        assert_eq!(light.color(Color::White, false), Color::Black);
+        assert_eq!(light.color(Color::DarkGray, true), Color::Indexed(253));
+        assert_eq!(contrast.color(Color::DarkGray, false), Color::White);
+        assert_eq!(contrast.color(Color::DarkGray, true), Color::Black);
+        for setting in ["dark", "light", "high-contrast", "mono"] {
+            let appearance = Appearance::from_settings(setting, true, true, true);
+            for color in [Color::Red, Color::Gray, Color::Blue, Color::White] {
+                assert_eq!(appearance.color(color, false), Color::Reset);
+                assert_eq!(appearance.color(color, true), Color::Reset);
+            }
+            assert!(appearance.reduced_motion && appearance.ascii);
+        }
+    }
+
+    #[test]
+    fn monochrome_backend_preserves_unicode_data_and_redundant_text() {
+        let mut backend = CrosstermBackend {
+            writer: Vec::new(),
+            appearance: Appearance::from_settings("mono", false, true, true),
+        };
+        let mut cell = Cell::default();
+        cell.set_symbol("界▶failed");
+        cell.fg = Color::Red;
+        cell.bg = Color::DarkGray;
+        cell.modifier = Modifier::BOLD;
+        backend.draw(std::iter::once((0, 0, &cell))).unwrap();
+        let output = String::from_utf8(backend.writer).unwrap();
+        assert!(output.contains("界▶failed"));
+        assert!(output.contains("[1m"));
+        assert!(!output.contains("38;"));
+        assert!(!output.contains("48;"));
+    }
 }

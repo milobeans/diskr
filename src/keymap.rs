@@ -22,6 +22,16 @@ pub struct KeySection {
 
 const GLOBAL: &[KeyBinding] = &[
     KeyBinding {
+        key: "b",
+        action: "Toggle full-width active view and side panels",
+        footer: None,
+    },
+    KeyBinding {
+        key: "Left/Right, Home/End (input)",
+        action: "Move input caret; Backspace/Delete erase a grapheme",
+        footer: None,
+    },
+    KeyBinding {
         key: "?",
         action: "Show keyboard help",
         footer: Some(FooterBinding {
@@ -147,7 +157,7 @@ const FILES: &[KeyBinding] = &[
     },
     KeyBinding {
         key: "t",
-        action: "Open top-files list",
+        action: "Toggle full-width Top Files browser; Esc returns",
         footer: None,
     },
     KeyBinding {
