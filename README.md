@@ -53,7 +53,8 @@ read/parse failures show unknown or lower-bound counts with warnings. JSON uses
 
 Verified binary archives are available from [GitHub Releases](https://github.com/milobeans/diskr/releases)
 for Apple Silicon (`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`).
-They target macOS 15 or newer. In a new, empty working directory:
+They target macOS 15 or newer and include dependency license notices and an
+inventory alongside the executable. In a new, empty working directory:
 
 ```sh
 case "$(uname -m)" in

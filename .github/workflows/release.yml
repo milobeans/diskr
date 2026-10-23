@@ -41,7 +41,31 @@ jobs:
           file "target/$TARGET/release/diskr"
           mkdir -p "$RUNNER_TEMP/binary"
           cp "target/$TARGET/release/diskr" LICENSE "$RUNNER_TEMP/binary/"
-          tar -czf "$RUNNER_TEMP/diskr-$TARGET.tar.gz" -C "$RUNNER_TEMP/binary" diskr LICENSE
+          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          python3 - <<'PY'
+          import json, os, shutil
+          from pathlib import Path
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          packages = json.loads((temporary / "metadata.json").read_text())["packages"]
+          destination = temporary / "binary" / "licenses"
+          destination.mkdir()
+          index = []
+          for package in packages:
+              root = Path(package["manifest_path"]).parent.resolve()
+              files = [entry for entry in root.iterdir() if entry.is_file() and not entry.is_symlink() and entry.name.upper().startswith(("LICENSE", "NOTICE", "COPYING", "COPYRIGHT"))]
+              if package.get("license_file"):
+                  candidate = (root / package["license_file"]).resolve()
+                  if root in candidate.parents and candidate.is_file() and candidate not in files:
+                      files.append(candidate)
+              if files:
+                  target = destination / (package["name"] + "-" + package["version"])
+                  target.mkdir(exist_ok=True)
+                  for entry in files:
+                      shutil.copyfile(entry, target / entry.name)
+              index.append({"package": package["name"], "version": package["version"], "license": package["license"], "repository": package["repository"], "notice_files": [entry.name for entry in files]})
+          (destination / "index.json").write_text(json.dumps(index, indent=2) + "\n")
+          PY
+          tar -czf "$RUNNER_TEMP/diskr-$TARGET.tar.gz" -C "$RUNNER_TEMP/binary" diskr LICENSE licenses
           cd "$RUNNER_TEMP"
           shasum -a 256 "diskr-$TARGET.tar.gz" > "$TARGET.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
