@@ -6,6 +6,8 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.82] - 2026-10-22
+
 ### Added
 
 - JSON reports share a versioned schema with canonical root/scope, completeness,
