@@ -19,8 +19,10 @@ A fast, macOS-native disk explorer for the terminal, written in Rust.
 
 ## Why diskr
 
-Most disk usage tools stop at "this folder is big." diskr is built around the
-questions you actually have when macOS says your disk is almost full:
+Finder and the macOS storage settings make it hard to see what is actually
+using your disk, or what is safe to remove. diskr was built as a simpler, more
+direct alternative, around the questions you have when macOS says your disk is
+almost full:
 
 - **What is using the space?** Live directory sizes, sorted by what is really
   allocated on disk. APFS clones, sparse files and compression make apparent
