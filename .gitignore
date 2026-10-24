@@ -9,3 +9,6 @@ target/
 /docs/AUDIT.md
 /docs/ISSUES.md
 /docs/internal/
+
+# Pages build copies .github/assets here.
+/site/assets/img/

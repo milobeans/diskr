@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en" data-root="../">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documentation · diskr</title>
+<meta name="description" content="Install diskr, learn its views and keys, script its reports, and understand how it measures disk usage on macOS.">
+<meta name="theme-color" content="#0c0d11" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f3efe6" media="(prefers-color-scheme: light)">
+<link rel="canonical" href="https://milobeans.github.io/diskr/docs/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="diskr documentation">
+<meta property="og:description" content="Install, keys, reports and internals of diskr, the macOS disk explorer for the terminal.">
+<meta property="og:url" content="https://milobeans.github.io/diskr/docs/">
+<meta property="og:image" content="https://milobeans.github.io/diskr/assets/img/social-preview.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.bunny.net">
+<link rel="stylesheet" href="https://fonts.bunny.net/css?family=instrument-serif:400,400i|instrument-sans:400,500,600|jetbrains-mono:400,500,600,700&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>
+  document.documentElement.dataset.theme = localStorage.getItem("diskr-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+</script>
+<script type="module" src="../assets/site.js"></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="wrap wide nav-inner">
+    <button class="icon-btn docs-menu" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="sidebar">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+    <a class="brand" href="../" aria-label="diskr home">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></span>diskr
+    </a>
+    <nav class="nav-links" aria-label="Primary">
+      <a href="./" aria-current="page">Docs</a>
+      <a href="../#tour">Tour</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/milobeans/diskr/blob/main/CHANGELOG.md">Changelog</a>
+    </nav>
+    <div class="nav-tools">
+      <button class="search-trigger" type="button" aria-label="Search docs">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <span class="text">Search docs</span><kbd>⌘K</kbd>
+      </button>
+      <button class="icon-btn theme-toggle" type="button" aria-label="Toggle color theme">
+        <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      </button>
+      <a class="icon-btn" href="https://github.com/milobeans/diskr" aria-label="diskr on GitHub">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.6 22.4c.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.5-3.9-1.5-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0c2.2-1.5 3.2-1.2 3.2-1.2.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A11.5 11.5 0 0 0 12 .5z"/></svg>
+      </a>
+    </div>
+  </div>
+</header>
+
+<div class="docs">
+  <nav class="sidebar" id="sidebar" aria-label="Documentation">
+    <h4 class="label">Getting started</h4>
+    <ul>
+      <li><a href="#install">Install</a></li>
+      <li><a href="#first-run">First run</a></li>
+    </ul>
+    <h4 class="label">Using diskr</h4>
+    <ul>
+      <li><a href="#files">Files</a></li>
+      <li><a href="#reclaim">Reclaim</a></li>
+      <li><a href="#top-files">Top files</a></li>
+      <li><a href="#changes">Changes and baselines</a></li>
+      <li><a href="#packages">Packages and projects</a></li>
+      <li><a href="#space">Disks and free space</a></li>
+    </ul>
+    <h4 class="label">Reference</h4>
+    <ul>
+      <li><a href="#keys">Keys</a></li>
+      <li><a href="#reports">Reports</a></li>
+      <li><a href="#baselines">Baselines and profiles</a></li>
+      <li><a href="#appearance">Appearance</a></li>
+    </ul>
+    <h4 class="label">Internals</h4>
+    <ul>
+      <li><a href="#how-it-works">How it works</a></li>
+      <li><a href="#compatibility">Compatibility</a></li>
+      <li><a href="#development">Development</a></li>
+    </ul>
+  </nav>
+
+  <main id="main" class="doc">
+    <header class="doc-head">
+      <span class="label">Documentation</span>
+      <h1>The diskr manual</h1>
+      <p>Everything diskr does, how to drive it from the keyboard or a script, and how it arrives at its numbers. Press <kbd>⌘K</kbd> or <kbd>/</kbd> to search.</p>
+    </header>
+
+    <h2 id="install">Install</h2>
+    <p>diskr runs on macOS, on Apple Silicon and Intel. With Rust 1.88 or newer:</p>
+    <div class="code"><pre>cargo install diskr</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+    <p>Prebuilt archives for <code>aarch64-apple-darwin</code> and <code>x86_64-apple-darwin</code> are on <a href="https://github.com/milobeans/diskr/releases">GitHub Releases</a>. They target macOS 15 or newer and include dependency license notices and an inventory alongside the executable.</p>
+    <details class="more">
+      <summary>Verified install from GitHub Releases</summary>
+      <div>
+        <p>In a new, empty working directory:</p>
+        <div class="code"><pre>case "$(uname -m)" in
+  arm64) target=aarch64-apple-darwin ;;
+  x86_64) target=x86_64-apple-darwin ;;
+  *) echo "Unsupported architecture" >&2; exit 1 ;;
+esac
+archive="diskr-$target.tar.gz"
+curl --fail --location --remote-name "https://github.com/milobeans/diskr/releases/latest/download/$archive"
+curl --fail --location --remote-name "https://github.com/milobeans/diskr/releases/latest/download/SHA256SUMS"
+checksum=$(awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS)
+test -n "$checksum" &amp;&amp; printf '%s\n' "$checksum" | shasum -a 256 -c -</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+        <p>Only after checksum verification succeeds, extract and install:</p>
+        <div class="code"><pre>tar -xzf "$archive"
+mkdir -p "$HOME/.local/bin"
+install -m 755 diskr "$HOME/.local/bin/diskr"
+"$HOME/.local/bin/diskr" --help</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+        <p>Add <code>$HOME/.local/bin</code> to your shell's <code>PATH</code> if needed. Archives are not Developer ID signed or notarized; macOS or organization policy may require a different installation route. No quarantine or security-policy bypass is required or recommended.</p>
+      </div>
+    </details>
+    <p>To build from a local checkout, run <code>cargo install --path .</code>. A maintained Homebrew formula is not currently provided.</p>
+
+    <h2 id="first-run">First run</h2>
+    <div class="code"><pre>diskr               <span class="c"># browse your home folder</span>
+diskr ~/Downloads   <span class="c"># start somewhere specific</span></pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+    <p>The screen is split into panes: <strong>Files</strong> on the left, <strong>Disks</strong> and <strong>Packages</strong> on the right, and a <strong>Reclaim</strong> view that opens over them. <kbd>Tab</kbd> cycles through them, and the footer always lists the keys that work in the focused pane. Your first minute:</p>
+    <ul>
+      <li><kbd>S</kbd> sizes every visible folder; <kbd>.</kbd> shows hidden ones</li>
+      <li><kbd>⏎</kbd> opens a folder, <kbd>⌫</kbd> goes up, <kbd>/</kbd> searches</li>
+      <li><kbd>t</kbd> ranks the largest files under the selection; <kbd>i</kbd> shows details</li>
+      <li><kbd>?</kbd> lists every key, and <kbd>q</kbd> quits</li>
+    </ul>
+
+    <h2 id="files">Files</h2>
+    <div class="figure" data-frame="files">
+      <div class="window">
+        <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~</span></div>
+        <div class="screen"><canvas role="img" aria-label="The Files pane listing a home folder by allocated size"></canvas></div>
+      </div>
+    </div>
+    <p>The Files pane sorts by allocated size with a share bar for every row. Inline tags such as <code>[cache]</code> and <code>[build]</code> mark reclaimable folders as you browse, and a <code>↑</code> or <code>↓</code> badge shows how much a folder changed since its last scan. <kbd>o</kbd> cycles sort modes, including sorting by growth.</p>
+    <h3 id="lazy-scanning">Lazy, cached scanning</h3>
+    <p>Scans start in small batches around the current selection, so opening <code>/</code> or another broad folder does not immediately walk every subtree. Press <kbd>S</kbd> to fill in every missing or stale visible size without refreshing the folder or invalidating sizes that are already fresh; <kbd>r</kbd> refreshes the view and rescans everything visible.</p>
+    <p>Sizes are cached between runs. On relaunch, diskr replays macOS FSEvents since the previous session and revalidates only the folders that actually changed, so unchanged trees stay fresh without a rescan.</p>
+    <h3 id="allocated-size">Allocated and apparent size</h3>
+    <p>APFS clones, sparse files and compressed files make a file's logical size diverge from what it occupies on disk. diskr tracks both, sorts by allocated size, and shows apparent size when they differ. Folders or entries that cannot be read are flagged as lower bounds with <code>≥</code> rather than counted as zero.</p>
+    <h3 id="file-actions">Acting on files</h3>
+    <p>Reveal any item in Finder with <kbd>f</kbd>, open it with the default app with <kbd>O</kbd>, copy its path with <kbd>y</kbd>, or open Terminal at its location with <kbd>s</kbd>. <kbd>d</kbd> moves files or project dependency folders to the Trash after confirmation; <kbd>v</kbd> marks items and <kbd>a</kbd> marks everything visible so you can act on several at once. <kbd>c</kbd> renames and <kbd>n</kbd> creates a folder.</p>
+
+    <h2 id="reclaim">Reclaim</h2>
+    <div class="figure" data-frame="reclaim">
+      <div class="window">
+        <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~</span></div>
+        <div class="screen"><canvas role="img" aria-label="The cleanup view with 18 findings labeled safe, regenerable or risky"></canvas></div>
+      </div>
+    </div>
+    <p>Tab to the Reclaim pane, or run <code>diskr --reclaim ~</code>, to find caches, build artifacts and package stores. Every finding carries a class and the reason for it:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Class</th><th>Meaning</th><th>Examples</th></tr></thead>
+      <tbody>
+        <tr><td><strong class="tone-safe">safe</strong></td><td>Pure cache, regenerated automatically</td><td><code>~/Library/Caches</code>, Xcode DerivedData, Homebrew, npm and pip caches, Trash</td></tr>
+        <tr><td><strong class="tone-regen">regenerable</strong></td><td>Costs a rebuild or re-download</td><td><code>node_modules</code>, <code>target</code>, <code>.venv</code>, Cargo registry, iOS DeviceSupport</td></tr>
+        <tr><td><strong class="tone-risky">risky</strong></td><td>May hold data you cannot recreate</td><td>Xcode Archives, simulator devices, Docker data, <code>.next</code> output</td></tr>
+      </tbody>
+    </table></div>
+    <p>In the pane, <kbd>⏎</kbd> lists a finding's paths, <kbd>d</kbd> moves it to the Trash, <kbd>R</kbd> rescans, and <kbd>E</kbd> empties the Trash when the report lists a Trash finding. The <code>--reclaim</code> report only reports; it never deletes anything.</p>
+    <h3 id="detection">How findings are detected</h3>
+    <p>The detector runs two passes: a fixed-location pass over well-known paths (<code>~/Library/Caches</code>, Xcode DerivedData, Homebrew, Docker and others) and a bounded recursive pass that finds repeated build-artifact folders (<code>node_modules</code>, <code>target</code>, <code>.venv</code>, <code>__pycache__</code>, <code>.next</code>, <code>.gradle</code>). Both use the same bulk scanner for sizing.</p>
+    <p>Artifact classifications require supporting project or environment markers; a name such as <code>target</code> alone is not a cleanup recommendation. Reports disclose their depth, mount and hidden/cache exclusions. <kbd>Esc</kbd> or <kbd>Ctrl+C</kbd> cancels a focused reclaim scan, and cancelled findings are never published as a complete report.</p>
+    <div class="callout"><span class="label">Note</span><p>Candidate bytes are not a promise of freed space. APFS clones, snapshots and links can retain blocks, and moving files to the Trash does not free their storage until the Trash is emptied.</p></div>
+
+    <h2 id="top-files">Top files</h2>
+    <div class="figure" data-frame="top">
+      <div class="window">
+        <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~/Library</span></div>
+        <div class="screen"><canvas role="img" aria-label="Top Files ranking the largest files under Library"></canvas></div>
+      </div>
+    </div>
+    <p>Press <kbd>t</kbd> on any folder to open a full-width browser of the largest files beneath it, however deep. <kbd>⏎</kbd> or <kbd>f</kbd> reveals the selection in Finder, <kbd>O</kbd> opens it, <kbd>d</kbd> moves it to the Trash, and <kbd>t</kbd> or <kbd>Esc</kbd> returns. Top Files is a root-unique content scan, so it is the right tool when you need an exact total for a tree. From a script, use <code>diskr --top 20 ~/Downloads</code>.</p>
+
+    <h2 id="changes">Changes and baselines</h2>
+    <p>Save a baseline now and compare whenever you like. diskr keeps the latest baseline per root, and named baselines let you pin comparison points such as “before cleanup”.</p>
+<pre class="term-block"><span class="p">$ </span>diskr --save ~
+<span class="p">$ </span>diskr --diff ~
+<span class="w">Diff for /Users/demo</span>
+<span class="c">Baseline captured 3d ago</span>
+Total: 44 GiB disk → 50 GiB disk  <span class="g">(+5.1 GiB)</span>
+    <span class="g">+2.7 GiB</span>  grew       .ollama
+    <span class="g">+1.5 GiB</span>  grew       Downloads
+    <span class="g">+960 MiB</span>  grew       code</pre>
+    <p>In the TUI, <kbd>B</kbd> saves a baseline for the current folder. Baselines are stored under <code>~/Library/Application Support/diskr/</code>, and diffs do not overwrite them. Named baselines and saved inventory profiles are covered in <a href="#baselines">Baselines and profiles</a>.</p>
+
+    <h2 id="packages">Packages and projects</h2>
+    <p>Press <kbd>p</kbd> for the packages pane, and <kbd>p</kbd> again while it is focused to switch views. The <strong>System</strong> view lists Homebrew formulae and casks, npm, pip, Cargo and Bun installs with per-package sizes. The <strong>Projects</strong> view finds dependency folders under the current path and how much each costs. <kbd>u</kbd> filters to dependency leaves, and <kbd>x</kbd> (or <kbd>d</kbd>) runs the owning manager's uninstall flow after confirmation.</p>
+    <h3 id="package-sizes">How sizes are measured</h3>
+    <p>Reports distinguish empty inventories from unavailable managers, command failures, malformed output and partial results, and keep inventory and dependency-graph warnings in package details. Sizes describe known allocation within their stated footprint: directory trees, app and manager metadata, installed binaries, RECORD-listed files, or installer metadata. A <code>≥</code> marker denotes a partial measurement; manager totals also report unknown and limited-scope footprints.</p>
+    <p>Manager details identify the executable and package roots used by the scan, and uninstall uses that retained installation scope. Cargo follows <code>CARGO_INSTALL_ROOT</code>, its user configuration and <code>CARGO_HOME</code>; Homebrew, Bun, npm and pip supply their active locations through their inventory commands.</p>
+    <h3 id="dependency-counts">Dependency counts</h3>
+    <p>Project counts are unique declared names across runtime, development, optional, peer and build groups, not a count of installed transitive packages. Cargo target tables and Python PEP/Poetry groups are included; Python names are normalized and merged across requirements and pyproject declarations. Go <code>indirect</code> requirements are excluded. Manifests are never executed: dynamic declarations, executable Gemfiles and parse failures show unknown or lower-bound counts with warnings.</p>
+
+    <h2 id="space">Disks and free space</h2>
+    <p><code>diskr --space</code> explains why <code>df</code>, Finder and your own arithmetic disagree: mount-level totals, APFS container free space, what is actually available to you, and the local snapshots that can pin deleted data.</p>
+<pre class="term-block"><span class="p">$ </span>diskr --space ~
+<span class="w">Space report for /Users/demo</span>
+Mount: /System/Volumes/Data <span class="c">(apfs, /dev/disk3s5)</span>
+Total: 460 GiB
+Used: 446 GiB
+Free blocks: 14 GiB
+Available to user: <span class="b">14 GiB</span>
+APFS container disk3: 460 GiB total / 14 GiB free
+Local snapshots: 3</pre>
+    <p><code>diskr --thin-snapshots 10G ~</code> previews snapshot thinning as a dry run; add <code>--yes</code> to request it. In the TUI, <kbd>i</kbd> on a disk opens its details, where <kbd>s</kbd> retries snapshot discovery and <kbd>a</kbd> retries APFS container discovery independently.</p>
+
+    <h2 id="keys">Keys</h2>
+    <p>This list mirrors the in-app <kbd>?</kbd> overlay and <code>diskr --help</code>. Destructive keys are highlighted in red in the TUI and always ask for confirmation.</p>
+    <label class="key-filter">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="key-filter" type="search" placeholder="Filter keys: try “trash”, “sort” or “S”" aria-label="Filter keys" autocomplete="off">
+    </label>
+    <div class="table-wrap"><table id="keys-table">
+      <thead><tr><th>Key</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr data-key="?"><td><kbd>?</kbd></td><td>Show full keyboard help</td></tr>
+        <tr data-key="q"><td><kbd>q</kbd></td><td>Quit</td></tr>
+        <tr data-key="Esc, Ctrl+C"><td><kbd>Esc</kbd> <kbd>Ctrl+C</kbd></td><td>Cancel a focused listing/inventory/reclaim scan, focus Files, close a modal or clear a filter</td></tr>
+        <tr data-key="Up/Down, j/k"><td><kbd>↑</kbd> <kbd>↓</kbd> <kbd>j</kbd> <kbd>k</kbd></td><td>Move selection, or scroll keyboard help and detail drawers</td></tr>
+        <tr data-key="PageUp/PageDown"><td><kbd>PgUp</kbd> <kbd>PgDn</kbd></td><td>Move by a page, including in keyboard help and detail drawers</td></tr>
+        <tr data-key="Home/End"><td><kbd>Home</kbd> <kbd>End</kbd></td><td>Jump to first or last item in lists, help, and detail drawers</td></tr>
+        <tr data-key="Enter"><td><kbd>⏎</kbd></td><td>Open the selected directory, disk, package, or reclaim finding</td></tr>
+        <tr data-key="Backspace"><td><kbd>⌫</kbd></td><td>Go to parent directory</td></tr>
+        <tr data-key="Left/Right, h/l"><td><kbd>←</kbd> <kbd>→</kbd> <kbd>h</kbd> <kbd>l</kbd></td><td>Switch pane or package view</td></tr>
+        <tr data-key="Tab, Shift+Tab"><td><kbd>Tab</kbd> <kbd>⇧Tab</kbd></td><td>Cycle panes</td></tr>
+        <tr data-key="b"><td><kbd>b</kbd></td><td>Toggle full-width active view and side panels</td></tr>
+        <tr data-key="/"><td><kbd>/</kbd></td><td>Search files in the current directory or filter packages; Enter keeps, Esc clears</td></tr>
+        <tr data-key="Left/Right, Home/End (input)"><td><kbd>←</kbd> <kbd>→</kbd> <kbd>Home</kbd> <kbd>End</kbd> <span class="label">input</span></td><td>Move the caret in rename, mkdir and search; Backspace/Delete erase a grapheme</td></tr>
+        <tr data-key="i"><td><kbd>i</kbd></td><td>Show details for the selected file, package, or disk</td></tr>
+        <tr data-key="."><td><kbd>.</kbd></td><td>Toggle hidden files in the Files pane</td></tr>
+        <tr data-key="o"><td><kbd>o</kbd></td><td>Cycle sort mode in the Files pane</td></tr>
+        <tr data-key="r"><td><kbd>r</kbd></td><td>Refresh the current view and rescan all visible directory sizes</td></tr>
+        <tr data-key="S"><td><kbd>S</kbd></td><td>Scan every missing, stale, or incomplete visible directory size in the Files pane</td></tr>
+        <tr data-key="B"><td><kbd>B</kbd></td><td>Save a history baseline for the current Files directory</td></tr>
+        <tr data-key="t"><td><kbd>t</kbd></td><td>Toggle the full-width Top Files browser for the selection; Esc also returns</td></tr>
+        <tr data-key="c"><td><kbd>c</kbd></td><td>Rename the selected file</td></tr>
+        <tr data-key="n"><td><kbd>n</kbd></td><td>Create a directory</td></tr>
+        <tr data-key="v"><td><kbd>v</kbd></td><td>Toggle a mark on the selected file</td></tr>
+        <tr data-key="a"><td><kbd>a</kbd></td><td>Mark all visible files</td></tr>
+        <tr data-key="d" class="destructive"><td><kbd>d</kbd></td><td>Trash file/project dependency (or marks); uninstall installed package</td></tr>
+        <tr data-key="f"><td><kbd>f</kbd></td><td>Reveal selected item in Finder</td></tr>
+        <tr data-key="O"><td><kbd>O</kbd></td><td>Open selected item with the default app</td></tr>
+        <tr data-key="y"><td><kbd>y</kbd></td><td>Copy selected item path to clipboard</td></tr>
+        <tr data-key="s"><td><kbd>s</kbd></td><td>Open selected item location in Terminal</td></tr>
+        <tr data-key="p"><td><kbd>p</kbd></td><td>Open packages; press again while focused to switch package view</td></tr>
+        <tr data-key="u"><td><kbd>u</kbd></td><td>Toggle the dependency-leaf filter in the packages pane</td></tr>
+        <tr data-key="x" class="destructive"><td><kbd>x</kbd></td><td>Uninstall the selected package</td></tr>
+        <tr data-key="R"><td><kbd>R</kbd></td><td>Re-scan the Reclaim pane</td></tr>
+        <tr data-key="E" class="destructive"><td><kbd>E</kbd></td><td>Empty Trash from the Reclaim pane, when the report lists a Trash finding</td></tr>
+        <tr data-key="s (disk details)"><td><kbd>s</kbd> <span class="label">disk details</span></td><td>Retry local snapshot discovery without rerunning APFS discovery</td></tr>
+        <tr data-key="a (disk details)"><td><kbd>a</kbd> <span class="label">disk details</span></td><td>Retry APFS container discovery without rerunning snapshot discovery</td></tr>
+        <tr data-key="Up/Down, j/k (details)"><td><kbd>↑</kbd> <kbd>↓</kbd> <kbd>j</kbd> <kbd>k</kbd> <span class="label">details</span></td><td>Scroll the detail body while actions remain visible</td></tr>
+        <tr data-key="PageUp/PageDown (details)"><td><kbd>PgUp</kbd> <kbd>PgDn</kbd> <span class="label">details</span></td><td>Scroll detail body by ten lines</td></tr>
+        <tr data-key="Home/End (details)"><td><kbd>Home</kbd> <kbd>End</kbd> <span class="label">details</span></td><td>Jump to the start or end of detail content</td></tr>
+      </tbody>
+    </table>
+    <p class="key-empty">No keys match that filter.</p></div>
+
+    <h2 id="reports">Reports</h2>
+    <p>Everything the TUI knows is available as a report, and every report mode supports <code>--json</code>.</p>
+    <div class="code"><pre>diskr --top 20 ~/Downloads         <span class="c"># largest files by allocated size</span>
+diskr --reclaim ~                  <span class="c"># reclaimable caches and build artifacts</span>
+diskr --save ~/Downloads           <span class="c"># save a scan baseline</span>
+diskr --diff ~/Downloads           <span class="c"># what changed since the baseline</span>
+diskr --space ~                    <span class="c"># APFS free-space breakdown and snapshots</span>
+diskr --packages ~                 <span class="c"># system packages and project dependencies</span>
+diskr --packages --projects-only --max-depth 3 --exclude archive ~/code
+diskr --packages --manager cargo --manager brew --no-projects ~
+diskr --thin-snapshots 10G ~       <span class="c"># preview snapshot thinning (dry run)</span>
+diskr --thin-snapshots 10G --yes ~ <span class="c"># execute it</span></pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+    <h3 id="json">JSON output</h3>
+    <p>JSON reports use <code>schema_version: 1</code> and share a common <code>report</code>, <code>root</code>, <code>root_identity</code>, <code>scope</code>, <code>coverage</code>, <code>warnings</code>, <code>timing</code> and <code>numeric_semantics</code> contract while retaining earlier report-specific fields. <code>coverage.complete</code> is false for unreadable or skipped data, utility failures, unknown dependency counts, or incomplete and limited package footprints. Explicit discovery depth and policy exclusions remain visible in scope metadata.</p>
+    <p>Byte counts are unsigned 64-bit JSON integers, so use an integer-capable parser when values may exceed JavaScript's safe-number range. Signed byte deltas are decimal strings, timestamps are Unix seconds, and elapsed time is monotonic milliseconds. <code>root_identity</code> is a reversible Unix path encoding; <code>root</code> is the human-readable path.</p>
+    <p>Package JSON includes every manager's <code>scan_state</code> and each package's dependency evidence; incomplete graphs have unknown leaf status. <code>dep_count: null</code> marks an incomplete count, alongside <code>known_dep_count</code>, <code>dependency_count_complete</code> and <code>dependency_warnings</code>. APFS failures keep their error text and an <code>apfs_diagnostic</code> object whose <code>kind</code> is <code>timeout</code>, <code>tool_failure</code> or <code>malformed_output</code>.</p>
+    <h3 id="exit-codes">Exit codes</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>0</code></td><td>A usable report, including partial reports by default</td></tr>
+        <tr><td><code>1</code></td><td>An error</td></tr>
+        <tr><td><code>2</code></td><td>With <code>--strict</code>: the report printed but was incomplete; the diagnostic goes to stderr</td></tr>
+      </tbody>
+    </table></div>
+    <p><code>--strict</code> does not undo a requested <code>--save</code>. JSON stdout stays parseable and contains no progress or error prose, and closed output pipes still finish normally.</p>
+    <h3 id="filters">Filters</h3>
+    <p><code>--min-size SIZE</code> filters allocated-size rows in <code>--top</code>, <code>--reclaim</code> and <code>--packages</code>; <code>--class safe|regenerable|risky</code> filters reclaim categories. Unknown, partial or limited-scope sizes are retained. Filters affect rows, not scan totals or completeness, and JSON includes the filter settings and counts of removed rows.</p>
+    <p>Follow-up commands printed by reports quote paths for macOS <code>zsh</code>; paths containing control or non-UTF-8 bytes use <code>$'\xNN'</code> byte escapes.</p>
+    <h3 id="scope">Package scope</h3>
+    <p>Scope controls apply to <code>--packages</code> and <code>--save-profile</code>. <code>--projects-only</code> never invokes package managers. <code>--manager</code> is repeatable and selects <code>brew</code>, <code>brew-cask</code>, <code>npm</code>, <code>pip</code>, <code>cargo</code> or <code>bun</code>, with projects still included unless <code>--no-projects</code> is set. <code>--max-depth</code> accepts 0 (the selected folder only) through 64, default 5. Repeat <code>--exclude</code> for exact root-relative project subtrees, not shell globs; absolute paths and <code>..</code> are rejected. Exclusions affect discovery, not the footprint of an included project's dependency tree.</p>
+
+    <h2 id="baselines">Baselines and profiles</h2>
+    <p>The default <code>--save</code>/<code>--diff</code> pair keeps one latest baseline per root, retaining up to 512 roots. Named captures are separate, immutable, and never silently replace that latest baseline. Names use 1–80 ASCII letters, digits, <code>.</code>, <code>_</code> or <code>-</code>.</p>
+    <div class="code"><pre>diskr --save --baseline before-cleanup ~/code
+diskr --diff --baseline before-cleanup --json
+diskr --baselines list --json
+diskr --baselines pin before-cleanup
+diskr --baselines unpin before-cleanup
+diskr --baselines prune 10         <span class="c"># preview: keep newest 10 unpinned, plus all pinned</span>
+diskr --baselines prune 10 --yes   <span class="c"># apply; prints a recoverable library backup path</span>
+diskr --baselines export /tmp/diskr-baselines.json
+diskr --baselines import /tmp/diskr-baselines.json
+diskr --save-profile work --projects-only --max-depth 3 --exclude archive ~/code
+diskr --packages --profile work --json
+diskr --baselines remove-profile work        <span class="c"># preview; add --yes to back up and remove</span></pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+    <p>Without a path, a named diff uses its stored root; an explicit different root is rejected, not retargeted. The library lives alongside history as <code>baseline-library.json</code>, bounded at 16 MiB, 2,048 named captures and 256 profiles. Retention, capacity and source identities are visible in the list.</p>
+    <p>Pruning requires <code>--yes</code>, keeps every pinned record and writes a backup before removal. Exports refuse to overwrite an existing file. Imports validate before atomically merging, reject conflicting names, preserve machine and raw-root identity, and never replace latest-root history; re-importing identical records is harmless. A named cross-machine comparison is explicitly warned and partial for <code>--strict</code>, and imported foreign profiles cannot run until recreated locally with an explicit root, scope and new name.</p>
+    <h3 id="profiles">Saved inventory profiles</h3>
+    <p>Profiles save a package inventory root and scope without invoking managers. <code>--packages --profile NAME</code> accepts report filters, JSON and strict options, but not another path or scope override. Saving an existing name is an error; remove obsolete profiles with <code>--baselines remove-profile</code>, which previews by default and requires <code>--yes</code>, with a backup.</p>
+
+    <h2 id="appearance">Appearance</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>DISKR_THEME</code></td><td><code>dark</code> (default), <code>light</code>, <code>high-contrast</code> or <code>mono</code></td></tr>
+        <tr><td><code>NO_COLOR</code></td><td>Any non-empty value selects monochrome, keeping selection gutters and textual warning and coverage markers</td></tr>
+        <tr><td><code>DISKR_REDUCED_MOTION=1</code></td><td>Replaces animated scan glyphs with a static <code>scan</code> label</td></tr>
+        <tr><td><code>DISKR_ASCII=1</code></td><td>ASCII alternatives for common TUI decorations, and no animation. Unicode filenames stay Unicode</td></tr>
+      </tbody>
+    </table></div>
+    <p>These preferences affect terminal rendering, not filesystem names, action targets or JSON data. Use a UTF-8, VT-compatible terminal; 80×24 or larger is recommended.</p>
+
+    <h2 id="how-it-works">How it works</h2>
+    <h3 id="scanner">The scanner</h3>
+    <p>The core scanner calls <code>getattrlistbulk(2)</code> with a packed attribute list requesting name, object type, logical size and allocated size. The kernel fills a buffer with dozens of entries per call, and diskr parses the packed binary layout directly without allocating per entry on the hot path. A custom work-stealing thread pool fans out across subfolders. Performance depends on the filesystem, tree shape and cache state; no fixed speedup is promised.</p>
+    <p>Sizes count regular-file content only: symlink targets and folders' own metadata blocks are not added, so totals run slightly under <code>du</code> and Finder. The size cache and history baselines are persisted as JSON through <code>serde_json</code>.</p>
+    <h3 id="responsiveness">Responsiveness and cancellation</h3>
+    <p>Startup renders before state loading, with <kbd>q</kbd>, <kbd>Esc</kbd> and <kbd>Ctrl+C</kbd> cancellation. Folder enumeration runs off the UI loop in bounded batches, and navigation or refresh invalidates older generations. Cancelling enumeration in Files labels the shown list partial; <kbd>r</kbd> retries. Package rows appear as soon as each manager or project is ready, the inventory footer reports elapsed time and ready stages, and cancelling keeps the ready rows with a partial marker. Quitting cancels read-only discovery, while pending changes finish gracefully.</p>
+    <h3 id="shared-scans">Shared scans</h3>
+    <p>Independent scans of the same root, identity, policy, freshness and requested Top Files capacity share in-flight work. Each subscriber keeps its own cancellation, so one cancelled caller cannot cancel another. Completed results are not retained as a cache, and refreshes or changes invalidate matching in-flight work.</p>
+    <h3 id="accuracy">Accuracy notes</h3>
+    <p>Baseline and cleanup totals deduplicate hardlinks within their selected scope. Independently measured Files rows may share an inode and must not be summed as an exact unique-root total; use Top Files for that. Human terminal output escapes control characters from filenames and external tools, while JSON keeps normal structured escaping.</p>
+    <p>APFS space reporting combines <code>statfs(2)</code> for mount-level stats, a narrow parser for <code>diskutil info -plist</code> output for container-level free space, and <code>tmutil listlocalsnapshots</code> for snapshot discovery. Container allocation is not exclusive per-file ownership or a freed-space guarantee.</p>
+
+    <h2 id="compatibility">Compatibility</h2>
+    <p>diskr is macOS-only, on Apple Silicon and Intel, with a minimum supported Rust version of 1.88.0. CI's maintained runtime floor is macOS 15, with native tests on macOS 15 and 26 for both architectures. Older macOS source builds are unverified, not deliberately blocked, and the target guard reports a clear error on Linux, Windows and unsupported CPUs.</p>
+    <p>The filesystem baseline is local APFS. Hardlinks, sparse files, inaccessible entries, filesystem identity and tool-output variations have fixture coverage; other filesystems and network volumes are best-effort, and mount exclusions remain visible. Headless frame tests cover 40, 80 and 120 columns with short and tall viewports, and native PTY smoke tests exercise keyboard input and clean shutdown. Identical glyph widths across every terminal, font or multiplexer are not promised.</p>
+
+    <h2 id="development">Development</h2>
+    <p>The validation set every change passes:</p>
+    <div class="code"><pre>cargo fmt -- --check
+cargo check --locked
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked
+cargo package --locked</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+    <p>Benchmarks, the release flow and how the screenshots and this site's demo are generated are documented in the <a href="https://github.com/milobeans/diskr#development">README's Development section</a>. Planned work lives in the <a href="https://github.com/milobeans/diskr/blob/main/ROADMAP.md">roadmap</a> and release history in the <a href="https://github.com/milobeans/diskr/blob/main/CHANGELOG.md">changelog</a>.</p>
+
+    <nav class="pager" aria-label="More">
+      <a href="../"><span class="label">← Home</span><span>Overview and demo</span></a>
+      <a href="https://github.com/milobeans/diskr"><span class="label">Source →</span><span>diskr on GitHub</span></a>
+    </nav>
+  </main>
+
+  <aside class="toc" aria-label="On this page">
+    <span class="label">On this page</span>
+    <ul></ul>
+  </aside>
+</div>
+
+<div class="palette" role="dialog" aria-modal="true" aria-label="Search documentation">
+  <div class="palette-box">
+    <label class="palette-input">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input type="search" placeholder="Search the docs…" aria-label="Search the docs" autocomplete="off" spellcheck="false">
+    </label>
+    <ul class="palette-results" role="listbox"></ul>
+    <div class="palette-foot"><span><kbd>↑</kbd> <kbd>↓</kbd> move</span><span><kbd>⏎</kbd> open</span><span><kbd>esc</kbd> close</span></div>
+  </div>
+</div>
+</body>
+</html>

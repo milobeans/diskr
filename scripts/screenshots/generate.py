@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate the README screenshots and demo animation in .github/assets/.
+"""Regenerate the README screenshots, demo animation and docs-site replay.
 
     python3 scripts/screenshots/generate.py [--binary PATH] [--out DIR] [--keep-demo]
 
@@ -192,6 +192,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--binary", help="diskr binary to capture (default: build target/release/diskr)")
     ap.add_argument("--out", default=os.path.join(REPO, ".github", "assets"))
+    ap.add_argument("--site-out", default=os.path.join(REPO, "site", "assets", "replay.json"),
+                    help="replay data for the docs site")
     ap.add_argument("--keep-demo", action="store_true", help="keep the demo home after rendering")
     args = ap.parse_args()
 
@@ -241,8 +243,10 @@ def main():
     render.animate(frames, 120, 22, 2, os.path.join(args.out, "demo.webp"), os.path.join(WORK, "frames"))
     render.social_card(os.path.join(args.out, "files.png"), os.path.join(args.out, "social-preview.png"))
     shutil.rmtree(os.path.join(WORK, "frames"), ignore_errors=True)
-    for name in ["demo.webp", "files.png", "reclaim.png", "top-files.png", "social-preview.png"]:
-        path = os.path.join(args.out, name)
+    render.replay_json(frames, 120, 22, SHOWN_HOME, args.site_out)
+    outputs = [os.path.join(args.out, name) for name in
+               ["demo.webp", "files.png", "reclaim.png", "top-files.png", "social-preview.png"]]
+    for path in outputs + [args.site_out]:
         print(f"{os.path.getsize(path) // 1024:6d} KiB  {os.path.relpath(path, REPO)}")
 
 

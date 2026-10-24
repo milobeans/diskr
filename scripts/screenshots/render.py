@@ -253,3 +253,57 @@ def social_card(screenshot, out):
     shot = shot.resize((target_w, round(shot.height * target_w / shot.width)), Image.LANCZOS)
     card.alpha_composite(shot, ((w - target_w) // 2, 205 * s))
     card.resize((1280, 640), Image.LANCZOS).convert("RGB").save(out, optimize=True)
+
+
+def replay_json(frames, cols, rows, shown_home, out):
+    """Compact replay for the docs site: a style table, deduplicated rows,
+    per-frame hold times, chapter starts, and named stills."""
+    import json
+
+    styles, style_ids, lines, line_ids, packed, texts = [], {}, [], {}, [], []
+    for i, frame in enumerate(frames):
+        ids = []
+        for row in frame["cells"]:
+            runs = []
+            for ch, fg, bg, bold, rev in row:
+                key = (fg, bg, bool(bold), bool(rev))
+                if key not in style_ids:
+                    style_ids[key] = len(styles)
+                    styles.append(list(key))
+                ch = ch or "\u0000"  # trailing half of a wide glyph
+                if runs and runs[-1][1] == style_ids[key]:
+                    runs[-1][0] += ch
+                else:
+                    runs.append([ch, style_ids[key]])
+            key = json.dumps(runs, ensure_ascii=False)
+            if key not in line_ids:
+                line_ids[key] = len(lines)
+                lines.append(runs)
+            ids.append(line_ids[key])
+        nxt = frames[i + 1]["t"] if i + 1 < len(frames) else frame["t"] + 3.0
+        packed.append({"d": min(2400, max(40, round((nxt - frame["t"]) * 1000))), "l": ids})
+        texts.append("\n".join("".join(c[0] or " " for c in row) for row in frame["cells"]))
+
+    def first(pred):
+        return next((i for i, t in enumerate(texts) if pred(t)), None)
+
+    def settled(pred):
+        hits = [i for i, t in enumerate(texts) if pred(t)]
+        return max(hits, key=lambda i: packed[i]["d"]) if hits else None
+
+    chapters = [("Scan", 0), ("Drill in", first(lambda t: f"{shown_home}/code" in t)),
+                ("Reclaim", first(lambda t: "cleanup" in t)), ("Top files", first(lambda t: "top files" in t))]
+    marks = {
+        "files": settled(lambda t: "full scan complete" in t and "↑" in t and "top files ·" not in t),
+        "project": settled(lambda t: "[build]" in t),
+        "reclaim": settled(lambda t: "candidate disk bytes" in t),
+        "top": settled(lambda t: "top files ·" in t),
+    }
+    missing = [name for name, i in chapters + list(marks.items()) if i is None]
+    if missing:
+        raise SystemExit(f"replay is missing expected views: {', '.join(missing)}")
+    data = {"cols": cols, "rows": rows, "styles": styles, "lines": lines, "frames": packed,
+            "chapters": [{"name": n, "frame": i} for n, i in sorted(chapters, key=lambda c: c[1])],
+            "marks": marks}
+    with open(out, "w") as f:
+        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))

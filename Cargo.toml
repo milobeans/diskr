@@ -7,11 +7,12 @@ authors = ["Milo Evans"]
 description = "Fast macOS disk explorer for the terminal: see where your space went and what is safe to reclaim"
 license = "MIT"
 repository = "https://github.com/milobeans/diskr"
-homepage = "https://github.com/milobeans/diskr"
+homepage = "https://milobeans.github.io/diskr/"
+documentation = "https://milobeans.github.io/diskr/docs/"
 readme = "README.md"
 keywords = ["disk-usage", "storage", "tui", "macos", "apfs"]
 categories = ["command-line-utilities", "filesystem"]
-exclude = [".github/assets/", "scripts/"]
+exclude = [".github/assets/", "scripts/", "site/"]
 
 [dependencies]
 ratatui-core = { version = "0.1", features = ["std"] }

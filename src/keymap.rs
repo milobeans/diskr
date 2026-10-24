@@ -485,6 +485,30 @@ mod tests {
     }
 
     #[test]
+    fn docs_site_documents_every_keymap_key() {
+        // The docs site is not part of the published crate; skip when absent.
+        let Ok(site) =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/site/docs/index.html"))
+        else {
+            return;
+        };
+        let documented: HashSet<&str> = site
+            .split("data-key=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        let mapped: HashSet<&str> = HELP_SECTIONS
+            .iter()
+            .flat_map(|section| section.bindings.iter())
+            .map(|binding| binding.key)
+            .collect();
+        assert_eq!(
+            documented, mapped,
+            "docs site key table drifted from the keymap"
+        );
+    }
+
+    #[test]
     fn pane_specific_actions_match_their_focus() {
         for key in ["S", "o", "B", "."] {
             assert!(is_available_in_focus(Focus::Files, key));

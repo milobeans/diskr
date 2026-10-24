@@ -13,7 +13,7 @@ A fast, macOS-native disk explorer for the terminal, written in Rust.
 
 <img src=".github/assets/demo.webp" width="100%" alt="diskr in a terminal: directory sizes stream in for a home folder, a project opens to reveal a 4.4 GiB build directory, the cleanup view lists safe, regenerable and risky findings, and Top Files ranks the largest files under Library">
 
-[Install](#install) · [Tour](#a-quick-tour) · [Keys](#keys) · [Reports](#reports-and-scripting) · [How it works](#how-it-works)
+**[Website & docs](https://milobeans.github.io/diskr/)** · [Install](#install) · [Tour](#a-quick-tour) · [Keys](#keys) · [Reports](#reports-and-scripting) · [How it works](#how-it-works)
 
 </div>
 
@@ -575,11 +575,12 @@ Record CPU, macOS/filesystem, terminal dimensions, build profile, warm/cold cach
 state, sample count and tool versions when comparing results. These fixtures
 are local warm-cache diagnostics, not a claim about every volume or workload.
 
-### README images
+### README images and website
 
-The screenshots, demo animation and social preview in `.github/assets/` are
-generated from the release binary, not drawn by hand. After a UI change,
-regenerate them with:
+The screenshots, demo animation and social preview in `.github/assets/`, and
+the replay data behind the [website](https://milobeans.github.io/diskr/)
+(`site/assets/replay.json`), are generated from the release binary, not drawn
+by hand. After a UI change, regenerate them with:
 
 ```sh
 python3 scripts/screenshots/generate.py
@@ -590,6 +591,12 @@ free space. It builds a synthetic home directory from APFS clones, drives diskr
 in a pseudo-terminal, and installs its pinned Python packages into
 `target/screenshots/venv`. Host paths are masked as `/Users/demo`; the disks
 panel still shows the machine's real volumes.
+
+The website in `site/` is static HTML, CSS and JavaScript with no build step;
+preview it with `python3 -m http.server -d site` after copying
+`.github/assets/*` into `site/assets/img/`. The Pages workflow publishes it on
+every push to `main` that touches the site or its images. A test keeps the
+site's key reference in sync with the keymap.
 
 ### Releases
 

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <style>.i{fill:#16171b}@media (prefers-color-scheme:dark){.i{fill:#ece8dd}}</style>
+  <rect x="3" y="7" width="7.5" height="7.5" rx="2" fill="#e0a330"/>
+  <rect x="12.25" y="7" width="7.5" height="7.5" rx="2" fill="#e0a330"/>
+  <rect x="21.5" y="7" width="7.5" height="7.5" rx="2" class="i"/>
+  <rect x="3" y="17.5" width="7.5" height="7.5" rx="2" fill="#e0a330"/>
+  <rect x="12.25" y="17.5" width="7.5" height="7.5" rx="2" class="i"/>
+  <rect x="21.5" y="17.5" width="7.5" height="7.5" rx="2" class="i" opacity=".3"/>
+</svg>
