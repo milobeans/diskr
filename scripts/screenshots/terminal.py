@@ -78,10 +78,13 @@ class Session:
         time.sleep(seconds)
 
     def until(self, needle, timeout=30):
-        deadline = time.time() + timeout
-        while needle not in self.text():
-            if time.time() > deadline:
-                raise TimeoutError(f"screen never showed {needle!r}:\n{self.text()}")
+        self.until_screen(lambda text: needle in text, repr(needle), timeout)
+
+    def until_screen(self, matches, description, timeout=30):
+        deadline = time.monotonic() + timeout
+        while not matches(self.text()):
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"screen never showed {description}:\n{self.text()}")
             time.sleep(0.1)
 
     def ensure(self, needle, key):

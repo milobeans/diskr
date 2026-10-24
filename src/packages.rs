@@ -1,17 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::bulkstat::{self, SizeInfo};
 pub use crate::manifest::DependencyCount;
 use crate::manifest::{self, bounded_text};
 use crate::pool;
+use crate::process::CommandResult;
 use crate::terminal_text;
 
 thread_local! {
@@ -445,6 +444,10 @@ impl ManagerEnvironment {
             .args(args)
             .current_dir(&self.cwd);
         command.env("NO_COLOR", "1");
+        if self.manager == Manager::Pip {
+            // Verbose pip version checks can append index diagnostics to JSON stdout.
+            command.env("PIP_DISABLE_PIP_VERSION_CHECK", "1");
+        }
         if matches!(self.manager, Manager::Brew | Manager::BrewCask) {
             command.env("HOMEBREW_NO_AUTO_UPDATE", "1");
         }
@@ -457,7 +460,7 @@ impl ManagerEnvironment {
     }
 
     fn run(&self, args: &[&str], timeout: Duration) -> CommandResult {
-        run_process(self.command(args), timeout)
+        run_scan_process(self.command(args), timeout)
     }
 
     fn query_path(&self, args: &[&str]) -> Result<PathBuf, String> {
@@ -555,13 +558,6 @@ fn manager_scan_state(
 const CMD_TIMEOUT: Duration = Duration::from_secs(10);
 const CMD_TIMEOUT_SLOW: Duration = Duration::from_secs(30);
 const UNINSTALL_TIMEOUT: Duration = Duration::from_secs(300);
-
-pub(crate) struct CommandResult {
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
-    pub(crate) success: bool,
-    pub(crate) timed_out: bool,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectDeps {
@@ -680,19 +676,22 @@ pub fn scan_dep_graph(reports: &[ManagerReport]) -> DepGraph {
         .iter()
         .find(|report| report.manager == Manager::Brew)
         .and_then(|report| report.environment.clone());
+    let brew_cancellation = current_cancellation();
     let brew_handle = thread::spawn(move || {
-        if brew_names.is_empty() {
-            (HashMap::new(), None)
-        } else if let Some(environment) = brew_environment {
-            scan_brew_dep_graph(&brew_names, &environment)
-        } else {
-            (
-                HashMap::new(),
-                Some(String::from(
-                    "brew dependency environment unavailable; rescan packages",
-                )),
-            )
-        }
+        with_scan_cancellation(&brew_cancellation, || {
+            if brew_names.is_empty() {
+                (HashMap::new(), None)
+            } else if let Some(environment) = brew_environment {
+                scan_brew_dep_graph(&brew_names, &environment)
+            } else {
+                (
+                    HashMap::new(),
+                    Some(String::from(
+                        "brew dependency environment unavailable; rescan packages",
+                    )),
+                )
+            }
+        })
     });
 
     let pip_names: Vec<String> = reports
@@ -704,19 +703,22 @@ pub fn scan_dep_graph(reports: &[ManagerReport]) -> DepGraph {
         .iter()
         .find(|report| report.manager == Manager::Pip)
         .and_then(|report| report.environment.clone());
+    let pip_cancellation = current_cancellation();
     let pip_handle = thread::spawn(move || {
-        if pip_names.is_empty() {
-            (HashMap::new(), None)
-        } else if let Some(environment) = pip_environment {
-            scan_pip_dep_graph(&pip_names, &environment)
-        } else {
-            (
-                HashMap::new(),
-                Some(String::from(
-                    "pip dependency environment unavailable; rescan packages",
-                )),
-            )
-        }
+        with_scan_cancellation(&pip_cancellation, || {
+            if pip_names.is_empty() {
+                (HashMap::new(), None)
+            } else if let Some(environment) = pip_environment {
+                scan_pip_dep_graph(&pip_names, &environment)
+            } else {
+                (
+                    HashMap::new(),
+                    Some(String::from(
+                        "pip dependency environment unavailable; rescan packages",
+                    )),
+                )
+            }
+        })
     });
 
     let (brew_deps, brew_warning) = brew_handle.join().unwrap_or_else(|_| {
@@ -973,7 +975,7 @@ pub fn run_uninstall(
     environment: Option<&ManagerEnvironment>,
 ) -> Result<String, String> {
     let command = uninstall_command(manager, name, environment)?;
-    let result = run_process(command, UNINSTALL_TIMEOUT);
+    let result = crate::process::run_process(command, UNINSTALL_TIMEOUT);
     let cmd = manager.label();
     if result.timed_out {
         Err(format!("{cmd} timed out after 5 minutes; installation state may have changed, so rescan before retrying"))
@@ -1590,7 +1592,7 @@ fn scan_cargo(environment: &mut ManagerEnvironment) -> (Vec<Package>, Option<Str
     environment.package_roots = vec![root.join("bin")];
     let mut command = environment.command(&["install", "--list", "--root"]);
     command.arg(&root);
-    let result = run_process(command, CMD_TIMEOUT);
+    let result = run_scan_process(command, CMD_TIMEOUT);
     cargo_inventory_from_result(&result, Some(&root.join("bin")))
 }
 
@@ -2223,165 +2225,12 @@ fn run_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Comm
     if cmd == "brew" {
         command.env("HOMEBREW_NO_AUTO_UPDATE", "1");
     }
-    run_process(command, timeout)
+    run_scan_process(command, timeout)
 }
 
-const MAX_COMMAND_OUTPUT: usize = 16 * 1024 * 1024;
-
-pub(crate) fn run_process(mut command: Command, timeout: Duration) -> CommandResult {
+fn run_scan_process(command: Command, timeout: Duration) -> CommandResult {
     let cancellation = current_cancellation();
-    if cancellation.is_cancelled() {
-        return CommandResult {
-            stdout: String::new(),
-            stderr: String::from("scan cancelled"),
-            success: false,
-            timed_out: false,
-        };
-    }
-    command.process_group(0);
-    let mut child = match command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return CommandResult {
-                stdout: String::new(),
-                stderr: e.to_string(),
-                success: false,
-                timed_out: false,
-            }
-        }
-    };
-
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    if let Err(err) = stdout_pipe
-        .as_ref()
-        .map(set_nonblocking)
-        .transpose()
-        .and_then(|_| stderr_pipe.as_ref().map(set_nonblocking).transpose())
-    {
-        terminate_command(&mut child);
-        reap_command(child);
-        return CommandResult {
-            stdout: String::new(),
-            stderr: err.to_string(),
-            success: false,
-            timed_out: false,
-        };
-    }
-
-    let deadline = Instant::now() + timeout;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut status = None;
-    let mut failed = None;
-    let mut timed_out = false;
-    loop {
-        if cancellation.is_cancelled() {
-            failed = Some(String::from("scan cancelled"));
-            break;
-        }
-        if let Err(err) = drain_pipe(&mut stdout_pipe, &mut stdout)
-            .and_then(|_| drain_pipe(&mut stderr_pipe, &mut stderr))
-        {
-            failed = Some(err.to_string());
-            break;
-        }
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(result) => status = result,
-                Err(err) => {
-                    failed = Some(err.to_string());
-                    break;
-                }
-            }
-        }
-        if status.is_some() && stdout_pipe.is_none() && stderr_pipe.is_none() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    if timed_out || failed.is_some() {
-        // Descendants may inherit either pipe after their direct parent exits.
-        terminate_command(&mut child);
-    }
-    if status.is_none() {
-        reap_command(child);
-    }
-    let command_failed = failed.is_some();
-    let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
-    if let Some(err) = failed {
-        stderr = if stderr.is_empty() {
-            err
-        } else {
-            format!("{err}\n{stderr}")
-        };
-    }
-    CommandResult {
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr,
-        success: !timed_out && status.is_some_and(|s| s.success()) && !command_failed,
-        timed_out,
-    }
-}
-
-fn set_nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
-    let fd = pipe.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn drain_pipe<R: io::Read>(pipe: &mut Option<R>, output: &mut Vec<u8>) -> io::Result<()> {
-    let Some(reader) = pipe.as_mut() else {
-        return Ok(());
-    };
-    let mut buf = [0_u8; 8192];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => {
-                *pipe = None;
-                return Ok(());
-            }
-            Ok(n) => {
-                if output.len().saturating_add(n) > MAX_COMMAND_OUTPUT {
-                    return Err(io::Error::other("command output exceeds 16 MiB"));
-                }
-                output.extend_from_slice(&buf[..n]);
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-fn reap_command(mut child: std::process::Child) {
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
-}
-
-fn terminate_command(child: &mut std::process::Child) {
-    let pid = child.id() as libc::pid_t;
-    if pid <= 0 {
-        let _ = child.kill();
-        return;
-    }
-
-    if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
-        let _ = child.kill();
-    }
+    crate::process::run_process_cancellable(command, timeout, || cancellation.is_cancelled())
 }
 
 #[derive(Clone, Copy)]
@@ -2685,6 +2534,7 @@ fn allocated_size_from_metadata(meta: &std::fs::Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn manager_stream_emits_ready_reports_without_waiting_for_a_slow_manager() {
@@ -2784,7 +2634,7 @@ mod tests {
                 command
                     .args(["-c", "printf ready > \"$1\"; exec /bin/sleep 30", "fixture"])
                     .arg(worker_ready);
-                run_process(command, Duration::from_secs(10))
+                run_scan_process(command, Duration::from_secs(10))
             })
         });
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2802,6 +2652,149 @@ mod tests {
         });
         assert!(cancelled.into_iter().all(|cancelled| cancelled));
         assert!(!current_cancellation().is_cancelled());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dependency_graph_workers_cancel_their_processes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("graph_cancel");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut reports = Vec::new();
+        for manager in [Manager::Brew, Manager::Pip] {
+            let executable = root.join(manager.key());
+            std::fs::write(
+                &executable,
+                "#!/bin/sh\nprintf ready > \"$0.ready\"\nexec /bin/sleep 30\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            reports.push(ManagerReport {
+                manager,
+                packages: vec![Package {
+                    name: String::from("fixture"),
+                    version: String::from("1.0"),
+                    size: None,
+                    path: None,
+                    metadata_path: None,
+                    coverage: FootprintCoverage::default(),
+                }],
+                total_size: SizeInfo::default(),
+                available: true,
+                warning: None,
+                state: ManagerScanState::Complete,
+                environment: Some(ManagerEnvironment {
+                    executable,
+                    prefix_args: Vec::new(),
+                    install_root: None,
+                    package_roots: Vec::new(),
+                    cwd: root.clone(),
+                    manager,
+                }),
+            });
+        }
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancellation = bulkstat::ScanCancellation::new(std::sync::Arc::clone(&generation), 0);
+        let worker = thread::spawn(move || {
+            with_scan_cancellation(&cancellation, || scan_dep_graph(&reports))
+        });
+        let ready = [root.join("brew.ready"), root.join("pip.ready")];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.iter().all(|path| path.exists()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(ready.iter().all(|path| path.exists()));
+        let cancelled_at = Instant::now();
+        generation.fetch_add(1, Ordering::Relaxed);
+        let graph = worker.join().unwrap();
+        assert!(cancelled_at.elapsed() < Duration::from_secs(2));
+        assert_eq!(graph.warnings.len(), 2);
+        assert!(graph
+            .warnings
+            .iter()
+            .all(|warning| warning.message.contains("cancelled")));
+        assert!(graph
+            .entries
+            .values()
+            .all(|entry| !entry.is_dependency_leaf()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uninstall_does_not_inherit_inventory_cancellation() {
+        let environment = ManagerEnvironment {
+            executable: PathBuf::from("/bin/sh"),
+            prefix_args: vec![
+                String::from("-c"),
+                String::from("printf 'fixture completed'"),
+                String::from("fixture"),
+            ],
+            install_root: None,
+            package_roots: Vec::new(),
+            cwd: std::env::temp_dir(),
+            manager: Manager::Pip,
+        };
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let cancellation = bulkstat::ScanCancellation::new(generation, 0);
+        let result = with_scan_cancellation(&cancellation, || {
+            run_uninstall(Manager::Pip, "fixture", Some(&environment))
+        });
+        assert_eq!(result.unwrap(), "fixture completed");
+    }
+
+    #[test]
+    fn pip_json_inventory_disables_verbose_version_check_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("pip_version_check");
+        std::fs::create_dir_all(root.join("fixture-1.0.dist-info")).unwrap();
+        std::fs::write(root.join("fixture.py"), b"fixture").unwrap();
+        std::fs::write(root.join("fixture-1.0.dist-info/RECORD"), "fixture.py,,\n").unwrap();
+        let executable = root.join("pip3");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+[ "$*" = 'list --format=json --verbose' ] || exit 2
+/bin/cat "$0.json"
+if [ "$PIP_DISABLE_PIP_VERSION_CHECK" != 1 ]; then
+  printf '\n  Link requires a different Python: fixture\n'
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            root.join("pip3.json"),
+            serde_json::json!([{"name":"fixture", "version":"1.0", "location":root}]).to_string(),
+        )
+        .unwrap();
+        let mut environment = ManagerEnvironment {
+            executable,
+            prefix_args: Vec::new(),
+            install_root: None,
+            package_roots: Vec::new(),
+            cwd: root.clone(),
+            manager: Manager::Pip,
+        };
+        let mut unconfigured = environment.command(&["list", "--format=json", "--verbose"]);
+        unconfigured.env_remove("PIP_DISABLE_PIP_VERSION_CHECK");
+        let contaminated = crate::process::run_process(unconfigured, CMD_TIMEOUT);
+        assert!(contaminated.success);
+        assert!(contaminated
+            .stdout
+            .contains("Link requires a different Python"));
+        let (_, warning, parse_failed) = pip_inventory_from_result(&contaminated, &[]);
+        assert!(parse_failed);
+        assert!(warning.unwrap().contains("invalid JSON"));
+
+        let (packages, warning, parse_failed) = scan_pip(&mut environment);
+        assert!(!parse_failed, "{warning:?}");
+        assert!(warning.is_none(), "{warning:?}");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "fixture");
+        assert_eq!(packages[0].size.unwrap().logical, 7);
+        assert_eq!(environment.package_roots, vec![root.clone()]);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3503,87 +3496,6 @@ mod tests {
 
         std::fs::remove_dir_all(temp_caskroom).unwrap();
         std::fs::remove_dir_all(temp_apps).unwrap();
-    }
-
-    #[test]
-    fn run_command_captures_stdout_on_success() {
-        let result = run_command("echo", &["hello"]);
-        assert!(result.success);
-        assert!(!result.timed_out);
-        assert_eq!(result.stdout.trim(), "hello");
-    }
-
-    #[test]
-    fn run_command_captures_stderr_on_failure() {
-        let result = run_command("ls", &["/nonexistent_path_diskr_test_49"]);
-        assert!(!result.success);
-        assert!(!result.timed_out);
-        assert!(!result.stderr.is_empty());
-    }
-
-    #[test]
-    fn run_command_times_out_on_slow_process() {
-        let result = run_command_with_timeout("sleep", &["60"], Duration::from_millis(200));
-        assert!(result.timed_out);
-        assert!(!result.success);
-    }
-
-    #[test]
-    fn run_command_timeout_kills_grandchildren_holding_stdout_open() {
-        use std::sync::mpsc;
-
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let result = run_command_with_timeout(
-                "sh",
-                &["-c", "sleep 5 & wait"],
-                Duration::from_millis(200),
-            );
-            tx.send(result).unwrap();
-        });
-
-        let result = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("timed-out command should return even when a grandchild inherits stdout");
-        assert!(result.timed_out);
-        assert!(!result.success);
-    }
-
-    #[test]
-    fn run_command_deadline_includes_pipe_drain_after_parent_exits() {
-        let started = Instant::now();
-        let result = run_command_with_timeout(
-            "sh",
-            &["-c", "sleep 5 & printf 'parent exited\\n'"],
-            Duration::from_millis(200),
-        );
-        assert!(result.timed_out);
-        assert!(!result.success);
-        assert!(result.stdout.contains("parent exited"));
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn drain_pipe_enforces_output_bound_at_exact_boundary() {
-        let mut within_limit = Some(io::Cursor::new(vec![b'x'; MAX_COMMAND_OUTPUT]));
-        let mut output = Vec::new();
-        drain_pipe(&mut within_limit, &mut output).unwrap();
-        assert!(within_limit.is_none());
-        assert_eq!(output.len(), MAX_COMMAND_OUTPUT);
-
-        let mut over_limit = Some(io::Cursor::new(vec![b'x'; MAX_COMMAND_OUTPUT + 1]));
-        let mut output = Vec::new();
-        let error = drain_pipe(&mut over_limit, &mut output).unwrap_err();
-        assert_eq!(error.to_string(), "command output exceeds 16 MiB");
-        assert!(output.len() <= MAX_COMMAND_OUTPUT);
-    }
-
-    #[test]
-    fn run_command_reports_missing_command() {
-        let result = run_command("diskr_nonexistent_cmd_49", &[]);
-        assert!(!result.success);
-        assert!(!result.timed_out);
-        assert!(!result.stderr.is_empty());
     }
 
     #[test]

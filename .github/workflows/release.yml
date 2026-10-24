@@ -28,12 +28,37 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
+      MACOS_SIGNING_ENABLED: ${{ vars.MACOS_SIGNING_ENABLED || 'false' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Validate distribution tooling and signing configuration
+        env:
+          MACOS_DEVELOPER_ID_P12: ${{ secrets.MACOS_DEVELOPER_ID_P12 }}
+          MACOS_DEVELOPER_ID_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_PASSWORD }}
+          MACOS_DEVELOPER_ID_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_IDENTITY }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          case "$MACOS_SIGNING_ENABLED" in
+            true)
+              for name in MACOS_DEVELOPER_ID_P12 MACOS_DEVELOPER_ID_PASSWORD MACOS_DEVELOPER_ID_IDENTITY APPLE_NOTARY_KEY_P8 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
+                if [ -z "${!name}" ]; then
+                  echo "$name is required when MACOS_SIGNING_ENABLED is true" >&2
+                  exit 1
+                fi
+              done
+              ;;
+            false) ;;
+            *) echo "MACOS_SIGNING_ENABLED must be true or false" >&2; exit 1 ;;
+          esac
+          python3 -m unittest discover -s scripts/distribution -p 'test_*.py'
+          sh -n scripts/install.sh
+          sh -n scripts/distribution/sign.sh
       - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
       - run: cargo test --locked --target ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Verify executable and archive
+      - name: Verify executable and collect license notices
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -65,14 +90,36 @@ jobs:
               index.append({"package": package["name"], "version": package["version"], "license": package["license"], "repository": package["repository"], "notice_files": [entry.name for entry in files]})
           (destination / "index.json").write_text(json.dumps(index, indent=2) + "\n")
           PY
+      - name: Sign and notarize the distribution
+        if: env.MACOS_SIGNING_ENABLED == 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+          MACOS_DEVELOPER_ID_P12: ${{ secrets.MACOS_DEVELOPER_ID_P12 }}
+          MACOS_DEVELOPER_ID_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_PASSWORD }}
+          MACOS_DEVELOPER_ID_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_IDENTITY }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          sh scripts/distribution/sign.sh --binary-dir "$RUNNER_TEMP/binary" \
+            --target "$TARGET" --output-dir "$RUNNER_TEMP"
+      - name: Package the verified executable
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          "$RUNNER_TEMP/binary/diskr" --version
           tar -czf "$RUNNER_TEMP/diskr-$TARGET.tar.gz" -C "$RUNNER_TEMP/binary" diskr LICENSE licenses
           cd "$RUNNER_TEMP"
           shasum -a 256 "diskr-$TARGET.tar.gz" > "$TARGET.sha256"
+          if [ "$MACOS_SIGNING_ENABLED" = true ]; then
+            shasum -a 256 "diskr-$TARGET.dmg" >> "$TARGET.sha256"
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: diskr-${{ matrix.target }}
           path: |
             ${{ runner.temp }}/diskr-${{ matrix.target }}.tar.gz
+            ${{ runner.temp }}/diskr-${{ matrix.target }}.dmg
             ${{ runner.temp }}/${{ matrix.target }}.sha256
           if-no-files-found: error
           retention-days: 7
@@ -152,6 +199,27 @@ jobs:
       - run: cargo test --locked
       - run: cargo package --locked
       - run: cargo publish --dry-run --locked
+
+      - name: Download release binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: diskr-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/release-assets
+
+      - name: Prepare verified installation assets
+        env:
+          CRATE_VERSION: ${{ steps.meta.outputs.version }}
+          MACOS_SIGNING_ENABLED: ${{ vars.MACOS_SIGNING_ENABLED || 'false' }}
+        run: |
+          args=()
+          if [ "$MACOS_SIGNING_ENABLED" = true ]; then args+=(--signed); fi
+          python3 scripts/distribution/prepare.py --version "$CRATE_VERSION" \
+            --assets-dir "$RUNNER_TEMP/release-assets" --installer scripts/install.sh "${args[@]}"
+          cd "$RUNNER_TEMP/release-assets"
+          shasum -a 256 -c SHA256SUMS
+          sh -n install-diskr.sh
+          ruby -c diskr.rb
 
       - name: Check crates.io for existing version
         id: crates
@@ -238,13 +306,6 @@ jobs:
               )
           PY
 
-      - name: Download release binaries
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: diskr-*
-          merge-multiple: true
-          path: ${{ runner.temp }}/release-assets
-
       - name: Publish release notes and verified binaries
         env:
           GH_TOKEN: ${{ github.token }}
@@ -258,11 +319,20 @@ jobs:
           match = re.search(r"^## \[" + version + r"\] - [^\n]+\n(.*?)(?=^## \[|\Z)", changelog, re.M | re.S)
           if not match or not match.group(1).strip():
               raise SystemExit("released changelog section is missing or empty")
-          (Path(os.environ["RUNNER_TEMP"]) / "release-notes.md").write_text(match.group(1).strip() + "\n")
+          import json
+          distribution = json.loads((Path(os.environ["RUNNER_TEMP"]) / "release-assets" / "distribution.json").read_text())
+          if distribution["apple_notarized"]:
+              status = "Native executables are Developer ID signed and notarized. Disk images include verified stapled tickets; standalone binaries use Apple's online ticket lookup."
+          else:
+              status = "Native archives are checksum-verified but are not Developer ID signed or notarized. No security-policy bypass is required or recommended."
+          (Path(os.environ["RUNNER_TEMP"]) / "release-notes.md").write_text(match.group(1).strip() + "\n\n" + status + "\n")
           PY
           cd "$RUNNER_TEMP/release-assets"
-          cat aarch64-apple-darwin.sha256 x86_64-apple-darwin.sha256 > SHA256SUMS
           shasum -a 256 -c SHA256SUMS
+          assets=(diskr-aarch64-apple-darwin.tar.gz diskr-x86_64-apple-darwin.tar.gz SHA256SUMS install-diskr.sh diskr.rb distribution.json)
+          if [ -f diskr-aarch64-apple-darwin.dmg ]; then
+            assets+=(diskr-aarch64-apple-darwin.dmg diskr-x86_64-apple-darwin.dmg)
+          fi
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release already exists; refusing to overwrite published assets" >&2
             exit 1
@@ -271,4 +341,16 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
-            diskr-aarch64-apple-darwin.tar.gz diskr-x86_64-apple-darwin.tar.gz SHA256SUMS
+            "${assets[@]}"
+
+  refresh-site:
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Validate and deploy the website after release publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --ref main --repo "$GITHUB_REPOSITORY"

@@ -942,10 +942,35 @@ fn scan_open_dir(
     context: &ScanContext,
     cancellation: &ScanCancellation,
 ) -> DirectoryScan {
+    scan_open_dir_with_reader(dir, top_file_limit, context, cancellation, |attrs, buf| {
+        count_scanner_syscall();
+        let n = unsafe {
+            libc::getattrlistbulk(
+                fd.0,
+                attrs as *mut _ as *mut libc::c_void,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                FSOPT_RETURN_REALDEV,
+            )
+        };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n)
+        }
+    })
+}
+
+fn scan_open_dir_with_reader(
+    dir: &Path,
+    top_file_limit: usize,
+    context: &ScanContext,
+    cancellation: &ScanCancellation,
+    mut read_batch: impl FnMut(&mut Attrlist, &mut [u8]) -> std::io::Result<i32>,
+) -> DirectoryScan {
     if cancellation.is_cancelled() {
         return DirectoryScan::default();
     }
-    let fd = fd.0;
 
     let mut attrlist = Attrlist {
         bitmapcount: ATTR_BIT_MAP_COUNT,
@@ -973,34 +998,27 @@ fn scan_open_dir(
         let mut buf_ref = cell.borrow_mut();
         let buf = &mut *buf_ref;
 
-        loop {
-            count_scanner_syscall();
-            let n = unsafe {
-                libc::getattrlistbulk(
-                    fd,
-                    &mut attrlist as *mut _ as *mut libc::c_void,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    FSOPT_RETURN_REALDEV,
-                )
-            };
-            if n == 0 {
-                break;
-            }
-            if n < 0 {
-                let errno = std::io::Error::last_os_error().raw_os_error();
-                if errno == Some(libc::EINTR) {
-                    continue;
-                }
-                if !saw_bulk_entries && matches!(errno, Some(libc::ENOTSUP) | Some(libc::EINVAL)) {
-                    use_fallback = true;
+        while !cancellation.is_cancelled() {
+            let n = match read_batch(&mut attrlist, buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(error) => {
+                    let errno = error.raw_os_error();
+                    if errno == Some(libc::EINTR) {
+                        continue;
+                    }
+                    if !saw_bulk_entries
+                        && matches!(errno, Some(libc::ENOTSUP) | Some(libc::EINVAL))
+                    {
+                        use_fallback = true;
+                        break;
+                    }
+                    partial.inaccessible = partial
+                        .inaccessible
+                        .saturating_add(inaccessible_from_errno(errno));
                     break;
                 }
-                partial.inaccessible = partial
-                    .inaccessible
-                    .saturating_add(inaccessible_from_errno(errno));
-                break;
-            }
+            };
             saw_bulk_entries = true;
 
             partial.merge(
@@ -1010,7 +1028,7 @@ fn scan_open_dir(
         }
     });
 
-    if use_fallback {
+    if use_fallback && !cancellation.is_cancelled() {
         scan_open_dir_fallback(dir, top_file_limit, context, cancellation)
     } else {
         partial
@@ -1980,34 +1998,35 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
+    fn packed_file_record(with_total: bool) -> Vec<u8> {
+        let mut bytes = vec![0u8; 24];
+        let common = ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FILEID;
+        let file = ATTR_FILE_LINKCOUNT
+            | ATTR_FILE_ALLOCSIZE
+            | if with_total { ATTR_FILE_TOTALSIZE } else { 0 };
+        bytes[4..8].copy_from_slice(&common.to_ne_bytes());
+        bytes[16..20].copy_from_slice(&file.to_ne_bytes());
+        bytes.extend(5i32.to_ne_bytes());
+        bytes.extend(VREG.to_ne_bytes());
+        bytes.extend(7u64.to_ne_bytes());
+        bytes.extend(1u32.to_ne_bytes());
+        if with_total {
+            bytes.extend(123u64.to_ne_bytes());
+        }
+        bytes.extend(4096u64.to_ne_bytes());
+        let len = bytes.len() as u32;
+        bytes[..4].copy_from_slice(&len.to_ne_bytes());
+        bytes
+    }
+
     #[test]
     fn variable_layout_keeps_fields_aligned_when_attributes_are_absent() {
-        fn record(with_total: bool) -> Vec<u8> {
-            let mut bytes = vec![0u8; 24];
-            let common = ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FILEID;
-            let file = ATTR_FILE_LINKCOUNT
-                | ATTR_FILE_ALLOCSIZE
-                | if with_total { ATTR_FILE_TOTALSIZE } else { 0 };
-            bytes[4..8].copy_from_slice(&common.to_ne_bytes());
-            bytes[16..20].copy_from_slice(&file.to_ne_bytes());
-            bytes.extend(5i32.to_ne_bytes());
-            bytes.extend(VREG.to_ne_bytes());
-            bytes.extend(7u64.to_ne_bytes());
-            bytes.extend(1u32.to_ne_bytes());
-            if with_total {
-                bytes.extend(123u64.to_ne_bytes());
-            }
-            bytes.extend(4096u64.to_ne_bytes());
-            let len = bytes.len() as u32;
-            bytes[..4].copy_from_slice(&len.to_ne_bytes());
-            bytes
-        }
         let context = ScanContext {
             policy: ScanPolicy::with_devices(Path::new("/tmp"), 5, None),
             seen_hard_links: Mutex::new(HashMap::new()),
         };
-        let mut bytes = record(true);
-        bytes.extend(record(false));
+        let mut bytes = packed_file_record(true);
+        bytes.extend(packed_file_record(false));
         let scan = parse_bulk_batch(&bytes, 2, Path::new("/tmp"), 0, &context);
         assert_eq!(scan.size, SizeInfo::new(123, 4096));
         assert_eq!(scan.inaccessible, 1);
@@ -2296,6 +2315,64 @@ mod tests {
         assert!(scan_dir_with_cancellation(&root, 0, &cancellation).is_none());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_scan_cancellation_after_first_batch_stops_reads_and_suppresses_results() {
+        let root = test_root("cancel_native_batch");
+        let generation = Arc::new(AtomicU64::new(0));
+        let cancellation = ScanCancellation::new(Arc::clone(&generation), 0);
+        let state = WalkState::new(
+            ScanPolicy::with_devices(&root, 5, None),
+            0,
+            cancellation.clone(),
+        );
+        let bytes = packed_file_record(true);
+        let mut reads = 0;
+        let partial =
+            scan_open_dir_with_reader(&root, 0, &state.context, &cancellation, |_, buffer| {
+                reads += 1;
+                assert_eq!(reads, 1, "cancelled scan read another native batch");
+                buffer[..bytes.len()].copy_from_slice(&bytes);
+                generation.fetch_add(1, Ordering::Relaxed);
+                Ok(1)
+            });
+        assert_eq!(reads, 1);
+        assert_eq!(partial.size, SizeInfo::new(123, 4096));
+        state.merge(partial);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let subscriber = ScanSubscriber {
+            cancellation,
+            start: Mutex::new(None),
+            done: Mutex::new(Some(Box::new(move |result| tx.send(result).unwrap()))),
+        };
+        subscriber.finish(&Some(state.finish()));
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn native_scan_cancellation_skips_interrupted_retries_and_fallback() {
+        let root = test_root("cancel_native_error");
+        fs::write(&root, b"not a directory").unwrap();
+        for errno in [libc::EINTR, libc::ENOTSUP, libc::EINVAL] {
+            let generation = Arc::new(AtomicU64::new(0));
+            let cancellation = ScanCancellation::new(Arc::clone(&generation), 0);
+            let context = ScanContext {
+                policy: ScanPolicy::with_devices(&root, 5, None),
+                seen_hard_links: Mutex::new(HashMap::new()),
+            };
+            let mut reads = 0;
+            let partial = scan_open_dir_with_reader(&root, 0, &context, &cancellation, |_, _| {
+                reads += 1;
+                assert_eq!(reads, 1, "cancelled scan retried a native read");
+                generation.fetch_add(1, Ordering::Relaxed);
+                Err(std::io::Error::from_raw_os_error(errno))
+            });
+            assert_eq!(reads, 1);
+            assert_eq!(partial.size, SizeInfo::default());
+            assert_eq!(partial.inaccessible, 0, "cancelled scan entered fallback");
+        }
+        fs::remove_file(root).unwrap();
     }
 
     fn test_root(name: &str) -> PathBuf {

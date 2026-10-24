@@ -4,15 +4,18 @@ mod fs_ops;
 mod fsevents;
 mod history;
 mod keymap;
+mod locations;
 mod manifest;
 mod packages;
 mod pool;
+mod process;
 mod reclaim;
 mod scanner;
 mod space;
 mod state;
 mod terminal_backend;
 mod terminal_text;
+mod tui_input;
 mod ui;
 
 use anyhow::{bail, Context, Result};
@@ -1863,92 +1866,8 @@ where
                     if char_modifier_inhibited(&key) {
                         continue;
                     }
-                    if app.active_modal() == ActiveModal::Help {
-                        let handled = match key.code {
-                            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
-                                app.close_help();
-                                true
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                app.scroll_help(1);
-                                true
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                app.scroll_help(-1);
-                                true
-                            }
-                            KeyCode::PageDown => {
-                                app.scroll_help(10);
-                                true
-                            }
-                            KeyCode::PageUp => {
-                                app.scroll_help(-10);
-                                true
-                            }
-                            KeyCode::Home => {
-                                app.help_scroll = 0;
-                                true
-                            }
-                            KeyCode::End => {
-                                app.help_scroll = usize::MAX;
-                                true
-                            }
-                            _ => false,
-                        };
-                        if handled {
-                            needs_draw = true;
-                        }
-                        continue;
-                    }
-                    if app.active_modal() == ActiveModal::Delete {
-                        let handled = match key.code {
-                            KeyCode::Char('y') => {
-                                app.confirm_delete()?;
-                                true
-                            }
-                            KeyCode::Char('n') | KeyCode::Esc => {
-                                app.cancel_delete();
-                                true
-                            }
-                            _ => false,
-                        };
-                        if handled {
-                            needs_draw = true;
-                        }
-                        continue;
-                    }
-                    if app.active_modal() == ActiveModal::Uninstall {
-                        let handled = match key.code {
-                            KeyCode::Char('y') => {
-                                app.confirm_uninstall();
-                                true
-                            }
-                            KeyCode::Char('n') | KeyCode::Esc => {
-                                app.cancel_uninstall();
-                                true
-                            }
-                            _ => false,
-                        };
-                        if handled {
-                            needs_draw = true;
-                        }
-                        continue;
-                    }
-                    if app.active_modal() == ActiveModal::EmptyTrash {
-                        let handled = match key.code {
-                            KeyCode::Char('y') => {
-                                app.confirm_empty_trash();
-                                true
-                            }
-                            KeyCode::Char('n') | KeyCode::Esc => {
-                                app.cancel_empty_trash();
-                                true
-                            }
-                            _ => false,
-                        };
-                        if handled {
-                            needs_draw = true;
-                        }
+                    if let Some(handled) = tui_input::handle_overlay_key(app, key.code)? {
+                        needs_draw |= handled;
                         continue;
                     }
                     if matches!(
@@ -2287,6 +2206,10 @@ where
                         continue;
                     }
                     let handled = match key.code {
+                        KeyCode::Char('g') => {
+                            app.open_locations();
+                            true
+                        }
                         KeyCode::Char('b') => {
                             app.full_width = !app.full_width;
                             app.status = if app.full_width {
@@ -2609,6 +2532,7 @@ fn char_modifier_inhibited(key: &crossterm::event::KeyEvent) -> bool {
 fn cancel_active_state(app: &mut App) {
     match app.active_modal() {
         ActiveModal::Help => app.close_help(),
+        ActiveModal::Locations => app.locations.cancel(),
         ActiveModal::Delete => app.cancel_delete(),
         ActiveModal::Uninstall => app.cancel_uninstall(),
         ActiveModal::EmptyTrash => app.cancel_empty_trash(),

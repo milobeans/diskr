@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::packages;
+use crate::process;
 
 #[derive(Clone, Debug)]
 pub struct SpaceReport {
@@ -136,7 +136,7 @@ pub fn thin_local_snapshots(path: &Path, bytes: u64) -> Result<ThinResult> {
         .arg(path)
         .arg(bytes.to_string())
         .arg("4");
-    let output = packages::run_process(command, Duration::from_secs(300));
+    let output = process::run_process(command, Duration::from_secs(300));
     let stdout = output.stdout.trim().to_string();
     let stderr = output.stderr.trim().to_string();
     if output.timed_out {
@@ -249,7 +249,7 @@ fn statfs_for_path(path: &Path) -> Result<StatfsInfo> {
 pub(crate) fn list_local_snapshots(path: &Path) -> SnapshotListing {
     let mut command = Command::new("tmutil");
     command.arg("listlocalsnapshots").arg(path);
-    let output = packages::run_process(command, Duration::from_secs(15));
+    let output = process::run_process(command, Duration::from_secs(15));
     match output {
         output if output.success => SnapshotListing {
             names: parse_tmutil_snapshot_names(&output.stdout),
@@ -269,12 +269,12 @@ pub(crate) fn list_local_snapshots(path: &Path) -> SnapshotListing {
 }
 
 pub(crate) fn apfs_container_for_mount(mount: &Path) -> Result<ApfsContainer, DiscoveryError> {
-    apfs_container_with(mount, packages::run_process)
+    apfs_container_with(mount, process::run_process)
 }
 
 fn apfs_container_with(
     mount: &Path,
-    runner: fn(Command, Duration) -> packages::CommandResult,
+    runner: fn(Command, Duration) -> process::CommandResult,
 ) -> Result<ApfsContainer, DiscoveryError> {
     let mut command = Command::new("diskutil");
     command.arg("info").arg("-plist").arg(mount);
@@ -472,27 +472,27 @@ com.apple.os.update-MSUPrepareUpdate
 }
 #[test]
 fn apfs_discovery_preserves_failure_categories_and_exact_mount_argument() {
-    fn timeout(command: Command, duration: Duration) -> packages::CommandResult {
+    fn timeout(command: Command, duration: Duration) -> process::CommandResult {
         assert_eq!(command.get_program(), "diskutil");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["info", "-plist", "/fixture volume"]
         );
         assert_eq!(duration, Duration::from_secs(15));
-        packages::CommandResult {
+        process::CommandResult {
             stdout: String::new(),
             stderr: String::new(),
             success: false,
             timed_out: true,
         }
     }
-    fn failed(command: Command, duration: Duration) -> packages::CommandResult {
+    fn failed(command: Command, duration: Duration) -> process::CommandResult {
         let mut result = timeout(command, duration);
         result.timed_out = false;
         result.stderr = String::from("simulated utility failure");
         result
     }
-    fn malformed(command: Command, duration: Duration) -> packages::CommandResult {
+    fn malformed(command: Command, duration: Duration) -> process::CommandResult {
         let mut result = failed(command, duration);
         result.success = true;
         result.stdout = String::from("not a plist");

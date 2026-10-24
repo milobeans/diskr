@@ -9,6 +9,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  tooling:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Validate distribution and benchmark tooling
+        run: |
+          python3 -m unittest discover -s scripts/distribution -p 'test_*.py'
+          python3 -m unittest discover -s scripts -p '*_test.py'
+      - name: Validate isolated screenshot tooling
+        run: |
+          python3 -m venv "$RUNNER_TEMP/screenshot-tests"
+          "$RUNNER_TEMP/screenshot-tests/bin/python" -m pip install -r scripts/screenshots/requirements.txt
+          "$RUNNER_TEMP/screenshot-tests/bin/python" -m unittest discover -s scripts/screenshots -p 'test_*.py'
+
   msrv:
     runs-on: macos-15
 

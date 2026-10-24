@@ -1,6 +1,6 @@
 [package]
 name = "diskr"
-version = "0.1.83"
+version = "0.1.84"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Milo Evans"]
@@ -12,7 +12,7 @@ documentation = "https://milobeans.github.io/diskr/docs/"
 readme = "README.md"
 keywords = ["disk-usage", "storage", "tui", "macos", "apfs"]
 categories = ["command-line-utilities", "filesystem"]
-exclude = [".github/assets/", "scripts/", "site/"]
+exclude = [".github/assets/", "scripts/", "site/", "Formula/"]
 
 [dependencies]
 ratatui-core = { version = "0.1", features = ["std"] }

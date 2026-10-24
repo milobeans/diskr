@@ -540,6 +540,72 @@ fn native_tui_restores_terminal_after_filter_refresh_modal_and_quit() {
             first_paint.as_micros(),first_row.as_micros(),started.elapsed().as_secs_f64(),cpu_ns,after.ri_resident_size,
             cpu_ns as f64 / started.elapsed().as_nanos() as f64 * 100.0);
     }
+    let chosen = scan.join("chooser 界 folder");
+    std::fs::create_dir(&chosen).unwrap();
+    std::fs::write(chosen.join("chooser-success.txt"), b"chooser fixture").unwrap();
+    master.write_all(b"g").unwrap();
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::Screen("Origin: local folder"),
+    );
+    master.write_all(b"/").unwrap();
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::ScreenWithout("Folder path (absolute", "Origin: local folder"),
+    );
+    master.write_all("/chooser 界 folder\r".as_bytes()).unwrap();
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::ScreenWithout("chooser-success.txt", "go to folder / package profile"),
+    );
+    assert!(screen_matches(
+        &terminal_screen(&output, 100, 24),
+        "chooser 界 folder",
+        None,
+    ));
+    master.write_all(b"g").unwrap();
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::Screen("Origin: local folder"),
+    );
+    master.write_all(b"/").unwrap();
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::ScreenWithout("Folder path (absolute", "Origin: local folder"),
+    );
+    master.write_all(b"/cancelled-path").unwrap();
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::Screen("cancelled-path|"),
+    );
+    master.write_all(b"\x1b").unwrap();
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::ScreenWithout("Origin: local folder", "Folder path (absolute"),
+    );
+    master.write_all(b"\x1b").unwrap();
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::ScreenWithout("chooser-success.txt", "go to folder / package profile"),
+    );
+    master.write_all(b"\x7f").unwrap();
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::ScreenWithout("needle.txt", "chooser-success.txt"),
+    );
+    assert_eq!(
+        std::fs::read(chosen.join("chooser-success.txt")).unwrap(),
+        b"chooser fixture"
+    );
     master.write_all(b"q").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

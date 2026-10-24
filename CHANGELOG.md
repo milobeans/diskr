@@ -6,13 +6,63 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `g` opens an asynchronous folder and saved-profile chooser. Common locations,
+  saved roots and package scopes are available without leaving the TUI; imported
+  foreign profiles remain visible but cannot execute on this machine. Path entry
+  keeps typed text and its caret visible in short terminals.
+- A maintained Homebrew tap and checksum-verified native installer select the
+  correct architecture, retain license notices and explain first launch and PATH.
+  Releases include version-pinned installation assets and distribution metadata.
+  Installation verifies the final executable and refuses directory races without
+  following destination symlinks.
+- Optional Developer ID signing produces verified, notarized disk images when
+  distribution credentials are configured. Release metadata states whether
+  signing and notarization were performed.
+- Scheduled and manually triggered performance runs retain machine metadata,
+  structured measurements and raw logs. Website deployment validates links,
+  copy payloads, keyboard interactions, contrast, replay data and mobile layout.
+  Deployment waits for the matching release installation assets to be available.
+
 ### Changed
 
+- Growth badges retain a complete session baseline across repeat scans,
+  refreshes and navigation, and Growth sorting uses that same comparison.
+  Selected package profiles retain their scope on refresh and clear when
+  navigating away from their saved root.
+- Narrow-terminal footers prioritize scanning, hidden files and largest files.
+  Limited-access warnings stay visible before long paths and history, with
+  optional Full Disk Access recovery guidance in help and documentation.
+- Website installation leads with native macOS options and a short first-run
+  walkthrough. Mobile terminal examples expose horizontal scrolling, and
+  light/dark themes improve small-text contrast.
 - Native terminal smoke checks reconstruct incremental screen updates and wait
   for semantic refresh completion, including refreshes that finish between frames.
   Modal transitions require the new view to appear and the old view to disappear,
   so partial terminal frames cannot prematurely acknowledge a key action.
   Application behavior is unchanged.
+
+### Fixed
+
+- Renames atomically refuse existing destinations, including dangling symlinks
+  and destinations created concurrently.
+- Trash is classified as risky and review-required instead of automatically
+  regenerated cache in Files, reclaim reports and documentation.
+- Pip inventory disables background version checks so first-run verbose
+  diagnostics cannot corrupt JSON output; location evidence, strict parsing and
+  genuine partial-footprint warnings remain intact.
+- Cancellation stops native scans between directory batches and reaches Brew
+  and pip dependency-graph subprocesses. Confirmed mutations continue draining
+  independently of read-only cancellation.
+- History change intervals use elapsed-duration wording without duplicated
+  relative-time phrases. Reclaim details use singular/plural path labels, and
+  compact package headings keep size totals and coverage markers readable.
+- Documentation copies individual examples, preserves comments and separates
+  previews from confirmed mutations. Snapshot actions are distinct from reports.
+- Website search contains keyboard focus, restores its opening control, closes
+  with Escape and recovers from failed loads. Replay chapters support keyboard
+  activation, and documentation navigation targets valid sections.
 
 ## [0.1.83] - 2026-10-22
 

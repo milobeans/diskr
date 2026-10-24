@@ -45,27 +45,37 @@ TITLE = "diskr — ~"
 
 
 class Masker:
-    """Replace host paths with a neutral demo home, keeping columns aligned."""
+    """Replace host paths with neutral demo paths, keeping columns aligned."""
 
-    def __init__(self, paths, shown, user):
-        # Longest first so the demo home (inside the real home) wins.
-        self.paths = sorted(paths, key=len, reverse=True)
-        self.shown = shown
+    def __init__(self, pairs, user):
+        # Longest first so nested paths (the demo home inside the real home) win.
+        self.pairs = sorted(pairs, key=lambda pair: len(pair[0]), reverse=True)
+        self.user = user if len(user) >= 5 else ""
         self.user_pattern = re.compile(rf"/{re.escape(user)}\b") if user else None
 
     def apply(self, cells):
         cells = [[list(c) for c in row] for row in cells]
-        for old in self.paths:
+        for old, new in self.pairs:
             for row in cells:
-                replace_in_row(row, old, self.shown)
-        # Overlays can cut a path short; mask a visible prefix in place.
-        for old in self.paths:
+                replace_in_row(row, old, new)
+        # diskr shortens long paths from the start ("…tail"); swap a visible
+        # tail of a host path for the shown path.
+        for old, new in self.pairs:
+            for row in cells:
+                for k in range(len(old) - 1, 7, -1):
+                    if "…" + old[-k:] in row_text(row):
+                        replace_in_row(row, "…" + old[-k:], new)
+                        break
+        # Overlays can also cut a path short at the end; mask that prefix in place.
+        # Shared prefixes belong to the nearest known parent (usually HOME),
+        # not an arbitrary deeper path such as the synthetic Homebrew Cellar.
+        for old, new in reversed(self.pairs):
             for row in cells:
                 text = row_text(row)
                 for k in range(len(old) - 1, 7, -1):
                     at = text.find(old[:k])
                     if at >= 0:
-                        for i, ch in enumerate((self.shown + " " * k)[:k]):
+                        for i, ch in enumerate((new + " " * k)[:k]):
                             row[at + i][0] = ch
                         break
         return cells
@@ -74,7 +84,9 @@ class Masker:
         found = []
         for row in cells:
             text = row_text(row)
-            if any(p in text for p in self.paths) or (
+            tails = (old[-12:] for old, new in self.pairs if len(old) > 12 and old[-12:] not in new)
+            if any(old in text for old, _ in self.pairs) or any(t in text for t in tails) or (
+                    self.user and self.user in text) or (
                     self.user_pattern and self.user_pattern.search(text)):
                 found.append(text.rstrip())
         return found
@@ -85,8 +97,12 @@ def row_text(row):
 
 
 def replace_in_row(row, old, new):
+    if not old:
+        return
+    new = new[:len(old)]
+    cursor = 0
     while True:
-        at = row_text(row).find(old)
+        at = row_text(row).find(old, cursor)
         if at < 0:
             return
         for i, ch in enumerate(new):
@@ -99,6 +115,7 @@ def replace_in_row(row, old, new):
                     if row[j][0] in (" ", "─") and row[j][0] == row[j + 1][0]), len(row) - 1)
         for _ in range(removed):
             row.insert(gap, list(row[gap]))
+        cursor = at + len(new)
 
 
 def cmap_of(path, index=0):
@@ -255,15 +272,17 @@ def social_card(screenshot, out):
     card.resize((1280, 640), Image.LANCZOS).convert("RGB").save(out, optimize=True)
 
 
-def replay_json(frames, cols, rows, shown_home, out):
-    """Compact replay for the docs site: a style table, deduplicated rows,
-    per-frame hold times, chapter starts, and named stills."""
+def replay_json(frames, stills, chapters, cols, rows, out):
+    """Compact replay for the docs site: a style table, deduplicated rows and
+    per-frame hold times. Only the first `play` frames are played; named stills
+    for annotated figures follow them. `chapters` maps names to frame indexes."""
     import json
 
-    styles, style_ids, lines, line_ids, packed, texts = [], {}, [], {}, [], []
-    for i, frame in enumerate(frames):
+    styles, style_ids, lines, line_ids, packed = [], {}, [], {}, []
+
+    def pack(cells):
         ids = []
-        for row in frame["cells"]:
+        for row in cells:
             runs = []
             for ch, fg, bg, bold, rev in row:
                 key = (fg, bg, bool(bold), bool(rev))
@@ -280,30 +299,17 @@ def replay_json(frames, cols, rows, shown_home, out):
                 line_ids[key] = len(lines)
                 lines.append(runs)
             ids.append(line_ids[key])
+        return ids
+
+    for i, frame in enumerate(frames):
         nxt = frames[i + 1]["t"] if i + 1 < len(frames) else frame["t"] + 3.0
-        packed.append({"d": min(2400, max(40, round((nxt - frame["t"]) * 1000))), "l": ids})
-        texts.append("\n".join("".join(c[0] or " " for c in row) for row in frame["cells"]))
-
-    def first(pred):
-        return next((i for i, t in enumerate(texts) if pred(t)), None)
-
-    def settled(pred):
-        hits = [i for i, t in enumerate(texts) if pred(t)]
-        return max(hits, key=lambda i: packed[i]["d"]) if hits else None
-
-    chapters = [("Scan", 0), ("Drill in", first(lambda t: f"{shown_home}/code" in t)),
-                ("Reclaim", first(lambda t: "cleanup" in t)), ("Top files", first(lambda t: "top files" in t))]
-    marks = {
-        "files": settled(lambda t: "full scan complete" in t and "↑" in t and "top files ·" not in t),
-        "project": settled(lambda t: "[build]" in t),
-        "reclaim": settled(lambda t: "candidate disk bytes" in t),
-        "top": settled(lambda t: "top files ·" in t),
-    }
-    missing = [name for name, i in chapters + list(marks.items()) if i is None]
-    if missing:
-        raise SystemExit(f"replay is missing expected views: {', '.join(missing)}")
+        packed.append({"d": min(2400, max(40, round((nxt - frame["t"]) * 1000))), "l": pack(frame["cells"])})
+    marks = {}
+    for name, cells in stills:
+        marks[name] = len(packed)
+        packed.append({"d": 0, "l": pack(cells)})
     data = {"cols": cols, "rows": rows, "styles": styles, "lines": lines, "frames": packed,
-            "chapters": [{"name": n, "frame": i} for n, i in sorted(chapters, key=lambda c: c[1])],
+            "play": len(frames), "chapters": [{"name": n, "frame": i} for n, i in chapters],
             "marks": marks}
     with open(out, "w") as f:
         json.dump(data, f, ensure_ascii=False, separators=(",", ":"))

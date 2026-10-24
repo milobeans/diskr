@@ -1,0 +1,16 @@
+{
+  "name": "diskr-site-validation",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "prepare:site": "node prepare.mjs",
+    "check": "npm run prepare:site && node --test static.test.mjs",
+    "test:browser": "npm run check && playwright test",
+    "serve": "node serve.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "parse5": "8.0.1"
+  }
+}

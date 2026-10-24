@@ -1,0 +1,47 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 10 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: never
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      BENCHMARK_RUNNER: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: rustup toolchain install stable --profile minimal
+      - name: Validate measurement parsing
+        run: python3 -m unittest discover -s scripts -p '*_test.py'
+      - name: Run optimized serial fixture protocol
+        run: python3 scripts/benchmarks.py --output target/benchmark-results
+      - name: Add informational measurements to the run summary
+        if: always()
+        run: |
+          if [ -f target/benchmark-results/summary.md ]; then
+            cat target/benchmark-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Retain machine metadata, raw logs and structured results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmark-results-${{ matrix.runner }}-${{ github.sha }}
+          path: target/benchmark-results/
+          if-no-files-found: error
+          retention-days: 90

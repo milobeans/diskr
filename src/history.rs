@@ -928,6 +928,18 @@ pub fn scan_profile(name: &str) -> Result<ScanProfile> {
     Ok(profile)
 }
 
+pub fn scan_profiles() -> Result<Vec<(String, ScanProfile, bool)>> {
+    let library = read_library(&library_file())?;
+    Ok(library
+        .profiles
+        .into_iter()
+        .map(|(name, profile)| {
+            let foreign = profile.machine != library.machine;
+            (name, profile, foreign)
+        })
+        .collect())
+}
+
 fn write_new_export(path: &Path, text: &str) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;

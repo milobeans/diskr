@@ -6,36 +6,81 @@ on:
     paths:
       - "site/**"
       - ".github/assets/**"
+      - "scripts/site-validation/**"
       - ".github/workflows/pages.yml"
+      - "Cargo.toml"
+  pull_request:
+    paths:
+      - "site/**"
+      - ".github/assets/**"
+      - "scripts/site-validation/**"
+      - ".github/workflows/pages.yml"
+      - "Cargo.toml"
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
+  group: pages-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    outputs:
+      deploy: ${{ steps.release.outputs.deploy }}
+    permissions:
+      contents: read
+      pages: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Assemble site
-        run: |
-          mkdir -p site/assets/img
-          cp .github/assets/*.png .github/assets/*.webp site/assets/img/
-          python3 -c "import json; d = json.load(open('site/assets/replay.json')); assert d['frames'] and d['marks']"
-      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+      - name: Validate release availability policy
+        run: python3 -m unittest discover -s scripts/site-validation -p test_release.py
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          path: site
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: scripts/site-validation/package-lock.json
+      - name: Install pinned validation dependencies
+        run: npm ci --ignore-scripts --prefix scripts/site-validation
+      - name: Audit validation dependencies
+        run: npm audit --audit-level=high --prefix scripts/site-validation
+      - name: Install Chromium and its system dependencies
+        working-directory: scripts/site-validation
+        run: npx playwright install --with-deps chromium
+      - name: Validate deployment artifact and browser interactions
+        run: npm --prefix scripts/site-validation run test:browser
+      - name: Preserve browser failure diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: website-validation
+          path: |
+            target/site-validation/report
+            target/site-validation/results
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Verify installation assets are published for this version
+        id: release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/site-validation/check_release.py
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+        if: steps.release.outputs.deploy == 'true'
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: steps.release.outputs.deploy == 'true'
+        with:
+          path: target/site-validation/site
 
   deploy:
     needs: build
-    runs-on: ubuntu-latest
+    if: needs.build.outputs.deploy == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

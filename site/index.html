@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>diskr: disk usage explorer for the macOS terminal</title>
-<meta name="description" content="diskr is a fast disk usage explorer for the macOS terminal. It sizes folders by allocated space, suggests safe cleanups, tracks changes and explains APFS free space.">
+<meta name="description" content="diskr is a fast disk usage explorer for the macOS terminal. It sizes folders by allocated space, labels cleanup candidates, tracks changes and explains APFS free space.">
 <meta name="theme-color" content="#0f1013" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#f7f6f3" media="(prefers-color-scheme: light)">
 <link rel="canonical" href="https://milobeans.github.io/diskr/">
 <meta property="og:type" content="website">
 <meta property="og:title" content="diskr: disk usage explorer for the macOS terminal">
-<meta property="og:description" content="Sizes by allocated space, safe cleanup suggestions, change tracking and APFS space reports. Written in Rust.">
+<meta property="og:description" content="Sizes by allocated space, classified cleanup candidates, change tracking and APFS space reports. Written in Rust.">
 <meta property="og:url" content="https://milobeans.github.io/diskr/">
 <meta property="og:image" content="https://milobeans.github.io/diskr/assets/img/social-preview.png">
 <meta name="twitter:card" content="summary_large_image">
@@ -19,7 +19,9 @@
 <link rel="stylesheet" href="https://fonts.bunny.net/css?family=instrument-sans:400,500,600|jetbrains-mono:400,500,600,700&display=swap">
 <link rel="stylesheet" href="assets/site.css">
 <script>
-  document.documentElement.dataset.theme = localStorage.getItem("diskr-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  let theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  try { theme = localStorage.getItem("diskr-theme") || theme; } catch {}
+  document.documentElement.dataset.theme = theme;
 </script>
 <script type="module" src="assets/site.js"></script>
 </head>
@@ -56,15 +58,10 @@
 <main id="main">
   <div class="wrap intro">
     <h1>A fast disk usage explorer for the macOS terminal</h1>
-    <p>diskr shows folder sizes by actual disk allocation, finds caches and build output you can safely remove, and tracks what changed between scans. It was built as a simpler alternative to Finder and the macOS storage settings, which make it hard to see what is actually using your disk.</p>
+    <p>diskr shows folder sizes by actual disk allocation, finds caches and build output to review for cleanup, and tracks what changed between scans. It was built as a simpler alternative to Finder and the macOS storage settings, which make it hard to see what is actually using your disk.</p>
     <div class="actions">
-      <span class="cmd"><span class="prompt">$</span>cargo install diskr
-        <button class="copy" type="button" data-copy="cargo install diskr" aria-label="Copy">
-          <svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
-          <svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>
-        </button>
-      </span>
-      <a class="btn" href="docs/">Documentation</a>
+      <a class="btn" href="#install">Install for macOS</a>
+      <a class="btn ghost" href="docs/">Documentation</a>
       <a class="btn ghost" href="https://github.com/milobeans/diskr">GitHub</a>
     </div>
     <p class="facts label"><span>macOS 15+</span><span>Apple Silicon and Intel</span><span>Rust</span><span>MIT license</span></p>
@@ -73,8 +70,9 @@
   <div class="wrap demo" data-replay tabindex="0" aria-label="Demo of diskr. Space plays or pauses, arrow keys step frames, 1 to 4 jump to sections.">
     <div class="window">
       <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~</span></div>
-      <div class="screen"><canvas role="img" aria-label="diskr sizing a home folder, opening a project with a 4.4 GiB build directory, listing 18 cleanup findings, and ranking the largest files under Library"></canvas></div>
+      <div class="screen" tabindex="0" role="region" aria-label="Terminal screenshot; scroll horizontally on small screens"><canvas role="img" aria-label="diskr following folder sizes from the home folder down to a 4.4 GiB build directory and moving it to the Trash, then listing Homebrew packages, filtering to dependency leaves and uninstalling a 1.6 GiB llvm@18"></canvas></div>
     </div>
+          <p class="pan-hint">Scroll the terminal sideways to see every column.</p>
     <div class="player">
       <button class="play" type="button" aria-label="Play demo">
         <svg class="resume" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15l13-7.5z"/></svg>
@@ -83,21 +81,36 @@
       <div class="track"></div>
       <span class="clock">0:00 / 0:30</span>
     </div>
-    <p class="caption">Recorded from diskr running on a demo home folder. Drag the bar to seek; <kbd>space</kbd> pauses.</p>
+    <p class="caption">Recorded in a disposable demo home folder: find a large build directory and move it to the Trash, then review and remove a dependency leaf. Drag the bar to seek; <kbd>space</kbd> pauses.</p>
   </div>
+
+  <section id="first-run" aria-labelledby="first-run-title">
+    <div class="wrap">
+      <div class="section-head">
+        <h2 id="first-run-title">Your first scan</h2>
+        <p>After installing, run <code>diskr ~/Downloads</code> to start with a familiar folder.</p>
+      </div>
+      <ol class="first-steps">
+        <li><strong>Measure.</strong> <kbd>S</kbd> sizes visible folders. <kbd>.</kbd> includes hidden ones.</li>
+        <li><strong>Inspect.</strong> Select a folder and press <kbd>t</kbd> for its largest files, or <kbd>⏎</kbd> to open it.</li>
+        <li><strong>Choose.</strong> <kbd>i</kbd> shows details and <kbd>f</kbd> reveals an item in Finder. Review before moving anything to the Trash.</li>
+      </ol>
+      <p><kbd>?</kbd> shows every key, <kbd>g</kbd> opens folders and saved profiles, and <kbd>q</kbd> quits. If the scan reports limited access, see <a href="docs/#limited-access">what it means and how to refresh it</a>.</p>
+    </div>
+  </section>
 
   <section id="features" aria-labelledby="features-title">
     <div class="wrap">
       <div class="section-head">
         <h2 id="features-title">Features</h2>
-        <p>Scanning uses <code>getattrlistbulk(2)</code> and only covers what you are looking at. Sizes are cached between runs and revalidated with FSEvents.</p>
+        <p>The file browser scans lazily around your selection using <code>getattrlistbulk(2)</code>. Cached sizes are revalidated with FSEvents when reliable replay is available.</p>
       </div>
       <div class="features">
         <div><h3>Sizes by allocated space</h3><p>Folders sort by the bytes they occupy on disk. Apparent size is shown when it differs, as with APFS clones and sparse files.</p><span class="label">S · .</span></div>
         <div><h3>Cleanup suggestions</h3><p>Caches, build output and package stores, each labeled safe, regenerable or risky with a reason. Reports never delete anything.</p><span class="label">diskr --reclaim ~</span></div>
-        <div><h3>Change tracking</h3><p>Folders that changed since their last scan show a growth badge. Save baselines and compare them later.</p><span class="label">B · diskr --diff ~</span></div>
+        <div><h3>Change tracking</h3><p>Growth badges compare each folder with its session baseline. Save baselines and compare them later.</p><span class="label">B · diskr --diff ~</span></div>
         <div><h3>APFS space report</h3><p>Container free space, local snapshots and what is actually available, side by side.</p><span class="label">diskr --space ~</span></div>
-        <div><h3>Packages and projects</h3><p>Homebrew, Cargo, npm, pip and Bun packages, plus project dependency folders, with sizes.</p><span class="label">p · diskr --packages ~</span></div>
+        <div><h3>Packages and projects</h3><p>Homebrew, Cargo, npm, pip and Bun packages, plus project dependency folders, with sizes. Dependency leaves may still be used by you or your scripts.</p><span class="label">p · diskr --packages ~</span></div>
         <div><h3>Scriptable reports</h3><p>Every report has JSON output with a versioned schema. <code>--strict</code> exits with status 2 when data is incomplete.</p><span class="label">--json · --strict</span></div>
       </div>
     </div>
@@ -107,22 +120,23 @@
     <div class="wrap">
       <div class="section-head">
         <h2 id="interface-title">Interface</h2>
-        <p>Frames from the same recording as the demo. Hover the numbered markers for notes.</p>
+        <p>Frames captured from the same demo home folder. Hover the numbered markers for notes.</p>
       </div>
 
       <article class="view">
         <div class="view-text">
           <h3>Files</h3>
           <div>
-            <p>Each row shows its allocated size and share of the current folder. Tags such as <code>[cache]</code> mark reclaimable folders, and <code>↑</code> marks folders that grew since their last scan.</p>
+            <p>Each row shows its allocated size and share of the current folder. Tags such as <code>[cache]</code> mark reclaimable folders, and <code>↑</code> marks folders that grew relative to their session baseline.</p>
             <div class="keys"><span><kbd>S</kbd> size all</span><span><kbd>.</kbd> hidden files</span><span><kbd>o</kbd> sort</span><span><kbd>/</kbd> search</span></div>
           </div>
         </div>
-        <div class="figure" data-frame="files" data-pins='[{"find":"↑2.7 GiB","label":"Grew 2.7 GiB since its last scan"},{"find":"[cache]","label":"Tagged as cache"},{"find":"██████████","label":"Share of the current folder"}]'>
+        <div class="figure" data-frame="files" data-pins='[{"find":"↑2.7 GiB","label":"Grew 2.7 GiB relative to its session baseline"},{"find":"[cache]","label":"Tagged as cache"},{"find":"██████████","label":"Share of the current folder"}]'>
           <div class="window">
             <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~</span></div>
-            <div class="screen"><canvas role="img" aria-label="The Files pane listing a home folder by allocated size"></canvas></div>
+            <div class="screen" tabindex="0" role="region" aria-label="Terminal screenshot; scroll horizontally on small screens"><canvas role="img" aria-label="The Files pane listing a home folder by allocated size"></canvas></div>
           </div>
+          <p class="pan-hint">Scroll the terminal sideways to see every column.</p>
         </div>
       </article>
 
@@ -137,8 +151,9 @@
         <div class="figure" data-frame="project" data-pins='[{"find":"[build]","label":"Build output: Cargo.toml is next to it"}]'>
           <div class="window">
             <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~/code/ledger-api</span></div>
-            <div class="screen"><canvas role="img" aria-label="A Rust project whose target directory holds 4.4 GiB"></canvas></div>
+            <div class="screen" tabindex="0" role="region" aria-label="Terminal screenshot; scroll horizontally on small screens"><canvas role="img" aria-label="A Rust project whose target directory holds 4.4 GiB"></canvas></div>
           </div>
+          <p class="pan-hint">Scroll the terminal sideways to see every column.</p>
         </div>
       </article>
 
@@ -146,7 +161,7 @@
         <div class="view-text">
           <h3>Cleanup</h3>
           <div>
-            <p>Tab to the Reclaim pane for caches and build artifacts. Each finding has a class and an explanation.</p>
+            <p>Tab to the Reclaim pane for caches and build artifacts. Each finding has a class and an explanation. Moving an item to the Trash does not free its storage; emptying Trash is permanent.</p>
             <div class="classes">
               <div class="class safe"><b>safe</b><span>Cache that is regenerated automatically</span></div>
               <div class="class regen"><b>regenerable</b><span>Costs a rebuild or download</span></div>
@@ -157,8 +172,9 @@
         <div class="figure" data-frame="reclaim" data-pins='[{"find":"safe  Xcode DerivedData","label":"Safe: Xcode rebuilds it"},{"find":"risky  Simulator devices","label":"Risky: simulator data may be irreplaceable"},{"find":"1.5 GiB / 64 GiB","label":"Allocated / apparent size"}]'>
           <div class="window">
             <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~</span></div>
-            <div class="screen"><canvas role="img" aria-label="The cleanup view with 18 findings labeled safe, regenerable or risky"></canvas></div>
+            <div class="screen" tabindex="0" role="region" aria-label="Terminal screenshot; scroll horizontally on small screens"><canvas role="img" aria-label="The cleanup view with 18 findings labeled safe, regenerable or risky"></canvas></div>
           </div>
+          <p class="pan-hint">Scroll the terminal sideways to see every column.</p>
         </div>
       </article>
 
@@ -173,8 +189,9 @@
         <div class="figure" data-frame="top" data-pins='[{"find":"1.5 GiB / 64 GiB","label":"Allocated / apparent size"}]'>
           <div class="window">
             <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~/Library</span></div>
-            <div class="screen"><canvas role="img" aria-label="Top Files ranking the largest files under Library"></canvas></div>
+            <div class="screen" tabindex="0" role="region" aria-label="Terminal screenshot; scroll horizontally on small screens"><canvas role="img" aria-label="Top Files ranking the largest files under Library"></canvas></div>
           </div>
+          <p class="pan-hint">Scroll the terminal sideways to see every column.</p>
         </div>
       </article>
     </div>
@@ -220,42 +237,43 @@ Local snapshots: 3</pre>
     <div class="wrap">
       <div class="section-head">
         <h2 id="install-title">Install</h2>
-        <p>macOS on Apple Silicon or Intel. Prebuilt archives require macOS 15 or newer.</p>
+        <p>For macOS 15 or newer, on Apple Silicon and Intel. Homebrew and native archives need no Rust toolchain.</p>
       </div>
       <div class="tabs">
         <div class="tablist" role="tablist" aria-label="Install methods">
-          <button role="tab" id="tab-cargo" aria-controls="panel-cargo" aria-selected="true">Cargo</button>
+          <button role="tab" id="tab-homebrew" aria-controls="panel-homebrew" aria-selected="true">Homebrew</button>
+          <button role="tab" id="tab-cargo" aria-controls="panel-cargo" aria-selected="false" tabindex="-1">Cargo</button>
           <button role="tab" id="tab-binary" aria-controls="panel-binary" aria-selected="false" tabindex="-1">Prebuilt binary</button>
           <button role="tab" id="tab-source" aria-controls="panel-source" aria-selected="false" tabindex="-1">From source</button>
         </div>
-        <div class="tabpanel" id="panel-cargo" role="tabpanel" aria-labelledby="tab-cargo">
+        <div class="tabpanel" id="panel-homebrew" role="tabpanel" aria-labelledby="tab-homebrew">
+          <p>If you use Homebrew, install from the tap maintained in this repository:</p>
+          <div class="code"><pre>brew tap milobeans/diskr https://github.com/milobeans/diskr
+brew install milobeans/diskr/diskr</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+          <p>Homebrew selects the native archive for your Mac and verifies its checksum. Run <code>diskr ~/Downloads</code> to begin. To update later, run <code>brew update</code> followed by <code>brew upgrade milobeans/diskr/diskr</code>.</p>
+        </div>
+        <div class="tabpanel" id="panel-cargo" role="tabpanel" aria-labelledby="tab-cargo" hidden>
           <p>Requires Rust 1.88 or newer.</p>
-          <div class="code"><pre>cargo install diskr</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+          <div class="code"><pre>cargo install diskr --locked</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
           <p>Run <code>diskr</code> to browse your home folder, or <code>diskr ~/Downloads</code> to start elsewhere.</p>
         </div>
         <div class="tabpanel" id="panel-binary" role="tabpanel" aria-labelledby="tab-binary" hidden>
-          <p>Download the archive for your Mac and verify its checksum from <a href="https://github.com/milobeans/diskr/releases">GitHub Releases</a>. Run this in a new, empty directory:</p>
-          <div class="code"><pre>case "$(uname -m)" in
-  arm64) target=aarch64-apple-darwin ;;
-  x86_64) target=x86_64-apple-darwin ;;
-  *) echo "Unsupported architecture" >&2; exit 1 ;;
-esac
-archive="diskr-$target.tar.gz"
-curl --fail --location --remote-name "https://github.com/milobeans/diskr/releases/latest/download/$archive"
-curl --fail --location --remote-name "https://github.com/milobeans/diskr/releases/latest/download/SHA256SUMS"
-checksum=$(awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS)
-test -n "$checksum" &amp;&amp; printf '%s\n' "$checksum" | shasum -a 256 -c -</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
-          <p>After the checksum verifies, install it:</p>
-          <div class="code"><pre>tar -xzf "$archive"
-mkdir -p "$HOME/.local/bin"
-install -m 755 diskr "$HOME/.local/bin/diskr"
-"$HOME/.local/bin/diskr" --help</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
-          <p>Archives are not Developer ID signed or notarized; organization policy may require a different route. No quarantine bypass is needed or recommended.</p>
+          <p>In a new, empty directory, download and verify the installer from <a href="https://github.com/milobeans/diskr/releases/latest">the latest release</a>:</p>
+          <div class="code"><pre>curl --fail --location --remote-name https://github.com/milobeans/diskr/releases/latest/download/install-diskr.sh
+curl --fail --location --remote-name https://github.com/milobeans/diskr/releases/latest/download/SHA256SUMS
+checksum=$(awk &#x27;$2 == &quot;install-diskr.sh&quot; { print }&#x27; SHA256SUMS)
+test -n &quot;$checksum&quot; &amp;&amp; printf &#x27;%s\n&#x27; &quot;$checksum&quot; | shasum -a 256 -c -</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+          <p>Only after the checksum reports <strong>OK</strong>, run it. The installer selects your architecture and verifies the matching release archive:</p>
+          <div class="code"><pre>sh install-diskr.sh</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+          <p>Start a scan directly:</p>
+          <div class="code"><pre>&quot;$HOME/.local/bin/diskr&quot; ~/Downloads</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+          <p>The default location is <code>~/.local/bin</code>. See <a href="docs/#install-path">PATH setup and a custom install location</a> to run <code>diskr</code> by name. The installer does not edit your shell settings.</p>
+          <p>Check each release's notes and, when provided, <code>distribution.json</code> for its signing status. Signed releases include notarized, stapled DMGs. Version 0.1.83 archives are unsigned and not notarized; macOS or organization policy may require another installation route.</p>
         </div>
         <div class="tabpanel" id="panel-source" role="tabpanel" aria-labelledby="tab-source" hidden>
           <div class="code"><pre>git clone https://github.com/milobeans/diskr
 cd diskr
-cargo install --path .</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
+cargo install --path . --locked</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
         </div>
       </div>
     </div>
@@ -275,15 +293,17 @@ cargo install --path .</pre><button class="copy" type="button" aria-label="Copy"
   </div>
 </footer>
 
-<div class="palette" role="dialog" aria-modal="true" aria-label="Search documentation">
+<dialog class="palette" aria-label="Search documentation">
   <div class="palette-box">
-    <label class="palette-input">
+    <div class="palette-input">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
       <input type="search" placeholder="Search the docs" aria-label="Search the docs" autocomplete="off" spellcheck="false">
-    </label>
-    <ul class="palette-results" role="listbox"></ul>
+      <button class="palette-close" type="button" aria-label="Close search">Close</button>
+    </div>
+    <ul class="palette-results" aria-label="Search results"></ul>
+    <p class="palette-status" role="status" aria-live="polite"></p>
     <div class="palette-foot"><span><kbd>↑</kbd> <kbd>↓</kbd> move</span><span><kbd>⏎</kbd> open</span><span><kbd>esc</kbd> close</span></div>
   </div>
-</div>
+</dialog>
 </body>
 </html>

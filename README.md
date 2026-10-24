@@ -11,11 +11,17 @@ A fast, macOS-native disk explorer for the terminal, written in Rust.
 [![macOS 15+](https://img.shields.io/badge/macOS-15%2B-111111?logo=apple)](#compatibility)
 [![License: MIT](https://img.shields.io/crates/l/diskr.svg)](LICENSE)
 
-<img src=".github/assets/demo.webp" width="100%" alt="diskr in a terminal: directory sizes stream in for a home folder, a project opens to reveal a 4.4 GiB build directory, the cleanup view lists safe, regenerable and risky findings, and Top Files ranks the largest files under Library">
+<img src=".github/assets/demo.webp" width="100%" alt="diskr in a terminal: starting from the home folder, the largest folders lead to a project whose 4.4 GiB build directory is tagged as build output; it is moved to the Trash after confirmation and the project shrinks">
 
 **[Website & docs](https://milobeans.github.io/diskr/)** · [Install](#install) · [Tour](#a-quick-tour) · [Keys](#keys) · [Reports](#reports-and-scripting) · [How it works](#how-it-works)
 
 </div>
+
+> **Upcoming release:** This README describes 0.1.84. The latest published
+> release is 0.1.83; the new `g` chooser and native installer await 0.1.84
+> publication. For currently available installation options and features, see
+> the [0.1.83 README](https://github.com/milobeans/diskr/blob/v0.1.83/README.md)
+> and [latest release](https://github.com/milobeans/diskr/releases/latest).
 
 ## Why diskr
 
@@ -27,8 +33,8 @@ Finder sucks. diskr was built as a simpler and more direct way to manage the fil
 - **What can I safely delete?** Caches, build output, toolchains and package
   stores are found and labeled *safe*, *regenerable* or *risky*, each with the
   reason why.
-- **What changed?** Directories that changed since their last scan get a
-  growth badge, and saved baselines show exactly what grew between two dates.
+- **What changed?** Growth badges keep a stable comparison throughout a
+  session, and saved baselines show what grew between two captures.
 - **Why doesn't free space add up?** APFS container space, local snapshots and
   user-available versus free blocks, side by side.
 - **What are my dev tools costing me?** Homebrew, Cargo, npm, pip and Bun
@@ -39,11 +45,13 @@ It also stays out of your way:
 
 - **Fast and lazy.** Sizing uses `getattrlistbulk(2)` to read many entries per
   syscall, and only scans around what you are looking at. Sizes are cached
-  between runs and revalidated with FSEvents, so unchanged trees stay fresh
-  without a rescan.
+  between runs and revalidated with FSEvents. Reliable event history lets
+  unchanged trees stay fresh; unavailable or unreliable history triggers
+  conservative revalidation.
 - **Careful by default.** `--reclaim` only reports; it never deletes. In the
-  TUI, destructive keys are red and always ask for confirmation, and `d` moves
-  items to the Trash. Unreadable or partial measurements are flagged as lower bounds, never
+  TUI, destructive keys are red and ask for confirmation. Files move to the
+  Trash; installed packages use their owning manager's uninstall command.
+  Unreadable or partial measurements are flagged as lower bounds, never
   silently counted as zero.
 - **Native.** Reveal in Finder, open with the default app, copy a path or open
   Terminal at any item.
@@ -57,14 +65,14 @@ against a demo home directory.</sub>
 
 ### Everything at a glance
 
-<img src=".github/assets/files.png" width="100%" alt="The diskr Files pane listing a home directory by allocated size with share bars; .ollama shows an up arrow with 2.7 GiB of growth, .Trash and .npm are tagged as cache, and a side panel lists project dependency footprints for Cargo, pip and npm projects">
+<img src=".github/assets/files.png" width="100%" alt="The diskr Files pane listing a home directory by allocated size with share bars and a growth badge for .ollama, with project dependency footprints in the side panel">
 
 The Files pane sorts by allocated size with a share bar for every row. Inline
 tags such as `[cache]` and `[build]` mark reclaimable directories as you
-browse, and `↑2.7 GiB` shows what grew since the last scan. Press `.` to reveal
-hidden directories, which is where `.ollama`, `.cargo`, `.npm` and friends
-quietly accumulate. The side panels show your volumes and, with `p`, installed
-packages or per-project dependency footprints.
+browse, and `↑2.7 GiB` shows growth against the session's comparison size.
+Press `.` to reveal hidden directories, which is where `.ollama`, `.cargo`,
+`.npm` and friends quietly accumulate. The side panels show your volumes and,
+with `p`, installed packages or per-project dependency footprints.
 
 ### Know what is safe to delete
 
@@ -75,14 +83,19 @@ artifacts and package stores. Every finding explains itself:
 
 | Class | Meaning | Examples |
 | --- | --- | --- |
-| **safe** | Pure cache, regenerated automatically | `~/Library/Caches`, Xcode DerivedData, Homebrew, npm and pip caches, Trash |
+| **safe** | Pure cache, regenerated automatically | `~/Library/Caches`, Xcode DerivedData, Homebrew, npm and pip caches |
 | **regenerable** | Costs a rebuild or re-download | `node_modules`, `target`, `.venv`, Cargo registry, iOS DeviceSupport |
-| **risky** | May hold data you cannot recreate | Xcode Archives, simulator devices, Docker data, `.next` output |
+| **risky** | May hold data you cannot recreate | Trash, Xcode Archives, simulator devices, Docker data, `.next` output |
 
 Build directories are only flagged when their project markers are present
 (`target` next to a `Cargo.toml`, `node_modules` next to a `package.json`), so a
 folder named `target` alone is never a recommendation. Sizes are allocated
 bytes, which is why Docker's sparse disk image shows `1.5 GiB / 64 GiB`.
+
+Review Trash before emptying it: discarded files are not automatically
+regenerated, and emptying is permanent. Candidate bytes are not a promise of
+freed space; snapshots and shared APFS blocks can retain storage, and moving
+files to the Trash does not free their storage until it is emptied.
 
 ### Find the biggest files anywhere
 
@@ -109,8 +122,12 @@ Total: 44 GiB disk → 50 GiB disk  (+5.1 GiB)
     +960 MiB  grew       code
 ```
 
-In the TUI, press `B` to save a baseline for the current directory; rows that
-changed since their last scan show a `↑` or `↓` badge, and `o` can sort by growth.
+In the TUI, press `B` to save a baseline for the current directory. The `↑` and
+`↓` badges and Growth sort compare against each directory's complete cached
+size when the session began, or its first complete measurement if no complete
+cached size was available. Refreshing or scanning again does not reset that
+comparison, and partial measurements do not show a growth delta. Saved history
+baselines are separate and change only when you capture one explicitly.
 
 ### Explain your free space
 
@@ -137,11 +154,17 @@ Local snapshots: 3
 
 ### Packages and project dependencies
 
+<img src=".github/assets/packages.webp" width="100%" alt="diskr packages pane listing Homebrew formulae by size; filtering to dependency leaves puts a 1.6 GiB llvm@18 at the top, which is uninstalled after confirmation">
+
 Press `p` for the packages pane. The System view lists Homebrew formulae and
 casks, npm, pip, Cargo and Bun installs with per-package sizes; the Projects
 view finds dependency directories under the current path and how much each
-costs. `u` filters to dependency leaves, and `x` (or `d`) runs the owning
-manager's uninstall flow after confirmation.
+costs. In System view, `u` filters to dependency leaves, and `x` (or `d`)
+runs the owning manager's uninstall flow after confirmation. In Projects
+view, `d` moves the selected dependency directory to the Trash after confirmation.
+
+A dependency leaf has no known package-manager dependents. You or your scripts
+may still use it directly; review the package before uninstalling it.
 
 <details>
 <summary>How package sizes and dependency counts are measured</summary>
@@ -176,53 +199,76 @@ read/parse failures show unknown or lower-bound counts with warnings. JSON uses
 
 ## Install
 
-With Rust 1.88 or newer:
+diskr runs on macOS 15 or newer, on Apple Silicon and Intel. With Homebrew,
+install the maintained formula from this repository:
 
 ```sh
-cargo install diskr
+brew tap milobeans/diskr https://github.com/milobeans/diskr
+brew install milobeans/diskr/diskr
 ```
 
-Or grab a prebuilt binary for Apple Silicon (`aarch64-apple-darwin`) or Intel
-(`x86_64-apple-darwin`) from [GitHub Releases](https://github.com/milobeans/diskr/releases).
-Archives target macOS 15 or newer and include dependency license notices and
-an inventory alongside the executable.
+Then run `diskr ~/Downloads` for a focused first scan, or `diskr` to start at
+your home folder. Homebrew selects the matching native binary and verifies
+its checksum; Rust is not required. To update later, run `brew update` followed
+by `brew upgrade milobeans/diskr/diskr`.
 
-<details>
-<summary>Verified install from GitHub Releases</summary>
-
-In a new, empty working directory:
+Without Homebrew, use the checksum-verified native installer below, or install
+through Cargo with Rust 1.88 or newer:
 
 ```sh
-case "$(uname -m)" in
-  arm64) target=aarch64-apple-darwin ;;
-  x86_64) target=x86_64-apple-darwin ;;
-  *) echo "Unsupported architecture" >&2; exit 1 ;;
-esac
-archive="diskr-$target.tar.gz"
-curl --fail --location --remote-name "https://github.com/milobeans/diskr/releases/latest/download/$archive"
+cargo install diskr --locked
+```
+
+<details>
+<summary>Native installer without Homebrew or Rust</summary>
+
+Download `install-diskr.sh` and `SHA256SUMS` from the same
+[GitHub release](https://github.com/milobeans/diskr/releases/latest). You can
+also download the current release in a new, empty working directory:
+
+```sh
+curl --fail --location --remote-name "https://github.com/milobeans/diskr/releases/latest/download/install-diskr.sh"
 curl --fail --location --remote-name "https://github.com/milobeans/diskr/releases/latest/download/SHA256SUMS"
-checksum=$(awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS)
+checksum=$(awk '$2 == "install-diskr.sh" { print }' SHA256SUMS)
 test -n "$checksum" && printf '%s\n' "$checksum" | shasum -a 256 -c -
 ```
 
-Only after checksum verification succeeds, extract and install:
+After verification prints `install-diskr.sh: OK`, run the installer:
 
 ```sh
-tar -xzf "$archive"
-mkdir -p "$HOME/.local/bin"
-install -m 755 diskr "$HOME/.local/bin/diskr"
-"$HOME/.local/bin/diskr" --help
+sh install-diskr.sh
 ```
 
-Add `$HOME/.local/bin` to your shell's `PATH` if needed. Archives are not
-Developer ID signed or notarized; macOS or organization policy may require a
-different installation route. No quarantine/security-policy bypass is required
-or recommended by these instructions.
+The release installer selects your architecture, pins downloads to its release,
+verifies the archive checksum and executable version, and installs into
+`$HOME/.local/bin`. It also installs the license notices and does not change
+shell startup files or ask for administrator access. An optional
+`--prefix /absolute/path` installs into that directory's `bin`; `--version
+X.Y.Z` selects a specific release.
+
+Start it directly:
+
+```sh
+"$HOME/.local/bin/diskr" ~/Downloads
+```
+
+For a shorter command, add the installation directory to your shell's `PATH`.
+With the default prefix, `export PATH="$HOME/.local/bin:$PATH"` enables it in
+the current shell; add that line to your shell configuration if you want it
+in future sessions. To update, download the new release's installer and
+checksums, verify them again, then run that installer.
+
+Native archives are also available directly for Apple Silicon
+(`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`). Releases include
+SHA-256 checksums and dependency license notices. Check each release's notes
+and, when provided, `distribution.json` for its signing status. Signed releases
+include notarized, stapled DMGs. Version 0.1.83 archives are unsigned and not
+notarized; macOS or organization policy may require a different installation
+route. These instructions do not bypass quarantine or security policy.
 
 </details>
 
-To build from a local checkout, run `cargo install --path .`. A maintained
-Homebrew formula is not currently provided.
+To build from a local checkout, run `cargo install --path . --locked`.
 
 ## Usage
 
@@ -233,11 +279,37 @@ diskr ~/Downloads   # start somewhere specific
 
 Your first minute:
 
-- `S` sizes every visible directory; `.` shows hidden ones
-- `Enter` opens a directory, `Backspace` goes up, `/` searches
-- `Tab` cycles Files, Disks, Packages and Reclaim
-- `t` ranks the largest files under the selection; `i` shows details
-- `?` lists every key
+1. Press `.` to include hidden directories, then `S` to request sizes for
+   visible directories. Keep an eye on partial or lower-bound measurements.
+2. Select a large directory and press `Enter` to explore it, or `t` to see
+   its largest files. `Backspace` goes up; `Esc` returns from Top Files.
+3. Press `i` for details or `f` to inspect the selection in Finder. Read a
+   cleanup finding's explanation before deciding whether to remove it.
+4. Press `?` for help or `q` to quit. `Tab` switches panes, and `p` opens
+   package inventory when you need it.
+
+Press `g` to go directly to a folder or saved package profile. The chooser
+includes Home, Downloads, Documents, Applications, the filesystem root and
+previously scanned roots, and shows each profile's origin and scan scope.
+Press `/` there to enter an absolute, current-folder-relative or `~/` path.
+Profiles imported from another machine remain visible but cannot run until
+recreated locally. A local profile keeps its manager choices, project depth
+and exclusions when refreshed at its saved root; navigating elsewhere returns
+to the default inventory scope.
+
+### Limited access and incomplete scans
+
+`limited access` means macOS denied access to protected locations; `≥` marks
+a size that is only a lower bound. The visible results remain useful, but
+they are not a complete account of those folders. Press `?` for access help.
+
+If you want to include protected folders, open **System Settings → Privacy &
+Security → Full Disk Access** and choose whether to enable the terminal app
+hosting diskr, such as Terminal or iTerm. This permission is optional and
+applies to other commands launched by that app too. Follow any macOS prompt
+to quit and reopen it, then run diskr again; press `r` to refresh an existing
+view after access changes. Full Disk Access does not override filesystem
+permissions or make disconnected volumes readable.
 
 ## Keys
 
@@ -261,6 +333,7 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 | Left/Right, h/l | Switch pane or package view |
 | Tab, Shift+Tab | Cycle panes |
 | b | Toggle full-width active view and side panels |
+| g | Go to a folder or saved package profile |
 | / | Search files in the current directory or filter packages; Enter keeps, Esc clears |
 | Left/Right, Home/End (input) | Move the caret in rename, mkdir and search; Backspace/Delete erase a grapheme |
 | i | Show details for the selected file, package, or disk |
@@ -294,21 +367,42 @@ keys (`d`, `E`, `x`) are highlighted in red in the TUI.
 
 ## Reports and scripting
 
-Everything the TUI knows is available as a report. All report modes support
-`--json`.
+The main scan reports also support `--json`. Choose the command for the
+question you want to answer:
+
+| Purpose | Command |
+| --- | --- |
+| Largest files by allocated size | `diskr --top 20 ~/Downloads` |
+| Cleanup candidates and their classification | `diskr --reclaim ~` |
+| Capture a scan baseline | `diskr --save ~/Downloads` |
+| Changes since the saved baseline | `diskr --diff ~/Downloads` |
+| APFS free-space breakdown and snapshots | `diskr --space ~` |
+| System packages and project dependencies | `diskr --packages ~` |
+| Projects only, with bounded discovery | `diskr --packages --projects-only --max-depth 3 --exclude archive ~/code` |
+| Selected package managers, without projects | `diskr --packages --manager cargo --manager brew --no-projects ~` |
+
+These scan commands do not delete files or uninstall packages. `--save` writes
+a baseline; the other commands report without changing the baseline.
+
+<details>
+<summary>Preview and request snapshot thinning</summary>
+
+Preview the request without deleting snapshots:
 
 ```sh
-diskr --top 20 ~/Downloads         # largest files by allocated size
-diskr --reclaim ~                  # reclaimable caches and build artifacts
-diskr --save ~/Downloads           # save a scan baseline
-diskr --diff ~/Downloads           # what changed since the baseline
-diskr --space ~                    # APFS free-space breakdown and snapshots
-diskr --packages ~                 # system packages and project dependencies
-diskr --packages --projects-only --max-depth 3 --exclude archive ~/code
-diskr --packages --manager cargo --manager brew --no-projects ~
-diskr --thin-snapshots 10G ~       # preview snapshot thinning (dry run)
-diskr --thin-snapshots 10G --yes ~ # execute it
+diskr --thin-snapshots 10G ~
 ```
+
+Only if you intend to remove local Time Machine snapshots, run the apply
+command separately. It requests up to the stated space from macOS; the amount
+actually freed depends on the available snapshots and system permissions.
+This removes local restore points and does not move them to the Trash.
+
+```sh
+diskr --thin-snapshots 10G --yes ~
+```
+
+</details>
 
 <details>
 <summary>JSON output, exit codes and filters</summary>
@@ -369,18 +463,56 @@ replace that latest baseline. Names use 1-80 ASCII letters, digits, `.`, `_` or
 
 ```sh
 diskr --save --baseline before-cleanup ~/code
-diskr --diff --baseline before-cleanup --json
-diskr --baselines list --json
-diskr --baselines pin before-cleanup
-diskr --baselines unpin before-cleanup
-diskr --baselines prune 10         # preview: keep newest 10 unpinned, plus all pinned
-diskr --baselines prune 10 --yes   # apply; prints a recoverable library backup path
-diskr --baselines export /tmp/diskr-baselines.json
-diskr --baselines import /tmp/diskr-baselines.json
-diskr --save-profile work --projects-only --max-depth 3 --exclude archive ~/code
-diskr --packages --profile work --json
-diskr --baselines remove-profile work        # preview; add --yes to back up and remove
 ```
+
+Compare against that capture later:
+
+```sh
+diskr --diff --baseline before-cleanup --json
+```
+
+Other library commands are alternatives, not a script to run in sequence:
+
+| Purpose | Command |
+| --- | --- |
+| List captures and profiles | `diskr --baselines list --json` |
+| Protect a capture from pruning | `diskr --baselines pin before-cleanup` |
+| Allow a capture to be pruned again | `diskr --baselines unpin before-cleanup` |
+| Export the library to a new file | `diskr --baselines export /tmp/diskr-baselines.json` |
+| Merge an exported library | `diskr --baselines import /tmp/diskr-baselines.json` |
+
+Preview pruning first. This keeps the ten newest unpinned captures and every
+pinned capture:
+
+```sh
+diskr --baselines prune 10
+```
+
+Apply that pruning decision separately; the command writes a recovery backup
+and prints its path before removing captures:
+
+```sh
+diskr --baselines prune 10 --yes
+```
+
+Save an inventory profile without running a scan:
+
+```sh
+diskr --save-profile work --projects-only --max-depth 3 --exclude archive ~/code
+```
+
+Run its saved scope when needed:
+
+```sh
+diskr --packages --profile work --json
+```
+
+In the TUI, press `g` and select the profile to apply the same saved root and
+scope. The Packages view identifies the active profile and scope.
+
+Preview removal of an obsolete profile with
+`diskr --baselines remove-profile work`. Add `--yes` only when you intend to
+back up the library and remove that profile.
 
 Without a path, a named diff uses its stored root. An explicit different root
 is rejected, not retargeted. Baselines are stored under
@@ -428,7 +560,8 @@ shape and cache state; no fixed speedup is promised.
 
 The size cache and history baselines are persisted as JSON through
 `serde_json`. On relaunch, diskr replays macOS FSEvents since the previous
-session to revalidate only the directories that actually changed.
+session. Reliable event history preserves unchanged cached sizes; unavailable
+or unreliable history conservatively marks cached sizes stale for revalidation.
 
 <details>
 <summary>Responsiveness, accuracy and cleanup detection</summary>
@@ -530,6 +663,25 @@ cargo audit
 
 ### Benchmarks
 
+Run the complete optimized protocol and retain its results with:
+
+```sh
+python3 scripts/benchmarks.py --output target/benchmark-results
+```
+
+The runner executes the five benchmark fixtures serially, then samples native
+TUI idle behavior for five seconds (`--idle-seconds` accepts 1–60). It writes
+`metadata.json`, `results.json`, `benchmarks.log`, `native-tui.log` and a
+readable `summary.md` beneath the selected output directory. Metadata includes
+the revision and dirty-tree flag, macOS/build, architecture, CPU, memory,
+toolchain, filesystem and measurement protocol.
+
+The **Benchmarks** GitHub Actions workflow runs weekly on Apple Silicon and
+Intel and can also be started manually. Download its `benchmark-results-…`
+artifacts within 90 days to compare runs with matching machine and fixture
+conditions. Timing trends are informational; failed deterministic assertions
+or missing expected measurements still fail the run.
+
 Repeatable optimized performance checks (temporary fixtures only):
 
 ```sh
@@ -576,7 +728,7 @@ are local warm-cache diagnostics, not a claim about every volume or workload.
 
 ### README images and website
 
-The screenshots, demo animation and social preview in `.github/assets/`, and
+The screenshots, demo animations and social preview in `.github/assets/`, and
 the replay data behind the [website](https://milobeans.github.io/diskr/)
 (`site/assets/replay.json`), are generated from the release binary, not drawn
 by hand. After a UI change, regenerate them with:
@@ -585,17 +737,30 @@ by hand. After a UI change, regenerate them with:
 python3 scripts/screenshots/generate.py
 ```
 
-It needs macOS on APFS, `img2webp` (`brew install webp`) and about 4 GiB of
-free space. It builds a synthetic home directory from APFS clones, drives diskr
-in a pseudo-terminal, and installs its pinned Python packages into
-`target/screenshots/venv`. Host paths are masked as `/Users/demo`; the disks
-panel still shows the machine's real volumes.
+It needs macOS, `img2webp` (`brew install webp`) and about 4 GiB of free
+space. It builds a synthetic home directory and Homebrew Cellar from APFS
+clones on a throwaway disk image, drives diskr in a pseudo-terminal, and
+installs its pinned Python packages into `target/screenshots/venv`. The demo's
+Trash moves stay on that image and its `brew` is a stand-in, so nothing outside
+the image is deleted. Host paths are masked as `/Users/demo`; the disks panel
+still shows the machine's real volumes.
 
 The website in `site/` is static HTML, CSS and JavaScript with no build step;
 preview it with `python3 -m http.server -d site` after copying
-`.github/assets/*` into `site/assets/img/`. The Pages workflow publishes it on
-every push to `main` that touches the site or its images. A test keeps the
-site's key reference in sync with the keymap.
+`.github/assets/*` into `site/assets/img/`. Validate it locally with:
+
+```sh
+npm ci --prefix scripts/site-validation
+npm --prefix scripts/site-validation run check
+npm --prefix scripts/site-validation exec -- playwright install --with-deps chromium
+npm --prefix scripts/site-validation run test:browser
+```
+
+The checks assemble a preview under `target/site-validation`, validate links
+and assets, and exercise copy payloads, search keyboard behavior, replay
+loading, color contrast and narrow layouts. The Pages workflow runs these
+checks before publishing site or image changes from `main`. A Rust test also
+keeps the site's key reference in sync with the keymap.
 
 ### Releases
 
@@ -605,6 +770,27 @@ One-time setup:
 
 1. Add a repository secret named `CARGO_REGISTRY_TOKEN` with a crates.io API token that has publish access for `diskr`.
 
+Developer ID signing and notarization are optional and disabled until the
+required credentials are provisioned. Apple Developer Program membership or
+an Apple Development certificate alone does not configure distribution
+signing. To enable it, set the repository variable `MACOS_SIGNING_ENABLED`
+to `true` and configure these repository secrets:
+
+| Secret | Value |
+| --- | --- |
+| `MACOS_DEVELOPER_ID_P12` | Base64-encoded Developer ID Application certificate and private key exported as a P12 |
+| `MACOS_DEVELOPER_ID_PASSWORD` | Password protecting that P12 |
+| `MACOS_DEVELOPER_ID_IDENTITY` | Full `Developer ID Application: …` identity |
+| `APPLE_NOTARY_KEY_P8` | Base64-encoded App Store Connect team API private key with notarization access |
+| `APPLE_NOTARY_KEY_ID` | API key ID |
+| `APPLE_NOTARY_ISSUER_ID` | Team API issuer ID |
+
+When enabled, the workflow signs the executable and produces notarized,
+stapled DMGs alongside the archives containing the signed executable. It
+requires valid credentials and successful notarization; enabling the setting
+does not itself establish that a release is signed. Keep credentials in
+GitHub Secrets and never in the repository.
+
 Release flow:
 
 1. Move the `[Unreleased]` section of `CHANGELOG.md` into a new version
@@ -612,9 +798,6 @@ Release flow:
 2. Update `Cargo.toml` to the new crate version.
 3. Refresh `Cargo.lock` if needed and push the version bump to `main`.
 4. Create and push a matching tag like `v0.1.14`.
-
-CI and release jobs reject private maintenance files if they are accidentally
-tracked again.
 
 ```sh
 git tag -a v0.1.14 -m "v0.1.14"
@@ -628,7 +811,19 @@ When that tag is pushed, the `Release` workflow will:
 3. Run the full release validation set.
 4. Publish the crate to crates.io if that version is not already published.
 5. Download the published crate and verify it was built from the exact tag commit.
-6. Create the matching GitHub release once, using generated notes.
+6. Create the matching GitHub release once, using the released changelog
+   section for its notes.
+
+After the workflow succeeds, verify the release's `diskr.rb` against its
+`SHA256SUMS` entry, replace `Formula/diskr.rb` with that verified asset, and
+push the formula update to `main`. This tooling-only update needs no version
+bump or release tag. Keep the tap on the latest successfully published release,
+so Homebrew never points at assets that are still being built.
+
+Release notes and `distribution.json` record whether that release was Developer
+ID signed and Apple notarized. Check those records for the release you install;
+the repository's optional signing configuration is not evidence about an
+earlier artifact.
 
 </details>
 

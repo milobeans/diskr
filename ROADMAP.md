@@ -5,18 +5,16 @@ The strongest direction is to explain why space disappeared, what changed over
 time, and what is actually reclaimable.
 
 This file tracks product direction at the feature level. Shipped work is
-recorded in [CHANGELOG.md](CHANGELOG.md). Detailed maintenance trackers, audit
-notes, and workflow instructions are private project materials and are not
-published in this repository.
+recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Highest-Leverage Features
 
 - APFS phantom-space view: show local Time Machine snapshots, purgeable space,
   and other space that normal file trees do not explain. Use `tmutil
-  listlocalsnapshots /` for discovery and consider an explicit, confirmed
-  snapshot-thinning action. Implemented first CLI surface with
+  listlocalsnapshots` on the owning volume for discovery. Implemented with
   `diskr --space [--json] [PATH]` and guarded `diskr --thin-snapshots SIZE
-  [--yes] [PATH]`.
+  [--yes] [PATH]`. Snapshot thinning previews by default and requires a
+  separate apply command; individual snapshot byte sizes remain unavailable.
 - Logical vs. physical size: track apparent file size and allocated on-disk
   size separately so APFS clones, sparse files, and compressed files do not
   mislead users. Implemented for scanner results, TUI sorting, selected-item
@@ -56,8 +54,10 @@ published in this repository.
 - Stale-file finder: combine size with macOS last-used metadata such as
   Spotlight `kMDItemLastUsedDate` or access-time metadata to surface large files
   that have not been opened recently.
-- Trash and browser-cache awareness: include Trash, browser caches, downloads,
-  and app caches in a separate "easy wins" view, with conservative defaults.
+- Trash and browser-cache awareness: Reclaim includes browser/app caches and
+  discarded Trash files. Trash needs review because emptying is permanent;
+  it is not automatically regenerated cache. Ordinary Downloads remain
+  user-owned files, not an automatic cleanup recommendation.
 
 ## Navigation and Action Improvements
 
@@ -72,8 +72,11 @@ published in this repository.
   destroying logical copies.
 - Saved roots and profiles: CLI package profiles now retain a named root,
   manager selection, project depth and exclusions, with list/export/import and
-  guarded removal. A direct in-TUI saved-root/profile chooser remains a separate
-  navigation feature; named CLI profiles do not imply that picker is shipped.
+  guarded removal. The `g` chooser opens common folders, previously scanned
+  roots and saved profiles, with asynchronous catalog/path loading and direct
+  path entry. Profile origins and scopes stay visible; imported foreign
+  profiles cannot run until explicitly recreated locally. Refreshing at a
+  saved root retains its scope; navigating elsewhere restores the default.
 
 ## TUI Density and Declutter
 
@@ -81,11 +84,15 @@ Shipped behavior:
 
 - Size-share denominators cover the filtered directory, not its scroll window.
 - Context-sensitive footer and scrollable `?` help use a shared keymap table.
+  Footers prioritize useful actions at common widths, and limited-access
+  guidance explains optional permission recovery and refresh.
 - Files has magnitude-coded sizes, a sort/coverage summary and mark totals.
   Modified time appears when sorting by time or when width permits; there is
   no separate column-header row and no always-visible modified column.
 - Reclaim classification and growth chips are inline in Files. Independently
-  measured child sizes remain distinct from a unique-inode root total.
+  measured child sizes remain distinct from a unique-inode root total. Growth
+  badges and Growth sort share a session baseline, retained across repeated
+  scans and refreshes; partial measurements do not imply a known delta.
 - `b` toggles full-width active views and side panels. Compact disks use one
   line per volume; package lists format only their viewport. Root-relative
   project/Top Files rows retain full paths in details or the selected footer.
@@ -110,19 +117,23 @@ targets continue to take precedence over additional chrome.
   largest-file reports.
 - Machine-readable output: expose JSON summaries for disks, largest files,
   reclaimable categories, and scan diffs. Largest-file, APFS space,
-  reclaimability, and save/diff JSON are implemented.
+  reclaimability, package inventory and save/diff JSON are implemented, with
+  versioned coverage metadata and opt-in strict completion status.
 - Monitor mode: warn when a watched path crosses a size threshold or grows
   quickly between snapshots.
-- Import/export scan data: make snapshots portable and diffable so users can
-  compare machines or hand off diagnostics.
+- Import/export scan data: implemented for immutable named captures and
+  saved inventory profiles, preserving source-machine and raw-root identity.
+  Imports validate conflicts and capacity before merging and do not replace
+  the latest-root history. Foreign comparisons disclose their origin, and
+  foreign profiles require explicit local recreation before execution.
 
 ## Product Guardrails
 
 - Keep the default TUI fast and simple. New intelligence should be discoverable
   from the existing file and disk panes, not require a new heavy workflow.
 - Prefer explain-first cleanup. Any destructive or semi-destructive action should
-  show what will happen, how much space it should reclaim, and what the user may
-  lose.
+  show what will happen, the known allocation involved, and what the user may
+  lose. Candidate bytes are not a freed-space guarantee.
 - Stay macOS-specific where it creates leverage. APFS, Time Machine snapshots,
   FSEvents, Finder, and clone files are where `diskr` can beat generic tools.
 - Keep automation useful. Every major insight in the TUI should eventually have
@@ -151,6 +162,12 @@ targets continue to take precedence over additional chrome.
 10. Shipped density improvements: corrected denominators, context-sensitive
     and scrollable help, inline reclaim classification, full-width views and
     shared scrolling details. Remaining layout choices are listed above.
-11. Next: stale-file finder (size combined with last-used metadata); pairs
-    with age-dimming and reclaim classification chips.
-12. Next: duplicate finder with APFS clone-based dedupe (`clonefile(2)`).
+11. Shipped everyday usability: native/Homebrew installation, visible scan
+    coverage, useful actions at ordinary terminal widths, stable comparisons
+    and saved navigation. Website interaction checks and retained performance
+    measurements support those workflows; use their results to prioritize
+    further improvements.
+12. Explore stale-file finding only with clear evidence limits: missing or old
+    access metadata is not proof that a file is unused.
+13. Explore duplicate finding and APFS cloning after defining identity,
+    metadata preservation, recovery and actual freed-space verification.

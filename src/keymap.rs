@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::HashSet;
 
 use crate::app::Focus;
@@ -55,6 +56,14 @@ const GLOBAL: &[KeyBinding] = &[
 ];
 
 const NAVIGATION: &[KeyBinding] = &[
+    KeyBinding {
+        key: "g",
+        action: "Go to a folder or saved package profile",
+        footer: Some(FooterBinding {
+            key: "g",
+            action: "go",
+        }),
+    },
     KeyBinding {
         key: "Up/Down, j/k",
         action: "Move selection",
@@ -127,7 +136,10 @@ const FILES: &[KeyBinding] = &[
     KeyBinding {
         key: ".",
         action: "Toggle hidden files",
-        footer: None,
+        footer: Some(FooterBinding {
+            key: ".",
+            action: "hidden",
+        }),
     },
     KeyBinding {
         key: "o",
@@ -147,7 +159,7 @@ const FILES: &[KeyBinding] = &[
         action: "Scan missing, stale, or incomplete visible directory sizes",
         footer: Some(FooterBinding {
             key: "S",
-            action: "scan all",
+            action: "scan",
         }),
     },
     KeyBinding {
@@ -158,7 +170,10 @@ const FILES: &[KeyBinding] = &[
     KeyBinding {
         key: "t",
         action: "Toggle full-width Top Files browser; Esc returns",
-        footer: None,
+        footer: Some(FooterBinding {
+            key: "t",
+            action: "largest",
+        }),
     },
     KeyBinding {
         key: "c",
@@ -356,31 +371,48 @@ pub fn is_available_in_focus(focus: Focus, key: &str) -> bool {
 /// de-duplicated. The caller renders as many as fit and always advertises `?`,
 /// so the strip stays short and on-topic instead of listing every binding.
 pub fn footer_bindings_for(focus: Focus) -> Vec<FooterBinding> {
-    let sections: &[&[KeyBinding]] = match focus {
-        Focus::Files => &[NAVIGATION, FILES, EXTERNAL_ACTIONS, PACKAGES],
-        Focus::Disks => &[NAVIGATION, EXTERNAL_ACTIONS, PACKAGES],
-        Focus::Packages => &[NAVIGATION, PACKAGES, EXTERNAL_ACTIONS],
-        Focus::Reclaim => &[NAVIGATION, RECLAIM_REPORTS, EXTERNAL_ACTIONS],
+    let keys: &[&str] = match focus {
+        Focus::Files => &[
+            "S",
+            ".",
+            "t",
+            "g",
+            "/",
+            "r",
+            "Tab, Shift+Tab",
+            "i",
+            "Enter",
+            "d",
+            "q",
+        ],
+        Focus::Disks => &["Enter", "g", "r", "Tab, Shift+Tab", "f", "q"],
+        Focus::Packages => &[
+            "u",
+            "p",
+            "x",
+            "/",
+            "g",
+            "r",
+            "Tab, Shift+Tab",
+            "Enter",
+            "f",
+            "q",
+        ],
+        Focus::Reclaim => &["Enter", "R", "E", "g", "Tab, Shift+Tab", "f", "q"],
     };
-    let mut seen = HashSet::new();
-    let mut out: Vec<FooterBinding> = Vec::new();
-    for binding in sections.iter().copied().flatten() {
-        if let Some(footer) = binding.footer {
-            if seen.insert(footer.key) {
-                out.push(footer);
+    keys.iter()
+        .filter_map(|key| {
+            let mut footer = HELP_SECTIONS
+                .iter()
+                .flat_map(|section| section.bindings)
+                .find(|binding| binding.key == *key)?
+                .footer?;
+            if focus == Focus::Packages && *key == "p" {
+                footer.action = "view";
             }
-        }
-    }
-    // `q` quit always rides along after the pane-specific hints; `?` is added
-    // by the renderer so it survives width truncation.
-    for binding in GLOBAL {
-        if let Some(footer) = binding.footer {
-            if footer.key != "?" && seen.insert(footer.key) {
-                out.push(footer);
-            }
-        }
-    }
-    out
+            Some(footer)
+        })
+        .collect()
 }
 
 #[cfg(test)]

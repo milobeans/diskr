@@ -143,7 +143,8 @@ export class Player {
     this.view = new TerminalView(root.querySelector("canvas"), data);
     this.times = [];
     let acc = 0;
-    for (const f of data.frames) { this.times.push(acc); acc += f.d; }
+    // Frames after `play` are stills for the annotated figures, not playback.
+    for (const f of data.frames.slice(0, data.play ?? data.frames.length)) { this.times.push(acc); acc += f.d; }
     this.total = acc;
     this.position = 0;
     this.playing = false;
@@ -165,6 +166,9 @@ export class Player {
       button.type = "button";
       button.style.setProperty("--w", end - start);
       button.setAttribute("aria-label", `Jump to ${c.name}`);
+      button.addEventListener("click", (event) => {
+        if (event.detail === 0) this.seek(start);
+      });
       const bar = el("span", "bar");
       bar.append(el("span", "fill"));
       button.append(bar, el("span", "name", `${i + 1} · ${c.name}`));
@@ -198,7 +202,12 @@ export class Player {
       this.scrubbing = false;
       if (this.wasPlaying) this.play();
     });
+    track.addEventListener("pointercancel", () => {
+      this.scrubbing = false;
+      if (this.wasPlaying) this.play();
+    });
     this.root.addEventListener("keydown", (e) => {
+      if ((e.key === " " || e.key === "Enter") && e.target.closest("button")) return;
       const idx = this.frameAt(this.position);
       if (e.key === " " || e.key === "k") { e.preventDefault(); this.toggle(); }
       else if (e.key === "ArrowRight" || e.key === "l") { e.preventDefault(); this.pause(); this.seek(this.times[Math.min(idx + 1, this.times.length - 1)]); }

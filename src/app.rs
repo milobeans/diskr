@@ -52,6 +52,7 @@ pub enum InputMode {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ActiveModal {
     Help,
+    Locations,
     Delete,
     Uninstall,
     EmptyTrash,
@@ -523,6 +524,24 @@ fn lookup_group_name(gid: u32) -> String {
     gid.to_string()
 }
 
+#[derive(Default)]
+struct SessionGrowth {
+    baselines: HashMap<PathBuf, SizeInfo>,
+}
+
+impl SessionGrowth {
+    fn remember(&mut self, path: &Path, size: SizeInfo) {
+        self.baselines.entry(path.to_path_buf()).or_insert(size);
+    }
+
+    fn delta(&self, path: &Path, size: SizeInfo) -> Option<i64> {
+        self.baselines.get(path).map(|baseline| {
+            (i128::from(size.allocated) - i128::from(baseline.allocated))
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        })
+    }
+}
+
 pub struct App {
     pub cwd: PathBuf,
     pub entries: Vec<Entry>,
@@ -535,6 +554,8 @@ pub struct App {
     pub sort: SortMode,
     pub focus: Focus,
     pub full_width: bool,
+    pub locations: crate::locations::LocationChooser,
+    pub inventory: crate::locations::InventorySelection,
     pub disks: Vec<DiskInfo>,
     pub status: String,
     pub cwd_enumeration_errors: u32,
@@ -598,6 +619,7 @@ pub struct App {
     pending_delete: Option<DeleteTarget>,
     marked: HashSet<PathBuf>,
     size_cache: HashMap<PathBuf, SizeInfo>,
+    session_growth: SessionGrowth,
     inaccessible_cache: HashMap<PathBuf, u32>,
     reclaim_classes: HashMap<PathBuf, reclaim::Reclaimability>,
     /// `$HOME`, captured once so the files pane can classify fixed-cache rows
@@ -752,7 +774,7 @@ fn run_external_open(path: &Path, reveal: bool) -> Result<(), String> {
         command.arg("-R");
     }
     command.arg(path);
-    let output = packages::run_process(command, Duration::from_secs(15));
+    let output = crate::process::run_process(command, Duration::from_secs(15));
     if output.timed_out {
         Err(String::from("open timed out; check Finder before retrying"))
     } else if output.success {
@@ -774,6 +796,8 @@ impl App {
             ActiveModal::Uninstall
         } else if self.confirming_empty_trash {
             ActiveModal::EmptyTrash
+        } else if self.locations.open {
+            ActiveModal::Locations
         } else if self.pkg_detail {
             ActiveModal::Package
         } else if self.top_files_open {
@@ -849,6 +873,17 @@ impl App {
             }
             Err(err) => Some(format!("size cache ignored: {err}")),
         };
+        let mut session_growth = SessionGrowth::default();
+        for (path, size) in &size_cache {
+            if inaccessible_cache.get(path).copied().unwrap_or(0) == 0
+                && cache_details.get(path).is_some_and(|details| {
+                    details.skipped_mounts == 0
+                        && details.policy_version == state::SCAN_POLICY_VERSION
+                })
+            {
+                session_growth.remember(path, *size);
+            }
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App {
             cwd,
@@ -862,6 +897,8 @@ impl App {
             sort: SortMode::SizeDesc,
             focus: Focus::Files,
             full_width: false,
+            locations: Default::default(),
+            inventory: Default::default(),
             disks: Vec::new(),
             status: String::from("i info · f Finder · O open"),
             cwd_enumeration_errors: 0,
@@ -918,6 +955,7 @@ impl App {
             pending_delete: None,
             marked: HashSet::new(),
             size_cache,
+            session_growth,
             inaccessible_cache,
             reclaim_classes: HashMap::new(),
             cache_age,
@@ -1067,11 +1105,11 @@ impl App {
         } else {
             String::from("±0")
         };
-        let age = format_elapsed(
+        let span = format_duration(
             diff.current_timestamp
                 .saturating_sub(diff.baseline_timestamp),
         );
-        Some(format!("{delta_label} in {age}"))
+        Some(format!("{delta_label} over {span}"))
     }
 
     pub fn reload(&mut self) -> Result<()> {
@@ -1117,6 +1155,25 @@ impl App {
     }
 
     fn rebuild_entries(&mut self) -> Result<()> {
+        if self
+            .inventory
+            .root
+            .as_deref()
+            .is_some_and(|root| root != self.cwd)
+        {
+            self.cancel_package_scan();
+            self.inventory = Default::default();
+            self.pkg_reports.clear();
+            self.project_deps.clear();
+            self.project_dep_errors = 0;
+            self.project_scope = Default::default();
+            self.project_deps_cwd = None;
+            self.managers_complete = false;
+            self.dep_graph = None;
+            self.packages_loaded = false;
+            self.rebuild_flat_packages();
+            self.rebuild_project_dep_search_text();
+        }
         self.cancel_package_scan();
         if self.streaming_listings {
             self.start_listing();
@@ -1207,6 +1264,12 @@ impl App {
                 .get(&path)
                 .map(|d| d.skipped_mounts)
                 .unwrap_or(0);
+            let size_delta = if is_dir && inaccessible == 0 && skipped_mounts == 0 {
+                self.remember_cached_growth(&path);
+                size.and_then(|size| self.session_growth.delta(&path, size))
+            } else {
+                None
+            };
             let idx = self.entries.len();
             self.entry_index.insert(path.clone(), idx);
             self.entries.push(Entry {
@@ -1222,7 +1285,7 @@ impl App {
                 skipped_mounts,
                 modified,
                 scanning: false,
-                size_delta: None,
+                size_delta,
             });
         }
         self.apply_sort();
@@ -1338,6 +1401,12 @@ impl App {
                         .get(&entry.path)
                         .map(|details| details.skipped_mounts)
                         .unwrap_or(0);
+                    if entry.inaccessible == 0 && entry.skipped_mounts == 0 {
+                        self.remember_cached_growth(&entry.path);
+                        entry.size_delta = entry
+                            .size
+                            .and_then(|size| self.session_growth.delta(&entry.path, size));
+                    }
                 }
                 if let Some(class) = row.class {
                     self.reclaim_classes.insert(entry.path.clone(), class);
@@ -1640,6 +1709,53 @@ impl App {
         aggregates
     }
 
+    pub fn open_locations(&mut self) {
+        self.locations
+            .open(self.home.as_deref(), self.history_records.keys().cloned());
+    }
+
+    fn apply_location(&mut self, location: crate::locations::ResolvedLocation) -> Result<()> {
+        self.cancel_read_only_work();
+        self.exit_search();
+        self.clear_pkg_search();
+        self.marked.clear();
+        self.pkg_reports.clear();
+        self.project_deps.clear();
+        self.project_dep_errors = 0;
+        self.project_scope = Default::default();
+        self.managers_complete = false;
+        self.dep_graph = None;
+        self.packages_loaded = false;
+        self.package_scan_partial = false;
+        self.project_deps_cwd = None;
+        self.rebuild_flat_packages();
+        self.rebuild_project_dep_search_text();
+        self.cwd = location.path;
+        self.selected = 0;
+        let is_profile = location.profile.is_some();
+        self.inventory = crate::locations::InventorySelection {
+            root: is_profile.then(|| self.cwd.clone()),
+            profile: location.profile,
+            scope: location.scope,
+        };
+        self.focus = if is_profile {
+            Focus::Packages
+        } else {
+            Focus::Files
+        };
+        self.reload()?;
+        self.refresh_history_state();
+        if is_profile {
+            self.pkg_view = if self.inventory.scope.managers.is_empty() {
+                PkgView::ProjectDeps
+            } else {
+                PkgView::SystemManagers
+            };
+            self.request_package_scan(true);
+        }
+        Ok(())
+    }
+
     pub fn enter(&mut self) -> Result<()> {
         if self.confirming_delete {
             return Ok(());
@@ -1893,7 +2009,14 @@ impl App {
     }
 
     pub fn drain_scan_results(&mut self) -> bool {
-        let mut changed = self.drain_listing_results();
+        let (mut changed, location) = self.locations.poll();
+        if let Some(location) = location {
+            if let Err(error) = self.apply_location(location) {
+                self.status = format!("could not open folder: {error}");
+            }
+            changed = true;
+        }
+        changed |= self.drain_listing_results();
         while let Ok(msg) = self.scan_rx.try_recv() {
             match msg {
                 ScanMsg::DirStarted { scan_id, path } if scan_id == self.active_scan_id => {
@@ -1916,10 +2039,13 @@ impl App {
                     let is_active_scan = scan_id == self.active_scan_id;
                     let keep_scanning = !is_active_scan && self.active_scan_paths.contains(&path);
                     let scanned_at = now_secs();
-                    // The cached value (if any) is the directory's previous
-                    // size; capture it before record_cached_size overwrites it
-                    // so we can show how much it grew/shrank.
-                    let previous = self.size_cache.get(&path).copied();
+                    self.remember_cached_growth(&path);
+                    let size_delta = if inaccessible == 0 && skipped_mounts == 0 {
+                        self.session_growth.remember(&path, size);
+                        self.session_growth.delta(&path, size)
+                    } else {
+                        None
+                    };
                     self.record_cached_size(path.clone(), size, inaccessible, scanned_at, false);
                     if let Some(details) = self.cache_details.get_mut(&path) {
                         details.generation = epoch;
@@ -1932,9 +2058,7 @@ impl App {
                             e.cached_at = Some(scanned_at);
                             e.inaccessible = inaccessible;
                             e.skipped_mounts = skipped_mounts;
-                            e.size_delta = previous
-                                .map(|prev| size.allocated as i64 - prev.allocated as i64)
-                                .filter(|delta| *delta != 0);
+                            e.size_delta = size_delta;
                             if !keep_scanning {
                                 e.scanning = false;
                             }
@@ -2987,7 +3111,8 @@ impl App {
     }
 
     pub fn has_pending_scan_work(&self) -> bool {
-        self.listing_loading()
+        self.locations.loading
+            || self.listing_loading()
             || self.sort_dirty
             || self.entries.iter().any(|entry| entry.scanning)
             || self.top_files_loading
@@ -3015,6 +3140,7 @@ impl App {
     }
 
     pub fn cancel_read_only_work(&mut self) {
+        self.locations.close();
         self.cancel_listing();
         self.cancel_reclaim_scan();
         self.cancel_package_scan();
@@ -3535,6 +3661,19 @@ impl App {
         entries
     }
 
+    fn remember_cached_growth(&mut self, path: &Path) {
+        if self.inaccessible_cache.get(path).copied().unwrap_or(0) > 0
+            || self.cache_details.get(path).is_some_and(|details| {
+                details.skipped_mounts > 0 || details.policy_version != state::SCAN_POLICY_VERSION
+            })
+        {
+            return;
+        }
+        if let Some(size) = self.size_cache.get(path).copied() {
+            self.session_growth.remember(path, size);
+        }
+    }
+
     fn record_cached_size(
         &mut self,
         path: PathBuf,
@@ -3572,6 +3711,7 @@ impl App {
     }
 
     fn remove_cached_size(&mut self, path: &Path) {
+        self.remember_cached_growth(path);
         let mut removed = self.size_cache.remove(path).is_some();
         self.cache_details.remove(path);
         removed |= self.inaccessible_cache.remove(path).is_some();
@@ -3742,6 +3882,7 @@ impl App {
         let scan_id = self.next_pkg_scan_id();
         let (tx, rx) = std::sync::mpsc::channel();
         let cwd = self.cwd.clone();
+        let inventory_scope = self.inventory.scope.clone();
         let generation = self
             .package_generation
             .fetch_add(1, AtomicOrdering::Relaxed)
@@ -3755,6 +3896,11 @@ impl App {
         self.deps_loading = false;
         self.dep_scan_rx = None;
         self.project_deps.clear();
+        self.project_dep_errors = 0;
+        self.project_scope = bulkstat::DiscoveryCoverage {
+            depth_limit: inventory_scope.depth,
+            ..Default::default()
+        };
         self.project_deps_cwd = None;
         if include_managers {
             self.managers_complete = false;
@@ -3776,7 +3922,7 @@ impl App {
                 if include_managers {
                     scope.spawn(|| {
                         packages::scan_managers_streamed(
-                            packages::Manager::ALL,
+                            &inventory_scope.managers,
                             &cancellation,
                             &|report| {
                                 reports.lock().unwrap().push(report.clone());
@@ -3794,9 +3940,19 @@ impl App {
                         )
                     });
                 }
+                if !inventory_scope.projects {
+                    return packages::ProjectDepsReport {
+                        projects: Vec::new(),
+                        inaccessible: 0,
+                        scope: bulkstat::DiscoveryCoverage {
+                            depth_limit: inventory_scope.depth,
+                            ..Default::default()
+                        },
+                    };
+                }
                 packages::scan_project_deps_streamed(
                     &cwd,
-                    &packages::InventoryScope::default(),
+                    &inventory_scope,
                     &cancellation,
                     &|project| {
                         let _ = tx.send(PkgScanMsg {
@@ -4649,12 +4805,7 @@ impl App {
                         return Ok(());
                     }
                     let new_path = old_path.parent().unwrap().join(new_name);
-                    if new_path.exists() {
-                        self.status = format!("rename failed: {} already exists", new_name);
-                        self.exit_input_mode();
-                        return Ok(());
-                    }
-                    match std::fs::rename(&old_path, &new_path) {
+                    match crate::fs_ops::rename_without_replacement(&old_path, &new_path) {
                         Ok(()) => {
                             let previous_index = self.selected;
                             self.status = format!(
@@ -4668,7 +4819,11 @@ impl App {
                             self.refresh_history_state();
                         }
                         Err(e) => {
-                            self.status = format!("rename failed: {e}");
+                            self.status = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                                format!("rename failed: {new_name} already exists")
+                            } else {
+                                format!("rename failed: {e}")
+                            };
                         }
                     }
                 }
@@ -5042,19 +5197,23 @@ pub fn format_elapsed(secs: u64) -> String {
     if secs == 0 {
         return String::from("just now");
     }
+    format!("{} ago", format_duration(secs))
+}
+
+fn format_duration(secs: u64) -> String {
     let days = secs / 86_400;
     let hours = (secs % 86_400) / 3_600;
     let minutes = (secs % 3_600) / 60;
     if days > 0 {
-        return format!("{days}d {hours}h ago");
+        return format!("{days}d {hours}h");
     }
     if hours > 0 {
-        return format!("{hours}h {minutes}m ago");
+        return format!("{hours}h {minutes}m");
     }
     if minutes > 0 {
-        return format!("{minutes}m ago");
+        return format!("{minutes}m");
     }
-    format!("{secs}s ago")
+    format!("{secs}s")
 }
 
 pub fn format_modified_time(modified: Option<SystemTime>) -> String {
@@ -7712,6 +7871,155 @@ mod tests {
     }
 
     #[test]
+    fn session_growth_survives_repeat_scan_refresh_and_navigation() {
+        let root = test_root("session_growth_refresh");
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.size_cache.insert(a.clone(), SizeInfo::new(100, 100));
+        app.size_cache.insert(b.clone(), SizeInfo::new(100, 100));
+        app.sort = SortMode::Growth;
+
+        deliver_growth_scan(&mut app, &a, 500, 0, 0);
+        deliver_growth_scan(&mut app, &b, 300, 0, 0);
+        deliver_growth_scan(&mut app, &a, 500, 0, 0);
+        assert_eq!(app.entries[0].path, a);
+        assert_eq!(app.entries[0].size_delta, Some(400));
+
+        app.force_rescan();
+        deliver_growth_scan(&mut app, &a, 500, 0, 0);
+        deliver_growth_scan(&mut app, &b, 300, 0, 0);
+        assert_eq!(app.entries[0].path, a);
+        assert_eq!(app.entries[0].size_delta, Some(400));
+        app.cwd = b.clone();
+        app.reload().unwrap();
+        app.cwd = root.clone();
+        app.reload().unwrap();
+        assert_eq!(app.entries[0].path, a);
+        assert_eq!(app.entries[0].size_delta, Some(400));
+        assert_eq!(app.entries[1].size_delta, Some(200));
+        app.invalidate_pending_scan_results();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_growth_waits_for_complete_first_observation() {
+        let root = test_root("session_growth_complete");
+        let dir = root.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.record_cached_size(dir.clone(), SizeInfo::new(50, 50), 1, 1, true);
+        deliver_growth_scan(&mut app, &dir, 100, 0, 1);
+        assert_eq!(app.entries[0].size_delta, None);
+        deliver_growth_scan(&mut app, &dir, 300, 0, 0);
+        assert_eq!(app.entries[0].size_delta, Some(0));
+        deliver_growth_scan(&mut app, &dir, 500, 0, 0);
+        assert_eq!(app.entries[0].size_delta, Some(200));
+        deliver_growth_scan(&mut app, &dir, 100, 1, 0);
+        assert_eq!(app.entries[0].size_delta, None);
+        app.reload().unwrap();
+        assert_eq!(app.entries[0].size_delta, None);
+        deliver_growth_scan(&mut app, &dir, 500, 0, 0);
+        assert_eq!(app.entries[0].size_delta, Some(200));
+        app.invalidate_pending_scan_results();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_growth_restores_streamed_rows_and_bounds_extreme_deltas() {
+        let root = test_root("session_growth_streamed");
+        let dir = root.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.size_cache.insert(dir.clone(), SizeInfo::new(100, 100));
+        deliver_growth_scan(&mut app, &dir, 500, 0, 0);
+        let mut entry = app.entries.pop().unwrap();
+        entry.size_delta = None;
+        entry.size = None;
+        let (tx, rx) = channel();
+        app.listing_rx = Some(rx);
+        app.listing_state = ListingState::Loading;
+        tx.send(ListingBatch {
+            generation: app.listing_generation.load(AtomicOrdering::Relaxed),
+            cwd: root.clone(),
+            rows: vec![ListingRow {
+                entry,
+                device: None,
+                class: None,
+            }],
+            hidden: 0,
+            errors: 0,
+            finished: true,
+            error: None,
+        })
+        .unwrap();
+        assert!(app.drain_listing_results());
+        assert_eq!(app.entries[0].size_delta, Some(400));
+        let mut growth = SessionGrowth::default();
+        growth.remember(&dir, SizeInfo::new(0, 0));
+        assert_eq!(
+            growth.delta(&dir, SizeInfo::new(0, u64::MAX)),
+            Some(i64::MAX)
+        );
+        app.invalidate_pending_scan_results();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn deliver_growth_scan(
+        app: &mut App,
+        path: &Path,
+        allocated: u64,
+        inaccessible: u32,
+        skipped_mounts: u32,
+    ) {
+        app.invalidate_pending_scan_results();
+        let scan_id = app.min_valid_scan_id;
+        app.active_scan_id = scan_id;
+        app.scan_total = 1;
+        app.scan_completed = 0;
+        let (tx, rx) = channel();
+        app.scan_rx = rx;
+        tx.send(ScanMsg::DirSize {
+            scan_id,
+            epoch: state::next_epoch(),
+            path: path.to_path_buf(),
+            size: SizeInfo::new(allocated, allocated),
+            inaccessible,
+            skipped_mounts,
+        })
+        .unwrap();
+        tx.send(ScanMsg::AllDone { scan_id }).unwrap();
+        app.drain_scan_results();
+    }
+
+    #[test]
+    fn history_delta_describes_comparison_duration_without_relative_age() {
+        let root = test_root("history_delta_duration");
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.history_diff = Some(history::DiffReport {
+            path: root.clone(),
+            baseline_timestamp: 100,
+            current_timestamp: 107,
+            before_total: SizeInfo::new(100, 100),
+            after_total: SizeInfo::new(107, 107),
+            baseline_inaccessible: 0,
+            current_inaccessible: 0,
+            baseline_skipped_mounts: 0,
+            current_skipped_mounts: 0,
+            changes: Vec::new(),
+        });
+        assert_eq!(app.history_delta_status().as_deref(), Some("+7 B over 7s"));
+        app.history_diff.as_mut().unwrap().current_timestamp = 100;
+        assert_eq!(app.history_delta_status().as_deref(), Some("+7 B over 0s"));
+        assert_eq!(format_elapsed(7), "7s ago");
+        assert_eq!(format_elapsed(0), "just now");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn go_up_reselects_previous_directory_in_parent() {
         let root = test_root("go_up_selection");
         let child = root.join("child");
@@ -8511,6 +8819,111 @@ mod tests {
         );
         app.close_pkg_detail();
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_profile_retains_discovery_scope_until_leaving_its_root() {
+        let root = test_root("profile_scope");
+        for relative in ["current", "archive/old", "deep/nested"] {
+            let project = root.join(relative);
+            fs::create_dir_all(project.join("target")).unwrap();
+            fs::write(
+                project.join("Cargo.toml"),
+                "[package]\nname = 'fixture'\nversion = '0.1.0'\n",
+            )
+            .unwrap();
+            fs::write(project.join("target/artifact"), "fixture").unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.project_dep_errors = 7;
+        app.project_scope = bulkstat::DiscoveryCoverage {
+            depth_limit: 9,
+            depth_limited: 3,
+            skipped_mounts: 2,
+            excluded_policy: 4,
+        };
+        let scope = packages::InventoryScope {
+            managers: Vec::new(),
+            projects: true,
+            depth: 1,
+            excludes: vec![PathBuf::from("archive")],
+        };
+        app.apply_location(crate::locations::ResolvedLocation {
+            path: root.clone(),
+            profile: Some(String::from("work")),
+            scope: scope.clone(),
+        })
+        .unwrap();
+        assert_eq!(app.project_dep_errors, 0);
+        assert_eq!(
+            app.project_scope,
+            bulkstat::DiscoveryCoverage {
+                depth_limit: scope.depth,
+                ..Default::default()
+            }
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.packages_loading && Instant::now() < deadline {
+            app.drain_scan_results();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!app.packages_loading);
+        assert_eq!(app.inventory.profile.as_deref(), Some("work"));
+        assert_eq!(app.inventory.scope, scope);
+        assert_eq!(app.focus, Focus::Packages);
+        assert!(app.pkg_reports.is_empty());
+        assert_eq!(app.project_deps.len(), 1);
+        assert_eq!(app.project_deps[0].path, root.join("current"));
+        app.reload().unwrap();
+        assert_eq!(app.inventory.scope, scope, "refresh must preserve scope");
+        app.cwd = root.join("current");
+        app.reload().unwrap();
+        assert!(app.inventory.profile.is_none());
+        assert_eq!(app.inventory.scope, packages::InventoryScope::default());
+        assert_eq!(app.project_dep_errors, 0);
+        assert_eq!(app.project_scope, bulkstat::DiscoveryCoverage::default());
+        assert!(
+            !app.packages_loaded,
+            "old scoped inventory must not masquerade as the new root"
+        );
+        app.cancel_read_only_work();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn profile_can_disable_both_manager_and_project_discovery() {
+        let root = test_root("empty_profile_scope");
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = 'fixture'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        let root = root.canonicalize().unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.apply_location(crate::locations::ResolvedLocation {
+            path: root.clone(),
+            profile: Some(String::from("empty")),
+            scope: packages::InventoryScope {
+                managers: Vec::new(),
+                projects: false,
+                depth: 0,
+                excludes: Vec::new(),
+            },
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.packages_loading && Instant::now() < deadline {
+            app.drain_scan_results();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!app.packages_loading);
+        assert!(app.pkg_reports.is_empty());
+        assert!(app.project_deps.is_empty());
+        app.cancel_read_only_work();
+        assert!(!app.locations.open);
         fs::remove_dir_all(root).unwrap();
     }
 

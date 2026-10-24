@@ -126,8 +126,8 @@ const FIXED_CATEGORIES: &[FixedCategory] = &[
     },
     FixedCategory {
         label: "Trash",
-        class: Reclaimability::Safe,
-        note: "Already discarded items; emptying is permanent.",
+        class: Reclaimability::Risky,
+        note: "Review discarded files before emptying; they are not regenerated and permanent removal cannot be undone.",
         paths: &[".Trash"],
     },
     FixedCategory {
@@ -824,6 +824,10 @@ mod tests {
             Some(Reclaimability::Safe)
         );
         assert_eq!(
+            classify_by_name_path(".Trash", &home.join(".Trash"), Some(home)),
+            Some(Reclaimability::Risky)
+        );
+        assert_eq!(
             classify_by_name_path("Caches", Path::new("/elsewhere/Caches"), Some(home)),
             None
         );
@@ -840,6 +844,35 @@ mod tests {
             .iter()
             .find(|finding| finding.label == label)
             .map(|finding| finding.class)
+    }
+
+    #[test]
+    fn trash_requires_review_and_is_not_a_safe_cache_finding() {
+        let root = test_root("trash_classification");
+        fs::create_dir_all(root.join(".Trash")).unwrap();
+        fs::create_dir_all(root.join("Library/Caches")).unwrap();
+        fs::write(root.join(".Trash/discarded-document"), b"unique contents").unwrap();
+        fs::write(root.join("Library/Caches/cache"), b"cached contents").unwrap();
+
+        let report = report_with_home(&root, Some(&root));
+        assert_eq!(class_for(&report, "Trash"), Some(Reclaimability::Risky));
+        assert_eq!(
+            class_for(&report, "User caches"),
+            Some(Reclaimability::Safe)
+        );
+        let trash = report
+            .findings
+            .iter()
+            .find(|finding| finding.label == "Trash")
+            .unwrap();
+        assert!(trash.note.contains("Review discarded files"));
+        assert!(trash.note.contains("permanent removal cannot be undone"));
+        assert!(!report
+            .findings
+            .iter()
+            .filter(|finding| finding.class == Reclaimability::Safe)
+            .any(|finding| finding.label == "Trash"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

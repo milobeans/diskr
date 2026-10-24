@@ -172,3 +172,47 @@ def grow(root, base):
           1270 * MiB, 0)
     b.big("code/ledger-api/target/debug/deps/libsqlx_core.rlib", 960 * MiB, 0)
     b.big("Downloads/Xcode_26.1_Release_Candidate.xip", 1500 * MiB, 0)
+
+
+# Homebrew formulae for the package walkthrough: name, version, sizes in MiB of
+# the files inside its keg, and installed formulae it depends on.
+FORMULAE = [
+    ("llvm", "21.1.4", [1180, 560], []),
+    ("llvm@18", "18.1.8", [1090, 540], []),
+    ("qt", "6.9.3", [880, 330], []),
+    ("rust", "1.90.0", [640], ["llvm", "openssl@3"]),
+    ("opencv", "4.12.0", [520], ["ffmpeg", "python@3.13", "openblas", "qt"]),
+    ("openjdk", "25", [380], []),
+    ("python@3.13", "3.13.7", [280], ["openssl@3"]),
+    ("go", "1.25.3", [240], []),
+    ("pandoc", "3.8", [210], []),
+    ("ffmpeg", "8.0", [170], ["x265", "x264", "libvpx", "dav1d", "lame", "opus"]),
+    ("postgresql@17", "17.6", [140], ["openssl@3"]),
+    ("node", "24.10.0", [98], ["openssl@3"]),
+    ("openblas", "0.3.30", [95], []),
+    ("imagemagick", "7.1.2", [75], []),
+    ("git", "2.51.1", [55], []),
+    ("gh", "2.82.0", [50], []),
+    ("uv", "0.9.5", [40], []),
+    ("openssl@3", "3.6.0", [30], []),
+    ("x265", "4.1", [20], []),
+    ("libvpx", "1.15.2", [8], []),
+    ("x264", "r3222", [6], []),
+    ("ripgrep", "15.1.0", [6], []),
+    ("dav1d", "1.5.2", [4], []),
+    ("lame", "3.100", [2], []),
+    ("opus", "1.5.2", [2], []),
+]
+
+
+def build_homebrew(prefix, base):
+    """A Cellar of cloned kegs plus the `brew deps --installed --for-each` text."""
+    b = Builder(prefix, base)
+    for name, version, sizes, _ in FORMULAE:
+        for i, size in enumerate(sizes):
+            b.big(f"Cellar/{name}/{version}/lib/lib{name.split('@')[0]}{i}.dylib", size * MiB)
+        b.small(f"Cellar/{name}/{version}/INSTALL_RECEIPT.json", text="{}")
+    os.makedirs(os.path.join(prefix, "Caskroom"), exist_ok=True)
+    with open(os.path.join(prefix, "deps.txt"), "w") as f:
+        for name, _, _, deps in FORMULAE:
+            f.write(f"{name}: {' '.join(deps)}\n")

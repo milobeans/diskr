@@ -125,6 +125,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     match app.active_modal() {
         ActiveModal::Help => draw_help_overlay(f, app),
+        ActiveModal::Locations => draw_locations(f, app),
         ActiveModal::Delete => draw_confirm(f, app),
         ActiveModal::Uninstall => draw_uninstall_confirm(f, app),
         ActiveModal::EmptyTrash => draw_empty_trash_confirm(f, app),
@@ -158,40 +159,161 @@ fn draw_input_overlay(f: &mut Frame, app: &App) {
     f.render_widget(paragraph, area);
 }
 
-fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let path = truncate_start(
-        &app.cwd.display().to_string(),
-        area.width.saturating_sub(30) as usize,
+fn draw_locations(f: &mut Frame, app: &App) {
+    let area = centered_rect(84, 80, 64, 20, f.area());
+    f.render_widget(Clear, area);
+    let block = themed_block()
+        .title(" go to folder / package profile ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let chooser = &app.locations;
+    let message = if let Some(error) = &chooser.error {
+        terminal_text::sanitize(error).into_owned()
+    } else if chooser.loading {
+        String::from("Loading saved roots and profiles...")
+    } else {
+        String::from("Folders browse files; profiles apply their saved inventory scope.")
+    };
+    if let Some(input) = &chooser.path_input {
+        let footer_height = u16::from(inner.height >= 2);
+        let label_height = u16::from(inner.height >= 3);
+        let message_height = inner
+            .height
+            .saturating_sub(footer_height + label_height + 1)
+            .min(2);
+        let editor = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(message_height),
+                Constraint::Length(label_height),
+                Constraint::Min(1),
+                Constraint::Length(footer_height),
+            ])
+            .split(inner);
+        f.render_widget(
+            Paragraph::new(message).wrap(Wrap { trim: false }),
+            editor[0],
+        );
+        f.render_widget(
+            Paragraph::new("Folder path (absolute, relative, or ~/):"),
+            editor[1],
+        );
+        f.render_widget(
+            Paragraph::new(chooser.cursor.viewport(input, usize::from(editor[2].width))),
+            editor[2],
+        );
+        f.render_widget(Paragraph::new("Enter go · Esc back"), editor[3]);
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(7),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(message).wrap(Wrap { trim: false }),
+        chunks[0],
     );
-    // Only surface non-default state in the header (the sort mode lives in the
-    // files-pane title, and "hidden off" is the default). This keeps the line
-    // about the location, not about settings that rarely change.
-    let mut spans = vec![
-        Span::styled("diskr", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" · "),
-        Span::styled(path, Style::default().fg(Color::Cyan)),
-    ];
-    if app.show_hidden {
-        spans.push(Span::styled(
-            " · hidden on",
-            Style::default().fg(Color::Gray),
-        ));
+    let visible = usize::from(chunks[1].height).max(1);
+    let selected = chooser
+        .selected
+        .min(chooser.entries.len().saturating_sub(1));
+    let offset = selected.saturating_sub(visible.saturating_sub(1));
+    let items = chooser
+        .entries
+        .iter()
+        .skip(offset)
+        .take(visible)
+        .map(|entry| {
+            let kind = if entry.foreign {
+                "[foreign] "
+            } else if entry.profile.is_some() {
+                "[profile] "
+            } else {
+                ""
+            };
+            ListItem::new(truncate(
+                &format!("{kind}{} · {}", entry.label, entry.path.display()),
+                usize::from(chunks[1].width.saturating_sub(2)),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(decoration("▶ ", "> "));
+    let mut state = ListState::default();
+    if !chooser.entries.is_empty() {
+        state.select(Some(selected.saturating_sub(offset)));
     }
-    if let Some(baseline) = app.history_baseline_status() {
-        spans.push(Span::styled(
-            format!(" · {baseline}"),
-            Style::default().fg(Color::DarkGray),
-        ));
+    f.render_stateful_widget(list, chunks[1], &mut state);
+    if let Some(entry) = chooser.entries.get(selected) {
+        let mut details = vec![
+            Line::from(truncate_start(
+                &entry.path.display().to_string(),
+                usize::from(chunks[2].width),
+            )),
+            Line::from(truncate(
+                &format!("Origin: {}", entry.origin),
+                usize::from(chunks[2].width),
+            )),
+        ];
+        if entry.foreign {
+            details.push(Line::from(Span::styled(
+                "Unavailable: recreate this profile locally.",
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        if let Some(scope) = &entry.scope {
+            let managers = if scope.managers.is_empty() {
+                String::from("none")
+            } else {
+                scope
+                    .managers
+                    .iter()
+                    .map(|manager| manager.key())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            details.push(Line::from(format!("Managers: {managers}")));
+            details.push(Line::from(format!(
+                "Projects {} · depth {} · {} exclusions",
+                if scope.projects { "on" } else { "off" },
+                scope.depth,
+                scope.excludes.len()
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(details).wrap(Wrap { trim: false }),
+            chunks[2],
+        );
     }
-    if let Some(delta) = app.history_delta_status() {
-        spans.push(Span::styled(
-            format!(" · {delta}"),
-            Style::default().fg(Color::Green),
-        ));
-    }
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from("↑↓ select · Enter go · / path"),
+            Line::from("Esc/g close"),
+        ]),
+        chunks[3],
+    );
+}
+
+fn draw_header(f: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![Span::styled(
+        "diskr",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
     if app.fda_limited {
         spans.push(Span::styled(
-            " · limited access (no Full Disk Access)",
+            " · limited access",
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -200,6 +322,44 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             format!(" · {} entry errors", app.cwd_enumeration_errors),
             Style::default().fg(Color::Yellow),
         ));
+    }
+    let mut used = spans.iter().map(Span::width).sum::<usize>();
+    let width = usize::from(area.width);
+    if app.fda_limited && width.saturating_sub(used) >= 20 {
+        spans.push(Span::styled(
+            " · ? help",
+            Style::default().fg(Color::Yellow),
+        ));
+        used += 9;
+    }
+    let path = truncate_start(
+        &app.cwd.display().to_string(),
+        width.saturating_sub(used + 3),
+    );
+    if !path.is_empty() {
+        used += display_width(&path) + 3;
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(path, Style::default().fg(Color::Cyan)));
+    }
+    let mut context = Vec::new();
+    if app.show_hidden {
+        context.push((String::from("hidden on"), Color::Gray));
+    }
+    if let Some(baseline) = app.history_baseline_status() {
+        context.push((baseline, Color::DarkGray));
+    }
+    if let Some(delta) = app.history_delta_status() {
+        context.push((delta, Color::Green));
+    }
+    for (text, color) in context {
+        let needed = display_width(&text) + 3;
+        if used + needed <= width {
+            spans.push(Span::styled(
+                format!(" · {text}"),
+                Style::default().fg(color),
+            ));
+            used += needed;
+        }
     }
     let text = Line::from(spans);
     f.render_widget(Paragraph::new(text), area);
@@ -688,7 +848,7 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
 
     if let Some(finding) = app.selected_reclaim_finding() {
         let size_line = format!(
-            "{} · {} paths",
+            "{} · {} {}",
             if finding.size.allocated == finding.size.logical {
                 human(finding.size.allocated)
             } else {
@@ -698,7 +858,8 @@ fn draw_reclaim_panel(f: &mut Frame, app: &mut App) {
                     human(finding.size.logical)
                 )
             },
-            finding.count
+            finding.count,
+            if finding.count == 1 { "path" } else { "paths" }
         );
         let mut lines = vec![
             Line::from(""),
@@ -1547,8 +1708,11 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
         String::new()
     };
 
-    let title = Line::from(vec![
-        Span::raw(" packages ─"),
+    let mut title = Line::from(vec![
+        Span::raw(match &app.inventory.profile {
+            Some(profile) => format!(" packages · profile {} ─", truncate(profile, 16)),
+            None => String::from(" packages ─"),
+        }),
         Span::styled(
             if app.pkg_view == PkgView::SystemManagers {
                 "[ System ]"
@@ -1566,7 +1730,7 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
             },
             proj_style,
         ),
-        Span::styled(total_str, Style::default().fg(Color::Green)),
+        Span::styled(total_str.clone(), Style::default().fg(Color::Green)),
         if app.package_scan_partial {
             Span::styled(" [partial]", Style::default().fg(Color::Yellow))
         } else {
@@ -1579,10 +1743,84 @@ fn draw_packages(f: &mut Frame, area: Rect, app: &mut App) {
         },
     ]);
 
-    let block = themed_block()
+    let title_width = usize::from(area.width.saturating_sub(2));
+    let mut bottom_title = None;
+    if title.width() > title_width {
+        let total = total_str.trim_start_matches(" · ");
+        let view_budget = title_width
+            .saturating_sub(display_width(total))
+            .saturating_sub(if total.is_empty() { 2 } else { 5 });
+        let view = truncate(
+            if app.pkg_view == PkgView::SystemManagers {
+                "[ System ]"
+            } else {
+                "[ Projects ]"
+            },
+            view_budget,
+        );
+        let separator = if view.is_empty() || total.is_empty() {
+            ""
+        } else {
+            " · "
+        };
+        title = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(view, Style::default().fg(Color::Yellow)),
+            Span::raw(separator),
+            Span::styled(
+                truncate(total, title_width.saturating_sub(2)),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw(" "),
+        ]);
+        let mut metadata = Vec::new();
+        if app.package_scan_partial {
+            metadata.push(String::from("partial"));
+        }
+        if app.pkg_show_unused {
+            metadata.push(String::from("leaves"));
+        }
+        let metadata_width = title_width.saturating_sub(2);
+        let profile_marker = app.inventory.profile.as_ref().map(|_| "profile".to_owned());
+        let required: Vec<_> = metadata.iter().cloned().chain(profile_marker).collect();
+        let separator = if display_width(&required.join(" · ")) > metadata_width {
+            "·"
+        } else {
+            " · "
+        };
+        if let Some(profile) = &app.inventory.profile {
+            let name_budget = metadata_width
+                .saturating_sub(display_width(&metadata.join(separator)))
+                .saturating_sub(if metadata.is_empty() {
+                    0
+                } else {
+                    display_width(separator)
+                })
+                .saturating_sub("profile".len());
+            metadata.push(if name_budget > 1 {
+                format!("profile {}", truncate(profile, name_budget - 1))
+            } else {
+                String::from("profile")
+            });
+        }
+        if !metadata.is_empty() {
+            bottom_title = Some(Line::from(Span::styled(
+                format!(" {} ", truncate(&metadata.join(separator), metadata_width)),
+                Style::default().fg(if app.package_scan_partial {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
+            )));
+        }
+    }
+    let mut block = themed_block()
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(border_color));
+    if let Some(title) = bottom_title {
+        block = block.title_bottom(title);
+    }
 
     if !app.packages_loaded {
         let block_inner = block.inner(area);
@@ -2007,7 +2245,19 @@ fn draw_help_overlay(f: &mut Frame, app: &mut App) {
         .split(inner);
     let sections_area = chunks[0];
 
-    let (total_lines, page_height) = if sections_area.width >= 76 {
+    let (total_lines, page_height) = if app.fda_limited {
+        let sections: Vec<&KeySection> = keymap::HELP_SECTIONS.iter().collect();
+        let mut lines = access_help_lines();
+        lines.push(Line::from(""));
+        lines.extend(help_lines(&sections));
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let total = paragraph.line_count(sections_area.width);
+        let page = usize::from(sections_area.height);
+        app.help_scroll = app.help_scroll.min(total.saturating_sub(page));
+        let scroll = u16::try_from(app.help_scroll).unwrap_or(u16::MAX);
+        f.render_widget(paragraph.scroll((scroll, 0)), sections_area);
+        (total, page)
+    } else if sections_area.width >= 76 {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -2055,7 +2305,7 @@ fn draw_help_overlay(f: &mut Frame, app: &mut App) {
         marker("*"),
         note(" mounts skipped  "),
         Span::styled("↑↓", Style::default().fg(Color::Green)),
-        note(" grew/shrank"),
+        note(" since session baseline"),
     ]);
     f.render_widget(Paragraph::new(legend), chunks[1]);
 }
@@ -2119,7 +2369,28 @@ fn help_rendered_lines(sections: &[&KeySection], width: u16) -> usize {
         .sum()
 }
 
+fn access_help_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "Limited disk access",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("macOS blocks some protected folders. Their sizes remain lower bounds."),
+        Line::from("Optional: allow Full Disk Access for your terminal host."),
+        Line::from("System Settings > Privacy & Security > Full Disk Access."),
+        Line::from("Enable the app hosting this terminal: Terminal, iTerm, or your editor."),
+        Line::from("Restart that host if macOS requests it, then press r to refresh."),
+        Line::from("You can keep limited access; review lower-bound and error markers."),
+    ]
+}
+
 fn help_paragraph(sections: &[&KeySection]) -> Paragraph<'static> {
+    Paragraph::new(help_lines(sections)).wrap(Wrap { trim: false })
+}
+
+fn help_lines(sections: &[&KeySection]) -> Vec<Line<'static>> {
     let key_width = sections
         .iter()
         .flat_map(|section| section.bindings.iter())
@@ -2157,7 +2428,7 @@ fn help_paragraph(sections: &[&KeySection]) -> Paragraph<'static> {
         }
     }
 
-    Paragraph::new(lines).wrap(Wrap { trim: false })
+    lines
 }
 
 fn render_confirm_modal(f: &mut Frame, area: Rect, title: &str, body: Vec<Line<'_>>) {
@@ -2269,6 +2540,49 @@ fn draw_uninstall_confirm(f: &mut Frame, app: &App) {
     render_confirm_modal(f, area, "uninstall", body);
 }
 
+fn inventory_scope_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(profile) = &app.inventory.profile else {
+        return Vec::new();
+    };
+    let scope = &app.inventory.scope;
+    let managers = if scope.managers.is_empty() {
+        String::from("none")
+    } else {
+        scope
+            .managers
+            .iter()
+            .map(|manager| manager.key())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let root = app.inventory.root.as_ref().unwrap_or(&app.cwd);
+    let mut lines = vec![
+        Line::from(format!("  Profile: {}", terminal_text::sanitize(profile))),
+        Line::from(format!(
+            "  Scan root: {}",
+            terminal_text::sanitize(&root.display().to_string())
+        )),
+        Line::from(format!("  Managers: {managers}")),
+        Line::from(format!(
+            "  Projects: {} · depth {}",
+            if scope.projects { "on" } else { "off" },
+            scope.depth
+        )),
+    ];
+    if scope.excludes.is_empty() {
+        lines.push(Line::from("  Exclusions: none"));
+    } else {
+        for path in &scope.excludes {
+            lines.push(Line::from(format!(
+                "  Exclude: {}",
+                terminal_text::sanitize(&path.display().to_string())
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines
+}
+
 fn draw_pkg_detail(f: &mut Frame, app: &App) {
     let Some((pkg, manager, dep_info)) = app.selected_pkg_detail() else {
         return;
@@ -2278,6 +2592,7 @@ fn draw_pkg_detail(f: &mut Frame, app: &App) {
 
     let mut lines = Vec::new();
     lines.push(Line::from(""));
+    lines.extend(inventory_scope_lines(app));
 
     lines.push(Line::from(vec![
         Span::styled(
@@ -2511,6 +2826,7 @@ fn draw_project_dep_detail(f: &mut Frame, app: &App) {
 
     let mut lines = Vec::new();
     lines.push(Line::from(""));
+    lines.extend(inventory_scope_lines(app));
 
     lines.push(Line::from(vec![
         Span::styled(
@@ -3088,8 +3404,7 @@ fn size_magnitude_style(bytes: u64) -> Style {
     }
 }
 
-/// A trailing "↑/↓ size" badge for a directory whose size changed since the
-/// last scan, so the eye goes to what grew rather than the familiar top-N.
+/// A trailing "↑/↓ size" badge relative to the session baseline.
 fn growth_badge(delta: i64) -> Option<(String, Style)> {
     if delta == 0 {
         return None;
@@ -3405,6 +3720,251 @@ mod tests {
     use super::*;
 
     #[test]
+    fn narrow_footers_keep_primary_actions_and_help() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+        for width in [40, 80, 120] {
+            for focus in [Focus::Files, Focus::Packages, Focus::Reclaim, Focus::Disks] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                terminal
+                    .draw(|frame| draw_help(frame, frame.area(), focus))
+                    .unwrap();
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(text.contains("? help"), "{width} {focus:?}: {text}");
+                assert!(!text.contains("pane/view"));
+                match focus {
+                    Focus::Files => {
+                        for action in ["S scan", ". hidden", "t largest"] {
+                            assert!(text.contains(action), "{width}: {text}");
+                        }
+                        if width >= 80 {
+                            assert!(text.contains("g go"));
+                            assert!(text.contains("r refresh"));
+                        }
+                    }
+                    Focus::Packages => {
+                        assert!(text.contains("u leaves"));
+                        assert!(text.contains("p view"));
+                        assert!(text.contains("x uninstall"));
+                    }
+                    Focus::Reclaim => assert!(text.contains("R rescan")),
+                    Focus::Disks => assert!(text.contains("open")),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn access_warning_survives_long_paths_history_and_entry_errors() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+        let root = std::env::temp_dir().join(format!("diskr_access_header_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.fda_limited = true;
+        app.cwd_enumeration_errors = 7;
+        app.cwd = root.join("long-folder-name/".repeat(20));
+        app.history_baseline = Some(crate::history::ScanRecord {
+            path: app.cwd.clone(),
+            timestamp: 1,
+            generation: 1,
+            enumeration_errors: 0,
+            children: vec![],
+        });
+        for width in [40, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| draw_header(frame, frame.area(), &app))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(text.contains("limited access"), "{width}: {text}");
+            assert!(text.contains("7 entry errors"), "{width}: {text}");
+            if width >= 80 {
+                assert!(text.contains("? help"), "{width}: {text}");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn limited_access_help_explains_optional_host_permission_and_refresh() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+        let root = std::env::temp_dir().join(format!("diskr_access_help_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.fda_limited = true;
+        app.open_help();
+        for width in [80, 120] {
+            app.help_scroll = 0;
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| draw_help_overlay(frame, &mut app))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            for instruction in [
+                "Limited disk access",
+                "Full Disk Access",
+                "hosting this terminal",
+                "r to refresh",
+            ] {
+                assert!(text.contains(instruction), "{width}: {text}");
+            }
+            app.help_scroll = usize::MAX;
+            terminal
+                .draw(|frame| draw_help_overlay(frame, &mut app))
+                .unwrap();
+            assert!(app.help_scroll > 0);
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(text.contains("Detail drawers"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn location_chooser_keeps_foreign_scope_and_path_actions_visible() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+        let root =
+            std::env::temp_dir().join(format!("diskr_locations_render_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.locations.open = true;
+        app.locations.entries = vec![crate::locations::LocationEntry {
+            label: String::from("work"),
+            path: root.join("wide-folder/".repeat(10)),
+            profile: Some(String::from("work")),
+            origin: String::from("imported from remote-machine"),
+            foreign: true,
+            scope: Some(crate::packages::InventoryScope::default()),
+        }];
+        for width in [40, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| draw_locations(frame, &app)).unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            for expected in [
+                "[foreign]",
+                "Origin:",
+                "Unavailable:",
+                "Managers:",
+                "Projects on",
+                "Enter go",
+                "Esc/g close",
+            ] {
+                assert!(text.contains(expected), "{width}: {text}");
+            }
+        }
+        app.locations.path_input = Some(String::from("~/some/folder/target"));
+        app.locations
+            .cursor
+            .end(app.locations.path_input.as_ref().unwrap());
+        app.locations.error = Some(String::from("Folder is unavailable"));
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        terminal.draw(|frame| draw_locations(frame, &app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for expected in ["Folder is unavailable", "target|", "Enter go", "Esc back"] {
+            assert!(text.contains(expected), "{text}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn location_path_editor_retains_text_and_caret_in_short_terminals() {
+        let root = std::env::temp_dir().join(format!(
+            "diskr_location_editor_{}",
+            crate::state::next_epoch()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.locations.open = true;
+        let input = format!("/{}VISIBLE_INPUT", "long folder/".repeat(16));
+        app.locations.cursor.end(&input);
+        app.locations.path_input = Some(input);
+        app.locations.error = Some(String::from("Folder is unavailable"));
+        for width in [40, 80, 120] {
+            for height in [6, 8, 14, 24] {
+                let text = render_app(&mut app, width, height);
+                for expected in ["VISIBLE_INPUT|", "Enter go", "Esc back"] {
+                    assert!(text.contains(expected), "{width}x{height}: {text}");
+                }
+                if height >= 8 {
+                    assert!(
+                        text.contains("Folder is unavailable"),
+                        "{width}x{height}: {text}"
+                    );
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_profile_exposes_exact_inventory_scope_in_details() {
+        let root =
+            std::env::temp_dir().join(format!("diskr_profile_scope_render_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.inventory.profile = Some(String::from("work"));
+        app.inventory.root = Some(root.clone());
+        app.inventory.scope = crate::packages::InventoryScope {
+            managers: vec![crate::packages::Manager::Cargo],
+            projects: true,
+            depth: 3,
+            excludes: vec![std::path::PathBuf::from("archive/legacy")],
+        };
+        let text = inventory_scope_lines(&app)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
+            .collect::<String>();
+        for expected in [
+            "Profile: work",
+            "Scan root:",
+            "Managers: cargo",
+            "Projects: on",
+            "depth 3",
+            "Exclude: archive/legacy",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        app.focus = Focus::Packages;
+        app.full_width = true;
+        assert!(render_app(&mut app, 80, 24).contains("profile work"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn ascii_borders_leave_unicode_data_intact() {
         use ratatui_core::{backend::TestBackend, terminal::Terminal};
         let mut terminal = Terminal::new(TestBackend::new(30, 5)).unwrap();
@@ -3531,6 +4091,71 @@ mod tests {
         app.packages_loaded = true;
         app.focus = Focus::Packages;
         app.rebuild_flat_packages();
+    }
+
+    #[test]
+    fn compact_package_titles_keep_totals_and_scope_evidence() {
+        use ratatui_core::{backend::TestBackend, terminal::Terminal};
+        let root = std::env::temp_dir().join(format!(
+            "diskr_compact_packages_{}",
+            crate::state::next_epoch()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        package_fixture(&mut app, 1);
+        let size = SizeInfo::new((69 << 30) / 10, (69 << 30) / 10);
+        app.pkg_reports[0].packages[0].size = Some(size);
+        app.pkg_reports[0].total_size = size;
+        app.project_deps = vec![crate::packages::ProjectDeps {
+            path: root.clone(),
+            manager_label: String::from("cargo"),
+            manifest: String::from("Cargo.toml"),
+            dep_count: 1usize.into(),
+            deps_size: Some(size),
+            deps_dir: Some(root.join("target")),
+            coverage: Default::default(),
+        }];
+        for partial in [false, true] {
+            app.package_scan_partial = partial;
+            app.pkg_show_unused = partial;
+            app.inventory.profile = partial.then(|| "long-saved-project-profile".to_owned());
+            app.pkg_reports[0].warning = partial.then(|| "partial fixture".to_owned());
+            app.project_dep_errors = u32::from(partial);
+            for view in [PkgView::SystemManagers, PkgView::ProjectDeps] {
+                app.pkg_view = view;
+                app.rebuild_flat_packages();
+                for width in [28, 44, 80] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+                    terminal
+                        .draw(|frame| draw_packages(frame, frame.area(), &mut app))
+                        .unwrap();
+                    let cells = &terminal.backend().buffer().content;
+                    let title: String = cells
+                        .iter()
+                        .take(usize::from(width))
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    let text: String = cells.iter().map(|cell| cell.symbol()).collect();
+                    assert!(title.contains("6.9 GiB known"), "{width}: {title}");
+                    if partial {
+                        assert!(title.contains('≥'), "{width}: {title}");
+                        assert!(text.contains("partial"), "{width}: {text}");
+                        assert!(text.contains("profile"), "{width}: {text}");
+                    }
+                    if width >= 44 {
+                        assert!(
+                            title.contains(if view == PkgView::SystemManagers {
+                                "[ System ]"
+                            } else {
+                                "[ Projects ]"
+                            }),
+                            "{width}: {title}"
+                        );
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3943,6 +4568,46 @@ mod tests {
         for frame in SCAN_FRAMES {
             assert_eq!(display_width(frame), 4, "frame {frame:?} is not 4 columns");
         }
+    }
+
+    #[test]
+    fn reclaim_detail_uses_singular_and_plural_path_labels() {
+        let root = std::env::temp_dir().join(format!(
+            "diskr_reclaim_path_label_{}",
+            crate::state::next_epoch()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        app.focus = Focus::Reclaim;
+        for count in [1, 2] {
+            app.reclaim_report = Some(crate::reclaim::ReclaimReport {
+                root: root.clone(),
+                findings: vec![crate::reclaim::Finding {
+                    label: String::from("Fixture cache"),
+                    class: Reclaimability::Safe,
+                    note: String::from("Fixture note"),
+                    size: SizeInfo::new(100, 100),
+                    inaccessible: 0,
+                    skipped_mounts: 0,
+                    count,
+                    paths: vec![root.join("cache"); count],
+                    rollup: false,
+                }],
+                total: SizeInfo::new(100, 100),
+                ..Default::default()
+            });
+            let text = render_app(&mut app, 100, 30);
+            assert!(
+                text.contains(if count == 1 {
+                    "100 B · 1 path"
+                } else {
+                    "100 B · 2 paths"
+                }),
+                "{text}"
+            );
+            assert!(!text.contains("1 paths"), "{text}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

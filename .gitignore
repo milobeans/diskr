@@ -12,3 +12,10 @@ target/
 
 # Pages build copies .github/assets here.
 /site/assets/img/
+
+# Local validation and screenshot tooling caches.
+__pycache__/
+*.pyc
+scripts/site-validation/node_modules/
+scripts/site-validation/test-results/
+scripts/site-validation/playwright-report/
