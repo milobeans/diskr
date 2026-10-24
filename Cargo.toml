@@ -4,13 +4,14 @@ version = "0.1.83"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Milo Evans"]
-description = "Lightweight terminal file explorer and disk/storage manager for macOS"
+description = "Fast macOS disk explorer for the terminal: see where your space went and what is safe to reclaim"
 license = "MIT"
 repository = "https://github.com/milobeans/diskr"
 homepage = "https://github.com/milobeans/diskr"
 readme = "README.md"
-keywords = ["disk", "storage", "tui", "filesystem"]
+keywords = ["disk-usage", "storage", "tui", "macos", "apfs"]
 categories = ["command-line-utilities", "filesystem"]
+exclude = [".github/assets/"]
 
 [dependencies]
 ratatui-core = { version = "0.1", features = ["std"] }
