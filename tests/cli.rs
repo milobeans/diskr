@@ -10,6 +10,133 @@ fn fixture(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("diskr_cli_{name}_{}_{}", std::process::id(), nanos))
 }
 
+// Reconstruct the cursor/clear/text subset emitted by the backend; redraw bytes
+// alone are not a screen snapshot. Unexpected controls fail the smoke test.
+fn terminal_screen(bytes: &[u8], columns: usize, rows: usize) -> String {
+    let mut cells = vec![' '; columns * rows];
+    let (mut row, mut column) = (0usize, 0usize);
+    let mut saved = (0, 0);
+    let text = String::from_utf8_lossy(bytes);
+    let chars: Vec<_> = text.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\u{1b}' {
+            if chars.get(index + 1).is_none() {
+                break;
+            }
+            if chars.get(index + 1) != Some(&'[') {
+                panic!("unsupported terminal escape");
+            }
+            index += 2;
+            let start = index;
+            while index < chars.len() && !('@'..='~').contains(&chars[index]) {
+                index += 1;
+            }
+            if index == chars.len() {
+                break;
+            }
+            let parameters: String = chars[start..index].iter().collect();
+            let values: Vec<_> = parameters
+                .split(';')
+                .map(|value| value.parse::<usize>().ok())
+                .collect();
+            let value = |index: usize, default: usize| {
+                values.get(index).copied().flatten().unwrap_or(default)
+            };
+            match chars[index] {
+                'H' | 'f' => {
+                    row = value(0, 1).max(1).saturating_sub(1).min(rows - 1);
+                    column = value(1, 1).max(1).saturating_sub(1).min(columns - 1);
+                }
+                'A' => row = row.saturating_sub(value(0, 1).max(1)),
+                'B' => row = row.saturating_add(value(0, 1).max(1)).min(rows - 1),
+                'C' => column = column.saturating_add(value(0, 1).max(1)).min(columns - 1),
+                'D' => column = column.saturating_sub(value(0, 1).max(1)),
+                'G' => column = value(0, 1).max(1).saturating_sub(1).min(columns - 1),
+                'd' => row = value(0, 1).max(1).saturating_sub(1).min(rows - 1),
+                'J' => {
+                    let at = (row * columns + column).min(cells.len());
+                    match value(0, 0) {
+                        0 => cells[at..].fill(' '),
+                        1 => {
+                            let end = (at + 1).min(cells.len());
+                            cells[..end].fill(' ');
+                        }
+                        2 => cells.fill(' '),
+                        _ => panic!("unsupported screen clear"),
+                    }
+                }
+                'K' => {
+                    let start = row * columns;
+                    let at = column.min(columns);
+                    match value(0, 0) {
+                        0 => cells[start + at..start + columns].fill(' '),
+                        1 => cells[start..start + (at + 1).min(columns)].fill(' '),
+                        2 => cells[start..start + columns].fill(' '),
+                        _ => panic!("unsupported line clear"),
+                    }
+                }
+                's' => saved = (row, column),
+                'u' => {
+                    (row, column) = saved;
+                }
+                'm' | 'h' | 'l' => {}
+                command => panic!("unsupported CSI {parameters}{command}"),
+            }
+        } else {
+            match chars[index] {
+                '\r' => column = 0,
+                '\n' => row = (row + 1).min(rows - 1),
+                '\u{8}' => column = column.saturating_sub(1),
+                ch if !ch.is_control() => {
+                    let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if width > 0 {
+                        if column >= columns {
+                            column = 0;
+                            row = (row + 1).min(rows - 1);
+                        }
+                        cells[row * columns + column] = ch;
+                        for offset in 1..width {
+                            if column + offset < columns {
+                                cells[row * columns + column + offset] = ' ';
+                            }
+                        }
+                        column += width;
+                    }
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    cells
+        .chunks(columns)
+        .map(|row| row.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn terminal_decoder_keeps_unchanged_cells_and_applies_cursor_overwrites_and_clears() {
+    let initial = b"\x1b[1;1Hneedle.txt\x1b[2;1Hfilter /needle kept";
+    let mut stream = initial.to_vec();
+    stream.extend_from_slice(b"\x1b[2;1Hfull scan complete\x1b[K");
+    let screen = terminal_screen(&stream, 30, 3);
+    assert!(screen.contains("needle.txt"));
+    assert!(screen.contains("full scan complete"));
+    assert!(!screen.contains("kept"));
+    let mut fragmented = stream.clone();
+    fragmented.push(0x1b);
+    assert_eq!(terminal_screen(&fragmented, 30, 3), screen);
+    fragmented.extend_from_slice(b"[1;");
+    assert_eq!(terminal_screen(&fragmented, 30, 3), screen);
+    stream.extend_from_slice(b"\x1b[2J\x1b[1;1Hok");
+    let screen = terminal_screen(&stream, 30, 3);
+    assert!(screen.starts_with("ok"));
+    assert!(!screen.contains("needle"));
+    assert!(terminal_screen("\x1b[1;1H界\x1b[1;3Ha".as_bytes(), 5, 1).starts_with("界 a"));
+}
+
 #[test]
 fn baseline_library_and_profiles_preserve_identity_retention_and_latest_history() {
     let root = fixture("baseline_library");
@@ -249,53 +376,80 @@ fn native_tui_restores_terminal_after_filter_refresh_modal_and_quit() {
             .filter(|ch| !ch.is_whitespace())
             .collect()
     }
-    let wait_for =
-        |master: &mut std::fs::File, output: &mut Vec<u8>, needle: &str, offset: usize| {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut bytes = [0u8; 16_384];
-            loop {
-                match master.read(&mut bytes) {
-                    Ok(count) => output.extend_from_slice(&bytes[..count]),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) => panic!("PTY read: {error}"),
-                }
-                if emitted_text(&output[offset..]).contains(&emitted_text(needle.as_bytes())) {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "waiting for {needle}: {}",
-                    String::from_utf8_lossy(&output[output.len().saturating_sub(4096)..])
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
+    #[derive(Clone, Copy)]
+    enum Expected {
+        Emitted(&'static str),
+        Screen(&'static str),
+    }
+    let wait_for = |master: &mut std::fs::File, output: &mut Vec<u8>, expected: Expected| {
+        let needle = match expected {
+            Expected::Emitted(text) | Expected::Screen(text) => text,
         };
-    wait_for(&mut master, &mut output, "loading state for", 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut bytes = [0u8; 16_384];
+        loop {
+            match master.read(&mut bytes) {
+                Ok(count) => output.extend_from_slice(&bytes[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("PTY read: {error}"),
+            }
+            let observed = match expected {
+                Expected::Emitted(_) => emitted_text(output),
+                Expected::Screen(_) => terminal_screen(output, 100, 24)
+                    .chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .collect(),
+            };
+            if observed.contains(&emitted_text(needle.as_bytes())) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waiting for {needle}: {}",
+                String::from_utf8_lossy(&output[output.len().saturating_sub(4096)..])
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::Emitted("loading state for"),
+    );
     let first_paint = startup_started.elapsed();
-    wait_for(&mut master, &mut output, "needle.txt", 0);
+    wait_for(&mut master, &mut output, Expected::Screen("needle.txt"));
     let first_row = startup_started.elapsed();
-    let offset = output.len();
     master.write_all(b"/needle").unwrap();
-    wait_for(&mut master, &mut output, "Enter keep", offset);
+    wait_for(&mut master, &mut output, Expected::Screen("Enter keep"));
     master.write_all(b"\r").unwrap();
     std::thread::sleep(Duration::from_millis(50));
-    let offset = output.len();
     master.write_all(b"r").unwrap();
-    wait_for(&mut master, &mut output, "needle.txt", offset);
-    let offset = output.len();
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::Screen("all visible sizes fresh"),
+    );
+    let screen = terminal_screen(&output, 100, 24);
+    assert!(screen.contains("needle.txt"));
+    assert!(screen.contains(if idle_seconds > 0 {
+        "1/10002 items"
+    } else {
+        "1/2 items"
+    }));
     master.write_all(b"d").unwrap();
-    wait_for(&mut master, &mut output, "Move to Trash:", offset);
+    wait_for(&mut master, &mut output, Expected::Screen("Move to Trash:"));
     master.write_all(b"n").unwrap();
-    let offset = output.len();
     master.write_all(b"?").unwrap();
-    wait_for(&mut master, &mut output, "keyboard help", offset);
-    let offset = output.len();
+    wait_for(&mut master, &mut output, Expected::Screen("keyboard help"));
     master.write_all(b"\x1b").unwrap();
-    wait_for(&mut master, &mut output, "all visible sizes fresh", offset);
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::Screen("all visible sizes fresh"),
+    );
     if idle_seconds > 0 {
-        let offset = output.len();
         master.write_all(b"\x1b").unwrap();
-        wait_for(&mut master, &mut output, "other.txt", offset);
+        wait_for(&mut master, &mut output, Expected::Screen("other.txt"));
         fn usage(pid: u32) -> libc::rusage_info_v2 {
             let mut usage: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
             assert_eq!(

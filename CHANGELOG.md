@@ -6,6 +6,12 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Native terminal smoke checks reconstruct incremental screen updates and wait
+  for semantic refresh completion, including refreshes that finish between frames.
+  Application behavior is unchanged.
+
 ## [0.1.83] - 2026-10-22
 
 ### Added
