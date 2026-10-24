@@ -10,6 +10,8 @@ All notable changes to diskr are documented here. The format follows
 
 - Native terminal smoke checks reconstruct incremental screen updates and wait
   for semantic refresh completion, including refreshes that finish between frames.
+  Modal transitions require the new view to appear and the old view to disappear,
+  so partial terminal frames cannot prematurely acknowledge a key action.
   Application behavior is unchanged.
 
 ## [0.1.83] - 2026-10-22

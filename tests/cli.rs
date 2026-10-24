@@ -116,6 +116,16 @@ fn terminal_screen(bytes: &[u8], columns: usize, rows: usize) -> String {
         .join("\n")
 }
 
+fn screen_matches(screen: &str, present: &str, absent: Option<&str>) -> bool {
+    let compact = |text: &str| {
+        text.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
+    };
+    let screen = compact(screen);
+    screen.contains(&compact(present)) && absent.is_none_or(|text| !screen.contains(&compact(text)))
+}
+
 #[test]
 fn terminal_decoder_keeps_unchanged_cells_and_applies_cursor_overwrites_and_clears() {
     let initial = b"\x1b[1;1Hneedle.txt\x1b[2;1Hfilter /needle kept";
@@ -135,6 +145,36 @@ fn terminal_decoder_keeps_unchanged_cells_and_applies_cursor_overwrites_and_clea
     assert!(screen.starts_with("ok"));
     assert!(!screen.contains("needle"));
     assert!(terminal_screen("\x1b[1;1H界\x1b[1;3Ha".as_bytes(), 5, 1).starts_with("界 a"));
+}
+
+#[test]
+fn terminal_expectations_reject_partial_modal_frames() {
+    let mut stream = b"\x1b[23;1Hall visible sizes fresh\x1b[2;9Hkeyboard help".to_vec();
+    let opened = |bytes: &[u8]| {
+        screen_matches(
+            &terminal_screen(bytes, 100, 24),
+            "keyboard help",
+            Some("all visible sizes fresh"),
+        )
+    };
+    let closed = |bytes: &[u8]| {
+        screen_matches(
+            &terminal_screen(bytes, 100, 24),
+            "all visible sizes fresh",
+            Some("keyboard help"),
+        )
+    };
+    assert!(!opened(&stream));
+    assert!(!closed(&stream));
+    stream.extend_from_slice(b"\x1b[23;1H\x1b[2K+----------------+");
+    assert!(opened(&stream));
+    assert!(!closed(&stream));
+    stream.extend_from_slice(b"\x1b[2;1H\x1b[2K");
+    assert!(!opened(&stream));
+    assert!(!closed(&stream));
+    stream.extend_from_slice(b"\x1b[23;1H\x1b[2Kall visible sizes fresh");
+    assert!(!opened(&stream));
+    assert!(closed(&stream));
 }
 
 #[test]
@@ -380,10 +420,13 @@ fn native_tui_restores_terminal_after_filter_refresh_modal_and_quit() {
     enum Expected {
         Emitted(&'static str),
         Screen(&'static str),
+        ScreenWithout(&'static str, &'static str),
     }
     let wait_for = |master: &mut std::fs::File, output: &mut Vec<u8>, expected: Expected| {
         let needle = match expected {
-            Expected::Emitted(text) | Expected::Screen(text) => text,
+            Expected::Emitted(text) | Expected::Screen(text) | Expected::ScreenWithout(text, _) => {
+                text
+            }
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut bytes = [0u8; 16_384];
@@ -393,14 +436,18 @@ fn native_tui_restores_terminal_after_filter_refresh_modal_and_quit() {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => panic!("PTY read: {error}"),
             }
-            let observed = match expected {
-                Expected::Emitted(_) => emitted_text(output),
-                Expected::Screen(_) => terminal_screen(output, 100, 24)
-                    .chars()
-                    .filter(|ch| !ch.is_whitespace())
-                    .collect(),
+            let matches = match expected {
+                Expected::Emitted(text) => {
+                    emitted_text(output).contains(&emitted_text(text.as_bytes()))
+                }
+                Expected::Screen(text) => {
+                    screen_matches(&terminal_screen(output, 100, 24), text, None)
+                }
+                Expected::ScreenWithout(present, absent) => {
+                    screen_matches(&terminal_screen(output, 100, 24), present, Some(absent))
+                }
             };
-            if observed.contains(&emitted_text(needle.as_bytes())) {
+            if matches {
                 break;
             }
             assert!(
@@ -440,12 +487,16 @@ fn native_tui_restores_terminal_after_filter_refresh_modal_and_quit() {
     wait_for(&mut master, &mut output, Expected::Screen("Move to Trash:"));
     master.write_all(b"n").unwrap();
     master.write_all(b"?").unwrap();
-    wait_for(&mut master, &mut output, Expected::Screen("keyboard help"));
+    wait_for(
+        &mut master,
+        &mut output,
+        Expected::ScreenWithout("keyboard help", "all visible sizes fresh"),
+    );
     master.write_all(b"\x1b").unwrap();
     wait_for(
         &mut master,
         &mut output,
-        Expected::Screen("all visible sizes fresh"),
+        Expected::ScreenWithout("all visible sizes fresh", "keyboard help"),
     );
     if idle_seconds > 0 {
         master.write_all(b"\x1b").unwrap();
