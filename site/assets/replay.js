@@ -58,9 +58,6 @@ export class TerminalView {
     this.ctx = canvas.getContext("2d");
     this.index = 0;
     new ResizeObserver(() => this.resize()).observe(canvas.parentElement);
-    canvas.parentElement.addEventListener("scroll", (e) => {
-      e.currentTarget.closest(".window")?.classList.add("panned");
-    }, { passive: true, once: true });
     this.resize();
   }
 

@@ -42,37 +42,6 @@ $$(".copy").forEach((button) => button.addEventListener("click", async () => {
   } catch { /* clipboard unavailable; leave the text selectable */ }
 }));
 
-/* Reveal sections and meters as they enter the viewport. */
-const io = new IntersectionObserver((entries) => entries.forEach((e) => {
-  if (e.isIntersecting) { e.target.classList.add("in-view"); io.unobserve(e.target); }
-}), { threshold: 0.18, rootMargin: "0px 0px -8% 0px" });
-$$(".reveal, .apparent").forEach((n) => io.observe(n));
-
-/* Defrag map: blocks settle into allocation classes like a scan filling in. */
-const defrag = $(".defrag");
-if (defrag) {
-  const cols = 20, rows = 16;
-  defrag.style.setProperty("--cols", cols);
-  const weights = [["used", 34], ["safe", 14], ["regen", 12], ["risky", 6], ["", 34]];
-  const pick = () => {
-    let r = Math.random() * 100;
-    for (const [c, w] of weights) { if ((r -= w) < 0) return c; }
-    return "";
-  };
-  const cells = Array.from({ length: cols * rows }, () => defrag.appendChild(document.createElement("i")));
-  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  cells.forEach((cell, i) => {
-    const c = pick();
-    if (!c) return;
-    if (reduce) cell.dataset.c = c;
-    else setTimeout(() => (cell.dataset.c = c), 300 + (i % cols) * 45 + Math.floor(i / cols) * 30 + Math.random() * 400);
-  });
-  if (!reduce) setInterval(() => {
-    const cell = cells[Math.floor(Math.random() * cells.length)];
-    cell.dataset.c = pick();
-  }, 900);
-}
-
 /* Tabs */
 $$(".tabs").forEach((tabs) => {
   const buttons = $$("[role=tab]", tabs);

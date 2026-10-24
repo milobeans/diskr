@@ -3,20 +3,20 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>diskr: see where your Mac's disk space went</title>
-<meta name="description" content="A fast, macOS-native disk explorer for the terminal. See what is using your space, what is safe to delete, what changed, and why free space doesn't add up.">
-<meta name="theme-color" content="#0c0d11" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#f3efe6" media="(prefers-color-scheme: light)">
+<title>diskr: disk usage explorer for the macOS terminal</title>
+<meta name="description" content="diskr is a fast disk usage explorer for the macOS terminal. It sizes folders by allocated space, suggests safe cleanups, tracks changes and explains APFS free space.">
+<meta name="theme-color" content="#0f1013" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f7f6f3" media="(prefers-color-scheme: light)">
 <link rel="canonical" href="https://milobeans.github.io/diskr/">
 <meta property="og:type" content="website">
-<meta property="og:title" content="diskr: see where your disk space went">
-<meta property="og:description" content="A fast, macOS-native disk explorer for the terminal, written in Rust.">
+<meta property="og:title" content="diskr: disk usage explorer for the macOS terminal">
+<meta property="og:description" content="Sizes by allocated space, safe cleanup suggestions, change tracking and APFS space reports. Written in Rust.">
 <meta property="og:url" content="https://milobeans.github.io/diskr/">
 <meta property="og:image" content="https://milobeans.github.io/diskr/assets/img/social-preview.png">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.bunny.net">
-<link rel="stylesheet" href="https://fonts.bunny.net/css?family=instrument-serif:400,400i|instrument-sans:400,500,600|jetbrains-mono:400,500,600,700&display=swap">
+<link rel="stylesheet" href="https://fonts.bunny.net/css?family=instrument-sans:400,500,600|jetbrains-mono:400,500,600,700&display=swap">
 <link rel="stylesheet" href="assets/site.css">
 <script>
   document.documentElement.dataset.theme = localStorage.getItem("diskr-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
@@ -33,7 +33,7 @@
     </a>
     <nav class="nav-links" aria-label="Primary">
       <a href="docs/">Docs</a>
-      <a href="#tour">Tour</a>
+      <a href="#features">Features</a>
       <a href="#install">Install</a>
       <a href="https://github.com/milobeans/diskr/blob/main/CHANGELOG.md">Changelog</a>
     </nav>
@@ -54,168 +54,142 @@
 </header>
 
 <main id="main">
-  <section class="hero" aria-labelledby="hero-title">
-    <div class="defrag" aria-hidden="true"></div>
-    <div class="wrap">
-      <div class="hero-copy">
-        <p class="eyebrow rise" style="--i:0"><span class="dot"></span><span class="label">Disk explorer for the macOS terminal</span></p>
-        <h1 id="hero-title" class="display rise" style="--i:1">See where your disk space <em>went</em>, and what you can safely take back.</h1>
-        <p class="lede rise" style="--i:2">diskr sizes folders by what they really occupy on disk, explains which caches and build output are safe to remove, and shows what grew since you last looked. Fast, careful, and native to macOS.</p>
-        <div class="hero-actions rise" style="--i:3">
-          <span class="cmd"><span class="prompt">$</span>cargo install diskr
-            <button class="copy" type="button" data-copy="cargo install diskr" aria-label="Copy">
-              <svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
-              <svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>
-            </button>
-          </span>
-          <a class="btn" href="docs/">Read the docs <span class="arrow" aria-hidden="true">→</span></a>
-        </div>
-        <p class="hero-meta label rise" style="--i:4"><span>Apple Silicon &amp; Intel</span><span>macOS 15+</span><span>Written in Rust</span><span>MIT</span></p>
-      </div>
+  <div class="wrap intro">
+    <h1>A fast disk usage explorer for the macOS terminal</h1>
+    <p>diskr shows folder sizes by actual disk allocation, finds caches and build output you can safely remove, and tracks what changed between scans.</p>
+    <div class="actions">
+      <span class="cmd"><span class="prompt">$</span>cargo install diskr
+        <button class="copy" type="button" data-copy="cargo install diskr" aria-label="Copy">
+          <svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+          <svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>
+        </button>
+      </span>
+      <a class="btn" href="docs/">Documentation</a>
+      <a class="btn ghost" href="https://github.com/milobeans/diskr">GitHub</a>
+    </div>
+    <p class="facts label"><span>macOS 15+</span><span>Apple Silicon and Intel</span><span>Rust</span><span>MIT license</span></p>
+  </div>
 
-      <div class="stage rise" style="--i:5" data-replay tabindex="0" aria-label="Interactive replay of diskr. Space plays or pauses, arrow keys step frames, 1 to 4 jump to chapters.">
-        <div class="window">
-          <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~</span></div>
-          <div class="screen"><canvas role="img" aria-label="diskr sizing a home folder, opening a project with a 4.4 GiB build directory, listing 18 cleanup findings, and ranking the largest files under Library"></canvas></div>
-        </div>
-        <div class="player">
-          <button class="play" type="button" aria-label="Play demo">
-            <svg class="resume" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15l13-7.5z"/></svg>
-            <svg class="pause" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>
-          </button>
-          <div class="track"></div>
-          <span class="clock" aria-live="off">0:00 / 0:30</span>
-        </div>
-        <p class="caption">A real recording of diskr in a terminal, run against a demo home folder. Drag the bar to scrub; <kbd>space</kbd> pauses, <kbd>1</kbd>–<kbd>4</kbd> jump between chapters.</p>
+  <div class="wrap demo" data-replay tabindex="0" aria-label="Demo of diskr. Space plays or pauses, arrow keys step frames, 1 to 4 jump to sections.">
+    <div class="window">
+      <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~</span></div>
+      <div class="screen"><canvas role="img" aria-label="diskr sizing a home folder, opening a project with a 4.4 GiB build directory, listing 18 cleanup findings, and ranking the largest files under Library"></canvas></div>
+    </div>
+    <div class="player">
+      <button class="play" type="button" aria-label="Play demo">
+        <svg class="resume" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15l13-7.5z"/></svg>
+        <svg class="pause" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>
+      </button>
+      <div class="track"></div>
+      <span class="clock">0:00 / 0:30</span>
+    </div>
+    <p class="caption">Recorded from diskr running on a demo home folder. Drag the bar to seek; <kbd>space</kbd> pauses.</p>
+  </div>
+
+  <section id="features" aria-labelledby="features-title">
+    <div class="wrap">
+      <div class="section-head">
+        <h2 id="features-title">Features</h2>
+        <p>Scanning uses <code>getattrlistbulk(2)</code> and only covers what you are looking at. Sizes are cached between runs and revalidated with FSEvents.</p>
+      </div>
+      <div class="features">
+        <div><h3>Sizes by allocated space</h3><p>Folders sort by the bytes they occupy on disk. Apparent size is shown when it differs, as with APFS clones and sparse files.</p><span class="label">S · .</span></div>
+        <div><h3>Cleanup suggestions</h3><p>Caches, build output and package stores, each labeled safe, regenerable or risky with a reason. Reports never delete anything.</p><span class="label">diskr --reclaim ~</span></div>
+        <div><h3>Change tracking</h3><p>Folders that changed since their last scan show a growth badge. Save baselines and compare them later.</p><span class="label">B · diskr --diff ~</span></div>
+        <div><h3>APFS space report</h3><p>Container free space, local snapshots and what is actually available, side by side.</p><span class="label">diskr --space ~</span></div>
+        <div><h3>Packages and projects</h3><p>Homebrew, Cargo, npm, pip and Bun packages, plus project dependency folders, with sizes.</p><span class="label">p · diskr --packages ~</span></div>
+        <div><h3>Scriptable reports</h3><p>Every report has JSON output with a versioned schema. <code>--strict</code> exits with status 2 when data is incomplete.</p><span class="label">--json · --strict</span></div>
       </div>
     </div>
   </section>
 
-  <section class="rule-top" aria-labelledby="why-title">
+  <section id="interface" aria-labelledby="interface-title">
     <div class="wrap">
-      <div class="section-head reveal">
-        <span class="label">01 / Why diskr</span>
-        <h2 id="why-title">Built around the questions you <em>actually</em> have.</h2>
-        <p>Most disk tools stop at “this folder is big.” diskr keeps going until you know what to do about it.</p>
-      </div>
-      <ol class="questions reveal">
-        <li><span class="num">01</span><h3>What is using the space?</h3><p>Live folder sizes sorted by what is really allocated on disk, with a share bar for every row. APFS clones, sparse files and compression distort apparent size, so diskr tracks both.<span class="how">diskr · S sizes everything visible</span></p></li>
-        <li><span class="num">02</span><h3>What can I safely delete?</h3><p>Caches, build output, toolchains and package stores are found and labeled safe, regenerable or risky, each with the reason why.<span class="how">Tab to Reclaim · diskr --reclaim ~</span></p></li>
-        <li><span class="num">03</span><h3>What changed?</h3><p>Folders that changed since their last scan carry a growth badge, and saved baselines show exactly what grew between two dates.<span class="how">B saves a baseline · diskr --diff ~</span></p></li>
-        <li><span class="num">04</span><h3>Why doesn't free space add up?</h3><p>Mount totals, APFS container free space, what is actually available to you, and the local snapshots that can pin deleted data.<span class="how">diskr --space ~</span></p></li>
-        <li><span class="num">05</span><h3>What are my dev tools costing me?</h3><p>Homebrew, Cargo, npm, pip and Bun packages, plus every project's node_modules, target and .venv, each with its size.<span class="how">p opens packages · diskr --packages ~</span></p></li>
-      </ol>
-    </div>
-  </section>
-
-  <section id="tour" class="rule-top" aria-labelledby="tour-title">
-    <div class="wrap">
-      <div class="section-head reveal">
-        <span class="label">02 / Tour</span>
-        <h2 id="tour-title">Four views, <em>one keystroke</em> apart.</h2>
-        <p>Every frame here is the real interface, rendered from the same recording as the demo above. Hover the numbered pins.</p>
+      <div class="section-head">
+        <h2 id="interface-title">Interface</h2>
+        <p>Frames from the same recording as the demo. Hover the numbered markers for notes.</p>
       </div>
 
-      <article class="feature reveal">
-        <div class="figure" data-frame="files" data-pins='[{"find":"↑2.7 GiB","label":"Grew 2.7 GiB since its last scan: a new model download"},{"find":"[cache]","label":"Inline tag: this folder is pure cache"},{"find":"██████████","label":"Share of the current folder, by allocated bytes"}]'>
-          <div class="window">
-            <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~</span></div>
-            <div class="screen"><canvas role="img" aria-label="The Files pane listing a home folder by allocated size with share bars, cache tags and a growth badge"></canvas></div>
+      <article class="view">
+        <div class="view-text">
+          <h3>Files</h3>
+          <div>
+            <p>Each row shows its allocated size and share of the current folder. Tags such as <code>[cache]</code> mark reclaimable folders, and <code>↑</code> marks folders that grew since their last scan.</p>
+            <div class="keys"><span><kbd>S</kbd> size all</span><span><kbd>.</kbd> hidden files</span><span><kbd>o</kbd> sort</span><span><kbd>/</kbd> search</span></div>
           </div>
         </div>
-        <div>
-          <span class="label">Files</span>
-          <h3>Everything at a glance</h3>
-          <p>Folders sort by allocated size the moment you open them. diskr only scans around what you are looking at, caches sizes between runs, and revalidates them with FSEvents so unchanged trees stay fresh without a rescan.</p>
-          <p>Hidden folders are where <code>.ollama</code>, <code>.cargo</code> and <code>.npm</code> quietly pile up. Press <kbd>.</kbd> and they are right there with the rest.</p>
-          <div class="keys"><span><kbd>S</kbd> size all</span><span><kbd>.</kbd> hidden</span><span><kbd>o</kbd> sort</span><span><kbd>/</kbd> search</span></div>
+        <div class="figure" data-frame="files" data-pins='[{"find":"↑2.7 GiB","label":"Grew 2.7 GiB since its last scan"},{"find":"[cache]","label":"Tagged as cache"},{"find":"██████████","label":"Share of the current folder"}]'>
+          <div class="window">
+            <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~</span></div>
+            <div class="screen"><canvas role="img" aria-label="The Files pane listing a home folder by allocated size"></canvas></div>
+          </div>
         </div>
       </article>
 
-      <article class="feature reveal">
-        <div class="figure" data-frame="project" data-pins='[{"find":"[build]","label":"Recognized as build output because Cargo.toml sits beside it"}]'>
+      <article class="view">
+        <div class="view-text">
+          <h3>Project folders</h3>
+          <div>
+            <p>Build directories are tagged only when their project marker is present, such as <code>target</code> next to <code>Cargo.toml</code>. <kbd>d</kbd> moves an item to the Trash after confirmation.</p>
+            <div class="keys"><span><kbd>⏎</kbd> open</span><span><kbd>⌫</kbd> up</span><span><kbd>d</kbd> trash</span><span><kbd>f</kbd> Finder</span></div>
+          </div>
+        </div>
+        <div class="figure" data-frame="project" data-pins='[{"find":"[build]","label":"Build output: Cargo.toml is next to it"}]'>
           <div class="window">
             <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~/code/ledger-api</span></div>
-            <div class="screen"><canvas role="img" aria-label="A Rust project whose target directory holds 4.4 GiB and is tagged as build output"></canvas></div>
+            <div class="screen"><canvas role="img" aria-label="A Rust project whose target directory holds 4.4 GiB"></canvas></div>
           </div>
-        </div>
-        <div>
-          <span class="label">Projects</span>
-          <h3>Drill into any project</h3>
-          <p>Build directories are tagged only when their project markers are present: <code>target</code> next to a <code>Cargo.toml</code>, <code>node_modules</code> next to a <code>package.json</code>. A folder that merely happens to be called <code>target</code> is never a recommendation.</p>
-          <p>When you do want something gone, <kbd>d</kbd> moves it to the Trash after a confirmation.</p>
-          <div class="keys"><span><kbd>⏎</kbd> open</span><span><kbd>⌫</kbd> up</span><span><kbd>d</kbd> trash</span><span><kbd>f</kbd> Finder</span></div>
         </div>
       </article>
 
-      <article class="feature reveal">
-        <div class="figure" data-frame="reclaim" data-pins='[{"find":"safe  Xcode DerivedData","label":"Safe: pure cache that Xcode regenerates on the next build"},{"find":"risky  Simulator devices","label":"Risky: simulator data may be irreplaceable"},{"find":"1.5 GiB / 64 GiB","label":"Allocated vs apparent: Docker reserves 64 GiB but uses 1.5"}]'>
+      <article class="view">
+        <div class="view-text">
+          <h3>Cleanup</h3>
+          <div>
+            <p>Tab to the Reclaim pane for caches and build artifacts. Each finding has a class and an explanation.</p>
+            <div class="classes">
+              <div class="class safe"><b>safe</b><span>Cache that is regenerated automatically</span></div>
+              <div class="class regen"><b>regenerable</b><span>Costs a rebuild or download</span></div>
+              <div class="class risky"><b>risky</b><span>May contain data you cannot recreate</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="figure" data-frame="reclaim" data-pins='[{"find":"safe  Xcode DerivedData","label":"Safe: Xcode rebuilds it"},{"find":"risky  Simulator devices","label":"Risky: simulator data may be irreplaceable"},{"find":"1.5 GiB / 64 GiB","label":"Allocated / apparent size"}]'>
           <div class="window">
             <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~</span></div>
-            <div class="screen"><canvas role="img" aria-label="The cleanup view with 18 findings totaling 33 GiB, each labeled safe, regenerable or risky"></canvas></div>
-          </div>
-        </div>
-        <div>
-          <span class="label">Reclaim</span>
-          <h3>Know what is safe to delete</h3>
-          <p>Two passes find well-known caches and repeated build artifacts. Every finding explains itself, and the report never deletes anything on its own.</p>
-          <div class="classes">
-            <div class="class safe"><b>safe</b><span>Pure cache, regenerated automatically</span></div>
-            <div class="class regen"><b>regenerable</b><span>Costs a rebuild or a re-download</span></div>
-            <div class="class risky"><b>risky</b><span>May hold data you cannot recreate</span></div>
+            <div class="screen"><canvas role="img" aria-label="The cleanup view with 18 findings labeled safe, regenerable or risky"></canvas></div>
           </div>
         </div>
       </article>
 
-      <article class="feature reveal">
-        <div class="figure" data-frame="top" data-pins='[{"find":"1.5 GiB / 64 GiB","label":"Top Files reports allocated and apparent size side by side"}]'>
+      <article class="view">
+        <div class="view-text">
+          <h3>Top files</h3>
+          <div>
+            <p><kbd>t</kbd> lists the largest files anywhere under the selected folder. Reveal, open or trash them from the list.</p>
+            <div class="keys"><span><kbd>t</kbd> top files</span><span><kbd>O</kbd> open</span><span><kbd>y</kbd> copy path</span></div>
+          </div>
+        </div>
+        <div class="figure" data-frame="top" data-pins='[{"find":"1.5 GiB / 64 GiB","label":"Allocated / apparent size"}]'>
           <div class="window">
             <div class="window-bar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="window-title">diskr — ~/Library</span></div>
-            <div class="screen"><canvas role="img" aria-label="Top Files ranking the largest files under Library, led by a Docker disk image"></canvas></div>
+            <div class="screen"><canvas role="img" aria-label="Top Files ranking the largest files under Library"></canvas></div>
           </div>
-        </div>
-        <div>
-          <span class="label">Top files</span>
-          <h3>Find the biggest files anywhere</h3>
-          <p>Press <kbd>t</kbd> on any folder to rank the largest files beneath it, however deep they are buried. Reveal one in Finder, open it, or move it to the Trash without leaving the list.</p>
-          <div class="keys"><span><kbd>t</kbd> top files</span><span><kbd>O</kbd> open</span><span><kbd>y</kbd> copy path</span></div>
         </div>
       </article>
     </div>
   </section>
 
-  <section class="rule-top" aria-labelledby="accuracy-title">
-    <div class="wrap apparent">
-      <div class="reveal">
-        <span class="label">03 / Accuracy</span>
-        <h2 class="apparent-title" id="accuracy-title">Counts what is <em>allocated</em>, not what is claimed.</h2>
-        <p class="apparent-lede">Docker's disk image says it is 64 GiB. It occupies 1.5. APFS clones, sparse files and compression all make a file's apparent size a poor guide to what deleting it gives back, so diskr sorts by allocated bytes and shows both when they differ.</p>
-        <p class="apparent-note">Folders it cannot fully read are marked as lower bounds with <code>≥</code>, never silently counted as zero.</p>
-      </div>
-      <div class="meter reveal" role="img" aria-label="Docker.raw: 64 GiB apparent size versus 1.5 GiB allocated on disk">
-        <div class="meter-row apparent-row">
-          <header><span class="label">Apparent · Docker.raw</span><strong>64 GiB</strong></header>
-          <div class="meter-bar"><i style="--v:100%"></i></div>
-        </div>
-        <div class="meter-row alloc-row">
-          <header><span class="label">Allocated on disk</span><strong>1.5 GiB</strong></header>
-          <div class="meter-bar"><i style="--v:2.4%"></i></div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="rule-top" aria-labelledby="reports-title">
+  <section id="reports" aria-labelledby="reports-title">
     <div class="wrap">
-      <div class="section-head reveal">
-        <span class="label">04 / Scripting</span>
-        <h2 id="reports-title">Everything the TUI knows, <em>as a report</em>.</h2>
-        <p>Every report has a <code>--json</code> mode with a versioned schema, and <code>--strict</code> exits with status 2 when a report is incomplete.</p>
+      <div class="section-head">
+        <h2 id="reports-title">Reports</h2>
+        <p>The same data is available from the command line. See <a href="docs/#reports">all report modes and the JSON format</a>.</p>
       </div>
-      <div class="duo reveal">
+      <div class="duo">
         <div>
-          <h3>What changed</h3>
-          <p>Save a baseline, compare whenever you like.</p>
+          <h3>Compare with a baseline</h3>
+          <p>Save a baseline, then diff it later.</p>
 <pre class="term-block"><span class="p">$ </span>diskr --save ~
 <span class="p">$ </span>diskr --diff ~
 <span class="w">Diff for /Users/demo</span>
@@ -226,8 +200,8 @@ Total: 44 GiB disk → 50 GiB disk  <span class="g">(+5.1 GiB)</span>
     <span class="g">+960 MiB</span>  grew       code</pre>
         </div>
         <div>
-          <h3>Why free space disagrees</h3>
-          <p>APFS container space, snapshots and what you can really use.</p>
+          <h3>Explain free space</h3>
+          <p>APFS container space and local snapshots.</p>
 <pre class="term-block"><span class="p">$ </span>diskr --space ~
 <span class="w">Space report for /Users/demo</span>
 Mount: /System/Volumes/Data <span class="c">(apfs, /dev/disk3s5)</span>
@@ -239,45 +213,28 @@ APFS container disk3: 460 GiB total / 14 GiB free
 Local snapshots: 3</pre>
         </div>
       </div>
-      <p class="reveal more-link"><a href="docs/#reports">All report modes, JSON contract and exit codes →</a></p>
     </div>
   </section>
 
-  <section class="rule-top" aria-labelledby="principles-title">
+  <section id="install" aria-labelledby="install-title">
     <div class="wrap">
-      <div class="section-head reveal">
-        <span class="label">05 / Principles</span>
-        <h2 id="principles-title">Fast, careful, native, <em>scriptable</em>.</h2>
+      <div class="section-head">
+        <h2 id="install-title">Install</h2>
+        <p>macOS on Apple Silicon or Intel. Prebuilt archives require macOS 15 or newer.</p>
       </div>
-      <table class="spec reveal">
-        <tr><th scope="row">Fast and lazy</th><td>Sizing reads many entries per syscall and only scans around what you are looking at. Sizes persist between runs; FSEvents revalidates just the folders that changed.</td><td>getattrlistbulk(2) · work-stealing pool · no fixed speedup promised</td></tr>
-        <tr><th scope="row">Careful</th><td><code>--reclaim</code> only reports. Destructive keys are red and always ask first, and <kbd>d</kbd> moves items to the Trash.</td><td>delete, uninstall and empty Trash confirm · partial sizes marked ≥</td></tr>
-        <tr><th scope="row">Native</th><td>Reveal in Finder, open with the default app, copy a path or open Terminal at any item.</td><td>f · O · y · s</td></tr>
-        <tr><th scope="row">Scriptable</th><td>Versioned JSON for every report, unsigned 64-bit byte counts, and an exit code that tells CI when data was incomplete.</td><td>schema_version: 1 · --strict exits 2</td></tr>
-      </table>
-    </div>
-  </section>
-
-  <section id="install" class="rule-top" aria-labelledby="install-title">
-    <div class="wrap">
-      <div class="section-head reveal">
-        <span class="label">06 / Install</span>
-        <h2 id="install-title">Install in <em>one line</em>.</h2>
-        <p>macOS on Apple Silicon or Intel. Prebuilt archives target macOS 15 or newer.</p>
-      </div>
-      <div class="tabs reveal">
+      <div class="tabs">
         <div class="tablist" role="tablist" aria-label="Install methods">
           <button role="tab" id="tab-cargo" aria-controls="panel-cargo" aria-selected="true">Cargo</button>
           <button role="tab" id="tab-binary" aria-controls="panel-binary" aria-selected="false" tabindex="-1">Prebuilt binary</button>
           <button role="tab" id="tab-source" aria-controls="panel-source" aria-selected="false" tabindex="-1">From source</button>
         </div>
         <div class="tabpanel" id="panel-cargo" role="tabpanel" aria-labelledby="tab-cargo">
-          <p>With Rust 1.88 or newer:</p>
+          <p>Requires Rust 1.88 or newer.</p>
           <div class="code"><pre>cargo install diskr</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
-          <p>Then run <code>diskr</code> to browse your home folder, or <code>diskr ~/Downloads</code> to start somewhere specific.</p>
+          <p>Run <code>diskr</code> to browse your home folder, or <code>diskr ~/Downloads</code> to start elsewhere.</p>
         </div>
         <div class="tabpanel" id="panel-binary" role="tabpanel" aria-labelledby="tab-binary" hidden>
-          <p>Download the archive for your Mac and its checksum list from <a href="https://github.com/milobeans/diskr/releases">GitHub Releases</a>, then verify before extracting. Run this in a new, empty directory:</p>
+          <p>Download the archive for your Mac and verify its checksum from <a href="https://github.com/milobeans/diskr/releases">GitHub Releases</a>. Run this in a new, empty directory:</p>
           <div class="code"><pre>case "$(uname -m)" in
   arm64) target=aarch64-apple-darwin ;;
   x86_64) target=x86_64-apple-darwin ;;
@@ -288,7 +245,7 @@ curl --fail --location --remote-name "https://github.com/milobeans/diskr/release
 curl --fail --location --remote-name "https://github.com/milobeans/diskr/releases/latest/download/SHA256SUMS"
 checksum=$(awk -v archive="$archive" '$2 == archive { print }' SHA256SUMS)
 test -n "$checksum" &amp;&amp; printf '%s\n' "$checksum" | shasum -a 256 -c -</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
-          <p>Only after the checksum verifies, install it:</p>
+          <p>After the checksum verifies, install it:</p>
           <div class="code"><pre>tar -xzf "$archive"
 mkdir -p "$HOME/.local/bin"
 install -m 755 diskr "$HOME/.local/bin/diskr"
@@ -296,21 +253,10 @@ install -m 755 diskr "$HOME/.local/bin/diskr"
           <p>Archives are not Developer ID signed or notarized; organization policy may require a different route. No quarantine bypass is needed or recommended.</p>
         </div>
         <div class="tabpanel" id="panel-source" role="tabpanel" aria-labelledby="tab-source" hidden>
-          <p>From a local checkout:</p>
           <div class="code"><pre>git clone https://github.com/milobeans/diskr
 cd diskr
 cargo install --path .</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
         </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="cta rule-top" aria-labelledby="cta-title">
-    <div class="wrap reveal">
-      <h2 id="cta-title">Your disk is <em>fuller</em> than it looks.</h2>
-      <div class="hero-actions">
-        <a class="btn" href="docs/">Read the docs <span class="arrow" aria-hidden="true">→</span></a>
-        <a class="btn ghost" href="https://github.com/milobeans/diskr">View on GitHub</a>
       </div>
     </div>
   </section>
@@ -319,13 +265,12 @@ cargo install --path .</pre><button class="copy" type="button" aria-label="Copy"
 <footer class="footer">
   <div class="wrap">
     <a class="brand" href="./"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></span>diskr</a>
-    <span>MIT licensed · Made for macOS · © <span data-year>2026</span> Milo Evans</span>
+    <span>MIT license · © <span data-year>2026</span> Milo Evans</span>
     <nav aria-label="Footer">
       <a href="docs/">Docs</a>
       <a href="https://github.com/milobeans/diskr">GitHub</a>
       <a href="https://crates.io/crates/diskr">crates.io</a>
       <a href="https://github.com/milobeans/diskr/blob/main/CHANGELOG.md">Changelog</a>
-      <a href="https://github.com/milobeans/diskr/blob/main/ROADMAP.md">Roadmap</a>
     </nav>
   </div>
 </footer>
@@ -334,7 +279,7 @@ cargo install --path .</pre><button class="copy" type="button" aria-label="Copy"
   <div class="palette-box">
     <label class="palette-input">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-      <input type="search" placeholder="Search the docs…" aria-label="Search the docs" autocomplete="off" spellcheck="false">
+      <input type="search" placeholder="Search the docs" aria-label="Search the docs" autocomplete="off" spellcheck="false">
     </label>
     <ul class="palette-results" role="listbox"></ul>
     <div class="palette-foot"><span><kbd>↑</kbd> <kbd>↓</kbd> move</span><span><kbd>⏎</kbd> open</span><span><kbd>esc</kbd> close</span></div>

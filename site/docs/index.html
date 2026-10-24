@@ -16,7 +16,7 @@
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.bunny.net">
-<link rel="stylesheet" href="https://fonts.bunny.net/css?family=instrument-serif:400,400i|instrument-sans:400,500,600|jetbrains-mono:400,500,600,700&display=swap">
+<link rel="stylesheet" href="https://fonts.bunny.net/css?family=instrument-sans:400,500,600|jetbrains-mono:400,500,600,700&display=swap">
 <link rel="stylesheet" href="../assets/site.css">
 <script>
   document.documentElement.dataset.theme = localStorage.getItem("diskr-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
@@ -89,9 +89,8 @@
 
   <main id="main" class="doc">
     <header class="doc-head">
-      <span class="label">Documentation</span>
-      <h1>The diskr manual</h1>
-      <p>Everything diskr does, how to drive it from the keyboard or a script, and how it arrives at its numbers. Press <kbd>⌘K</kbd> or <kbd>/</kbd> to search.</p>
+      <h1>Documentation</h1>
+      <p>Installation, the interface, keys, reports and how diskr measures disk usage. Press <kbd>⌘K</kbd> or <kbd>/</kbd> to search.</p>
     </header>
 
     <h2 id="install">Install</h2>
@@ -125,7 +124,7 @@ install -m 755 diskr "$HOME/.local/bin/diskr"
     <h2 id="first-run">First run</h2>
     <div class="code"><pre>diskr               <span class="c"># browse your home folder</span>
 diskr ~/Downloads   <span class="c"># start somewhere specific</span></pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
-    <p>The screen is split into panes: <strong>Files</strong> on the left, <strong>Disks</strong> and <strong>Packages</strong> on the right, and a <strong>Reclaim</strong> view that opens over them. <kbd>Tab</kbd> cycles through them, and the footer always lists the keys that work in the focused pane. Your first minute:</p>
+    <p>The screen is split into panes: <strong>Files</strong> on the left, <strong>Disks</strong> and <strong>Packages</strong> on the right, and a <strong>Reclaim</strong> view that opens over them. <kbd>Tab</kbd> cycles through them, and the footer always lists the keys that work in the focused pane. Basic keys:</p>
     <ul>
       <li><kbd>S</kbd> sizes every visible folder; <kbd>.</kbd> shows hidden ones</li>
       <li><kbd>⏎</kbd> opens a folder, <kbd>⌫</kbd> goes up, <kbd>/</kbd> searches</li>
@@ -201,7 +200,7 @@ Total: 44 GiB disk → 50 GiB disk  <span class="g">(+5.1 GiB)</span>
     <p>Project counts are unique declared names across runtime, development, optional, peer and build groups, not a count of installed transitive packages. Cargo target tables and Python PEP/Poetry groups are included; Python names are normalized and merged across requirements and pyproject declarations. Go <code>indirect</code> requirements are excluded. Manifests are never executed: dynamic declarations, executable Gemfiles and parse failures show unknown or lower-bound counts with warnings.</p>
 
     <h2 id="space">Disks and free space</h2>
-    <p><code>diskr --space</code> explains why <code>df</code>, Finder and your own arithmetic disagree: mount-level totals, APFS container free space, what is actually available to you, and the local snapshots that can pin deleted data.</p>
+    <p><code>diskr --space</code> explains differences between <code>df</code> and Finder: mount-level totals, APFS container free space, what is actually available to you, and the local snapshots that can pin deleted data.</p>
 <pre class="term-block"><span class="p">$ </span>diskr --space ~
 <span class="w">Space report for /Users/demo</span>
 Mount: /System/Volumes/Data <span class="c">(apfs, /dev/disk3s5)</span>
@@ -369,7 +368,7 @@ cargo package --locked</pre><button class="copy" type="button" aria-label="Copy"
   <div class="palette-box">
     <label class="palette-input">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-      <input type="search" placeholder="Search the docs…" aria-label="Search the docs" autocomplete="off" spellcheck="false">
+      <input type="search" placeholder="Search the docs" aria-label="Search the docs" autocomplete="off" spellcheck="false">
     </label>
     <ul class="palette-results" role="listbox"></ul>
     <div class="palette-foot"><span><kbd>↑</kbd> <kbd>↓</kbd> move</span><span><kbd>⏎</kbd> open</span><span><kbd>esc</kbd> close</span></div>
