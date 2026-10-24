@@ -575,6 +575,22 @@ Record CPU, macOS/filesystem, terminal dimensions, build profile, warm/cold cach
 state, sample count and tool versions when comparing results. These fixtures
 are local warm-cache diagnostics, not a claim about every volume or workload.
 
+### README images
+
+The screenshots, demo animation and social preview in `.github/assets/` are
+generated from the release binary, not drawn by hand. After a UI change,
+regenerate them with:
+
+```sh
+python3 scripts/screenshots/generate.py
+```
+
+It needs macOS on APFS, `img2webp` (`brew install webp`) and about 4 GiB of
+free space. It builds a synthetic home directory from APFS clones, drives diskr
+in a pseudo-terminal, and installs its pinned Python packages into
+`target/screenshots/venv`. Host paths are masked as `/Users/demo`; the disks
+panel still shows the machine's real volumes.
+
 ### Releases
 
 Releases are automated through GitHub Actions and appear in the GitHub Releases tab.

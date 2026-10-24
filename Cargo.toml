@@ -11,7 +11,7 @@ homepage = "https://github.com/milobeans/diskr"
 readme = "README.md"
 keywords = ["disk-usage", "storage", "tui", "macos", "apfs"]
 categories = ["command-line-utilities", "filesystem"]
-exclude = [".github/assets/"]
+exclude = [".github/assets/", "scripts/"]
 
 [dependencies]
 ratatui-core = { version = "0.1", features = ["std"] }
