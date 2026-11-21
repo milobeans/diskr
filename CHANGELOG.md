@@ -6,6 +6,8 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.85] - 2026-11-21
+
 ### Added
 
 - Run `diskr update` to install the latest stable release through Homebrew, Cargo, or the checksum-verified native distribution. The command updates the active installation and reports when it is already current.
