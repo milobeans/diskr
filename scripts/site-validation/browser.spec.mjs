@@ -154,6 +154,45 @@ for (const url of pages) {
   });
 }
 
+test("the docs outline follows deep links and returns to the overview shortcuts", async ({ page }) => {
+  await page.goto("docs/#json");
+  const section = page.locator(".sidebar [aria-current='location']");
+  const topic = page.locator(".toc [aria-current='location']");
+  await expect(section).toHaveAttribute("href", "#reports");
+  await expect(topic).toHaveAttribute("href", "#json");
+  await expect(page.locator(".toc a[href='#exit-codes']")).toBeVisible();
+  await expect(page.locator(".toc a[href='#lazy-scanning']")).toHaveCount(0);
+
+  await page.locator(".sidebar a[href='#overview']").click();
+  await expect(section).toHaveAttribute("href", "#overview");
+  await expect(page.locator(".toc .label")).toHaveText("Quick links");
+  await page.locator(".toc a[href='#install']").click();
+  await expect(section).toHaveAttribute("href", "#install");
+  await expect(topic).toHaveAttribute("href", "#install");
+  await page.goBack();
+  await expect(section).toHaveAttribute("href", "#overview");
+});
+
+test("the mobile docs menu handles Escape and moves keyboard focus to the chosen section", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("docs/#json");
+  const menu = page.locator(".docs-menu");
+  const reports = page.locator(".sidebar a[href='#reports']");
+  await menu.focus();
+  await page.keyboard.press("Enter");
+  await expect(reports).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(menu).toHaveAttribute("aria-expanded", "false");
+  await expect(menu).toBeFocused();
+
+  await page.keyboard.press("Space");
+  await expect(reports).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/#reports$/);
+  await expect(page.locator("#reports")).toBeFocused();
+  await expect(menu).toHaveAttribute("aria-expanded", "false");
+});
+
 test("demo fetches real frames and responds to playback and frame-step controls", async ({ page }) => {
   await page.goto("./");
   const demo = page.locator("[data-replay]");

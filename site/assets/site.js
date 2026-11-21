@@ -84,57 +84,97 @@ $$(".tabs").forEach((tabs) => {
 /* Docs: heading anchors, generated outline, scrollspy, mobile drawer. */
 const doc = $(".doc");
 if (doc) {
-  const headings = $$("h2[id], h3[id]", doc);
-  headings.forEach((h) => {
-    const a = el("a", "anchor", "#");
-    a.href = "#" + h.id;
-    a.setAttribute("aria-label", `Link to ${h.textContent}`);
-    h.append(a);
-  });
-
-  const toc = $(".toc ul");
-  const tocLinks = new Map();
-  if (toc) headings.forEach((h) => {
-    const li = el("li");
-    const a = el("a", h.tagName === "H3" ? "sub" : null, h.firstChild.textContent.trim());
-    a.href = "#" + h.id;
-    li.append(a);
-    toc.append(li);
-    tocLinks.set(h.id, a);
-  });
-
-  const sideLinks = new Map($$(".sidebar a[href^='#']").map((a) => [a.getAttribute("href").slice(1), a]));
-  const sections = headings.filter((h) => h.tagName === "H2");
-  const spy = () => {
-    const y = scrollY + innerHeight * 0.3;
-    let current = headings[0];
-    for (const h of headings) if (h.offsetTop <= y) current = h;
-    let section = sections[0];
-    for (const h of sections) if (h.offsetTop <= y) section = h;
-    tocLinks.forEach((a, id) => a.classList.toggle("active", id === current?.id));
-    sideLinks.forEach((a, id) => a.classList.toggle("active", id === section?.id));
-  };
-  addEventListener("scroll", spy, { passive: true });
-  spy();
-
   const sidebar = $(".sidebar");
   const menu = $(".docs-menu");
+  const sideLinks = new Map($$("a[href^='#']", sidebar).map((link) => [link.hash.slice(1), link]));
+  const outline = $(".toc ul");
+  const outlineLabel = $(".toc .label");
+  const overview = { link: sideLinks.get("overview"), items: [...outline.children] };
+  const headings = [{ heading: $("#overview", doc), section: overview }];
+  let section = overview;
+
+  for (const heading of $$("h2[id], h3[id]", doc)) {
+    const title = heading.textContent.trim();
+    const fragment = "#" + heading.id;
+    if (heading.tagName === "H2") {
+      section = { link: sideLinks.get(heading.id), items: [] };
+    }
+    const link = el("a", heading.tagName === "H3" ? "sub" : null, title);
+    link.href = fragment;
+    const item = el("li");
+    item.append(link);
+    section.items.push(item);
+    headings.push({ heading, section, link });
+
+    const anchor = el("a", "anchor", "#");
+    anchor.href = fragment;
+    anchor.setAttribute("aria-label", `Link to ${title}`);
+    heading.append(anchor);
+  }
+  headings.forEach(({ heading }) => { heading.tabIndex = -1; });
+
+  let active;
+  const updateLocation = () => {
+    // Match native fragment positioning, including the sticky header offset.
+    const padding = parseFloat(getComputedStyle(document.documentElement).scrollPaddingTop) || 0;
+    const atEnd = scrollY > 0 && scrollY + innerHeight >= document.documentElement.scrollHeight - 2;
+    let current;
+    if (atEnd) {
+      // Near the footer a deep link can reach the scroll limit before its heading reaches the header.
+      const target = document.querySelector(":target");
+      current = headings.find(({ heading }) => heading === target && heading.getBoundingClientRect().top >= padding - 2) ?? headings.at(-1);
+    } else {
+      current = headings.findLast(({ heading }) => heading.getBoundingClientRect().top <= padding + 2) ?? headings[0];
+    }
+    if (current === active) return;
+    if (current.section !== active?.section) {
+      active?.section.link.removeAttribute("aria-current");
+      current.section.link.setAttribute("aria-current", "location");
+      outlineLabel.textContent = current.section === overview ? "Quick links" : "In this section";
+      outline.replaceChildren(...current.section.items);
+    }
+    active?.link?.removeAttribute("aria-current");
+    current.link?.setAttribute("aria-current", "location");
+    active = current;
+  };
+  addEventListener("scroll", updateLocation, { passive: true });
+  addEventListener("hashchange", updateLocation);
+  new ResizeObserver(updateLocation).observe(doc);
+  updateLocation();
+
   const narrow = matchMedia("(max-width: 900px)");
   const setMenuOpen = (open) => {
-    sidebar?.classList.toggle("open", open);
-    if (sidebar) sidebar.inert = narrow.matches && !open;
-    menu?.setAttribute("aria-expanded", String(open));
-    menu?.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+    sidebar.classList.toggle("open", open);
+    sidebar.inert = narrow.matches && !open;
+    menu.setAttribute("aria-expanded", String(open));
+    menu.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+    if (open) {
+      const link = active.section.link;
+      link.focus({ preventScroll: true });
+      if (link.offsetTop < sidebar.scrollTop || link.offsetTop + link.offsetHeight > sidebar.scrollTop + sidebar.clientHeight) {
+        sidebar.scrollTop = link.offsetTop - sidebar.clientHeight / 2;
+      }
+    }
   };
-  menu?.addEventListener("click", () => setMenuOpen(!sidebar.classList.contains("open")));
-  sidebar?.addEventListener("click", (e) => {
-    if (e.target.closest("a")) setMenuOpen(false);
+  menu.addEventListener("click", () => setMenuOpen(!sidebar.classList.contains("open")));
+  sidebar.addEventListener("click", (event) => {
+    const link = event.target.closest("a[href^='#']");
+    if (!sidebar.classList.contains("open") || !link || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    setMenuOpen(false);
+    document.getElementById(link.hash.slice(1))?.focus({ preventScroll: true });
   });
-  sidebar?.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && narrow.matches) {
-      e.preventDefault();
+  const dismissOutside = (event) => {
+    if (sidebar.classList.contains("open") && !sidebar.contains(event.target) && !menu.contains(event.target)) {
       setMenuOpen(false);
-      menu?.focus();
+    }
+  };
+  document.addEventListener("pointerdown", dismissOutside);
+  document.addEventListener("focusin", dismissOutside);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && sidebar.classList.contains("open")) {
+      event.preventDefault();
+      setMenuOpen(false);
+      menu.focus();
     }
   });
   narrow.addEventListener("change", () => setMenuOpen(false));
@@ -282,7 +322,7 @@ if (palette) {
 
   const open = () => {
     if (palette.open) return;
-    lastFocus = document.activeElement;
+    lastFocus = document.activeElement.closest(".sidebar.open") ? $(".docs-menu") : document.activeElement;
     input.value = "";
     results = [];
     list.replaceChildren();

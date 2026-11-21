@@ -25,7 +25,7 @@
 </script>
 <script type="module" src="../assets/site.js"></script>
 </head>
-<body>
+<body class="docs-page">
 <a class="skip" href="#main">Skip to content</a>
 
 <header class="nav">
@@ -60,13 +60,14 @@
 
 <div class="docs">
   <nav class="sidebar" id="sidebar" aria-label="Documentation">
-    <h4 class="label">Getting started</h4>
+    <p class="label">Getting started</p>
     <ul>
-      <li><a href="#install">Install</a></li>
+      <li><a href="#overview">Overview</a></li>
+      <li><a href="#install">Installation</a></li>
       <li><a href="#first-run">First run</a></li>
       <li><a href="#limited-access">Limited access</a></li>
     </ul>
-    <h4 class="label">Using diskr</h4>
+    <p class="label">Using diskr</p>
     <ul>
       <li><a href="#files">Files</a></li>
       <li><a href="#reclaim">Reclaim</a></li>
@@ -75,14 +76,14 @@
       <li><a href="#packages">Packages and projects</a></li>
       <li><a href="#space">Disks and free space</a></li>
     </ul>
-    <h4 class="label">Reference</h4>
+    <p class="label">Reference</p>
     <ul>
-      <li><a href="#keys">Keys</a></li>
+      <li><a href="#keys">Keyboard shortcuts</a></li>
       <li><a href="#reports">Reports</a></li>
       <li><a href="#baselines">Baselines and profiles</a></li>
       <li><a href="#appearance">Appearance</a></li>
     </ul>
-    <h4 class="label">Internals</h4>
+    <p class="label">Internals</p>
     <ul>
       <li><a href="#how-it-works">How it works</a></li>
       <li><a href="#compatibility">Compatibility</a></li>
@@ -92,19 +93,32 @@
 
   <main id="main" class="doc">
     <header class="doc-head">
-      <h1>Documentation</h1>
-      <p>Installation, the interface, keys, reports and how diskr measures disk usage. Press <kbd>⌘K</kbd> or <kbd>/</kbd> to search.</p>
+      <h1 id="overview">Documentation</h1>
+      <p>Install diskr, find what’s taking up space on your Mac, and use its disk reports from the command line.</p>
+      <a class="scan-guide" href="#first-run">
+        <span class="scan-intro">
+          <strong>Your first scan</strong>
+          <span>Measure a folder and inspect its largest files.</span>
+          <span class="scan-link">Open walkthrough <span aria-hidden="true">→</span></span>
+        </span>
+        <span class="scan-preview" aria-hidden="true"><img src="../assets/img/files.png" width="2278" height="1058" alt=""></span>
+      </a>
     </header>
 
-    <h2 id="install">Install</h2>
-    <p>diskr runs on macOS 15 or newer, on Apple Silicon and Intel. The Homebrew tap installs a native archive and verifies its checksum; no Rust toolchain is needed:</p>
-    <div class="code"><pre>brew tap milobeans/diskr https://github.com/milobeans/diskr
+    <h2 id="install">Installation</h2>
+    <p>On macOS 15 or newer, Homebrew installs a checksum-verified build for Apple Silicon or Intel.</p>
+    <div class="code install-code">
+      <div class="install-code-title"><span aria-hidden="true">›_</span> Homebrew</div>
+      <pre>brew tap milobeans/diskr https://github.com/milobeans/diskr
 brew install milobeans/diskr/diskr</pre><button class="copy" type="button" aria-label="Copy"><svg class="idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg><svg class="done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg></button></div>
-    <p>Update with <code>brew update</code>, then <code>brew upgrade milobeans/diskr/diskr</code>. Remove it with <code>brew uninstall milobeans/diskr/diskr</code>.</p>
-    <p>If you do not use Homebrew, download a verified native release below. Apple Silicon archives are named <code>aarch64-apple-darwin</code>; Intel archives are <code>x86_64-apple-darwin</code>. Both include dependency license notices alongside the executable.</p>
     <details class="more">
-      <summary>Native installer without Homebrew</summary>
+      <summary>Update or uninstall with Homebrew</summary>
+      <div><p>Update with <code>brew update</code>, then <code>brew upgrade milobeans/diskr/diskr</code>. Remove it with <code>brew uninstall milobeans/diskr/diskr</code>.</p></div>
+    </details>
+    <details class="more">
+      <summary>Use the native installer</summary>
       <div>
+        <p>The installer selects the <code>aarch64-apple-darwin</code> archive for Apple Silicon or <code>x86_64-apple-darwin</code> for Intel. Both include dependency license notices alongside the executable.</p>
         <p>In a new, empty directory, download the installer and checksum list from <a href="https://github.com/milobeans/diskr/releases/latest">the latest release</a>:</p>
         <div class="code"><pre>curl --fail --location --remote-name https://github.com/milobeans/diskr/releases/latest/download/install-diskr.sh
 curl --fail --location --remote-name https://github.com/milobeans/diskr/releases/latest/download/SHA256SUMS
@@ -233,7 +247,7 @@ APFS container disk3: 460 GiB total / 14 GiB free
 Local snapshots: 3</pre>
     <p><code>diskr --thin-snapshots 10G ~</code> previews snapshot thinning as a dry run; add <code>--yes</code> to request it. In the TUI, <kbd>i</kbd> on a disk opens its details, where <kbd>s</kbd> retries snapshot discovery and <kbd>a</kbd> retries APFS container discovery independently.</p>
 
-    <h2 id="keys">Keys</h2>
+    <h2 id="keys">Keyboard shortcuts</h2>
     <p>This list mirrors the in-app <kbd>?</kbd> overlay and <code>diskr --help</code>. Destructive keys are highlighted in red in the TUI and always ask for confirmation.</p>
     <label class="key-filter">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -419,10 +433,15 @@ cargo package --locked</pre><button class="copy" type="button" aria-label="Copy"
     </nav>
   </main>
 
-  <aside class="toc" aria-label="On this page">
-    <span class="label">On this page</span>
-    <ul></ul>
-  </aside>
+  <nav class="toc" aria-labelledby="outline-label">
+    <span class="label" id="outline-label">Quick links</span>
+    <ul>
+      <li><a href="#install">Installation</a></li>
+      <li><a href="#first-run">First run</a></li>
+      <li><a href="#keys">Keyboard shortcuts</a></li>
+      <li><a href="#reports">CLI reports</a></li>
+    </ul>
+  </nav>
 </div>
 
 <dialog class="palette" aria-label="Search documentation">

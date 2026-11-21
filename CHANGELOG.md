@@ -27,6 +27,9 @@ All notable changes to diskr are documented here. The format follows
 
 ### Changed
 
+- The documentation links directly to the first-scan walkthrough and shows an
+  outline for the section being read. Installation commands wrap on phones,
+  and the navigation menu supports keyboard selection and dismissal.
 - Growth badges retain a complete session baseline across repeat scans,
   refreshes and navigation, and Growth sorting uses that same comparison.
   Selected package profiles retain their scope on refresh and clear when
