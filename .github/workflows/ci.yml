@@ -33,6 +33,8 @@ jobs:
 
   rust:
     runs-on: macos-26
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -62,9 +64,9 @@ jobs:
       - run: cargo test --locked
       - run: cargo package --locked
       - name: Audit Rust dependencies
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo install cargo-audit --version 0.23.0 --locked --no-default-features
+          cargo audit --file Cargo.lock
 
   compatibility:
     strategy:

@@ -48,6 +48,8 @@ All notable changes to diskr are documented here. The format follows
 
 ### Fixed
 
+- CI reports Rust dependency advisories in the job log with read-only access.
+  The lockfile now uses rustix 1.1.6, which fixes an extended-attribute handling bug.
 - Renames atomically refuse existing destinations, including dangling symlinks
   and destinations created concurrently.
 - Trash is classified as risky and review-required instead of automatically
