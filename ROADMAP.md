@@ -162,8 +162,8 @@ targets continue to take precedence over additional chrome.
 10. Shipped density improvements: corrected denominators, context-sensitive
     and scrollable help, inline reclaim classification, full-width views and
     shared scrolling details. Remaining layout choices are listed above.
-11. Shipped everyday usability: native/Homebrew installation, visible scan
-    coverage, useful actions at ordinary terminal widths, stable comparisons
+11. Shipped everyday usability: native/Homebrew installation, `diskr update` for
+    installed copies, visible scan coverage, useful actions at ordinary terminal widths, stable comparisons
     and saved navigation. Website interaction checks and retained performance
     measurements support those workflows; use their results to prioritize
     further improvements.

@@ -17,6 +17,7 @@ mod terminal_backend;
 mod terminal_text;
 mod tui_input;
 mod ui;
+mod update;
 
 use anyhow::{bail, Context, Result};
 use crossterm::{
@@ -145,6 +146,11 @@ fn run_main() -> Result<()> {
     let result = match action {
         CliAction::Configured { .. } => bail!("nested report configuration is unsupported"),
         CliAction::Help => print_help(),
+        CliAction::Update => {
+            let message = update::run()?;
+            cli_println!("{message}");
+            Ok(())
+        }
         CliAction::Version => {
             cli_println!("diskr {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -326,6 +332,7 @@ fn shell_quote_path(path: &Path) -> String {
 }
 
 enum CliAction {
+    Update,
     Configured {
         action: Box<CliAction>,
         options: ReportOptions,
@@ -376,7 +383,15 @@ enum CliAction {
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction> {
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
+    if args.peek().is_some_and(|arg| arg == "update") {
+        args.next();
+        return match (args.next().as_deref(), args.next()) {
+            (None, None) => Ok(CliAction::Update),
+            (Some(flag), None) if flag == "-h" || flag == "--help" => Ok(CliAction::Help),
+            _ => bail!("usage: diskr update"),
+        };
+    }
     let mut path: Option<PathBuf> = None;
     let mut top_limit: Option<usize> = None;
     let mut reclaim_report = false;
@@ -753,6 +768,7 @@ Lightweight terminal file explorer and disk/storage manager for macOS.
 
 Usage:
   diskr [PATH]
+  diskr update          Update the active installation to the latest stable release
   diskr -- PATH
   diskr --top N [--json] [PATH]
   diskr --reclaim [--json] [PATH]
@@ -3142,6 +3158,19 @@ mod tests {
     fn separator_requires_path() {
         let err = parse(&["--"]).err().unwrap();
         assert!(err.to_string().contains("usage: diskr [PATH]"));
+    }
+
+    #[test]
+    fn update_is_an_explicit_subcommand() {
+        assert!(matches!(parse(&["update"]).unwrap(), CliAction::Update));
+        assert!(matches!(
+            parse(&["update", "--help"]).unwrap(),
+            CliAction::Help
+        ));
+        assert!(parse(&["update", "--json"]).is_err());
+        assert!(
+            matches!(parse(&["--", "update"]).unwrap(), CliAction::Run(p) if p == Path::new("update"))
+        );
     }
 
     #[test]

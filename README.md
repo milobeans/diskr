@@ -203,8 +203,7 @@ brew install milobeans/diskr/diskr
 
 Then run `diskr ~/Downloads` for a focused first scan, or `diskr` to start at
 your home folder. Homebrew selects the matching native binary and verifies
-its checksum; Rust is not required. To update later, run `brew update` followed
-by `brew upgrade milobeans/diskr/diskr`.
+its checksum; Rust is not required.
 
 Without Homebrew, use the checksum-verified native installer below, or install
 through Cargo with Rust 1.88 or newer:
@@ -249,8 +248,7 @@ Start it directly:
 For a shorter command, add the installation directory to your shell's `PATH`.
 With the default prefix, `export PATH="$HOME/.local/bin:$PATH"` enables it in
 the current shell; add that line to your shell configuration if you want it
-in future sessions. To update, download the new release's installer and
-checksums, verify them again, then run that installer.
+in future sessions.
 
 Native archives are also available directly for Apple Silicon
 (`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`). Releases include
@@ -263,6 +261,20 @@ route. These instructions do not bypass quarantine or security policy.
 </details>
 
 To build from a local checkout, run `cargo install --path . --locked`.
+
+### Update
+
+Run `diskr update` to check for the latest stable release and update the copy
+you invoked. Homebrew installations upgrade through the tap. Cargo installations
+update from crates.io in their existing install root. Native installations
+verify the release archive checksum and version before replacing the binary.
+An up-to-date copy exits successfully without reinstalling.
+
+The command is available starting with 0.1.85. To upgrade an older version
+once, run `brew update && brew upgrade milobeans/diskr/diskr`, rerun
+`cargo install diskr --locked`, or rerun the verified native installer,
+depending on how you installed it. To browse a directory named `update`,
+run `diskr ./update` or `diskr -- update`.
 
 ## Usage
 

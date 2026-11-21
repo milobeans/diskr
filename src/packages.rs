@@ -407,9 +407,13 @@ pub struct ManagerEnvironment {
 impl ManagerEnvironment {
     fn discover(manager: Manager) -> Result<Option<Self>, String> {
         let paths = std::env::var_os("PATH").unwrap_or_default();
+        Self::discover_with_path(manager, &paths)
+    }
+
+    fn discover_with_path(manager: Manager, paths: &OsStr) -> Result<Option<Self>, String> {
         let home = std::env::var_os("HOME").and_then(|home| Path::new(&home).canonicalize().ok());
         let euid = unsafe { libc::geteuid() };
-        let search_path = trusted_search_path(&paths, home.as_deref(), euid);
+        let search_path = trusted_search_path(paths, home.as_deref(), euid);
         let resolve = |name| command_path_from(name, &search_path, home.as_deref(), euid);
         let mut prefix_args = Vec::new();
         let mut executable = resolve(manager.command());
@@ -434,7 +438,7 @@ impl ManagerEnvironment {
             } else {
                 &[manager.command()]
             };
-            for dir in std::env::split_paths(&paths) {
+            for dir in std::env::split_paths(paths) {
                 for name in names {
                     let candidate = dir.join(name);
                     if std::fs::symlink_metadata(&candidate).is_ok() && resolve(name).is_none() {
@@ -483,6 +487,33 @@ impl ManagerEnvironment {
             }
         }
         command
+    }
+
+    pub(crate) fn for_update(
+        manager: Manager,
+        directory: Option<&Path>,
+    ) -> Result<Command, String> {
+        let paths = std::env::var_os("PATH").unwrap_or_default();
+        let paths = std::env::join_paths(
+            directory
+                .into_iter()
+                .map(Path::to_owned)
+                .chain(std::env::split_paths(&paths)),
+        )
+        .map_err(|error| error.to_string())?;
+        let environment = Self::discover_with_path(manager, &paths)?.ok_or_else(|| {
+            format!(
+                "a trusted {} installation is required to update diskr",
+                manager.command()
+            )
+        })?;
+        if directory.is_some_and(|dir| environment.executable != dir.join(manager.command())) {
+            return Err(format!(
+                "could not locate {} for this installation",
+                manager.command()
+            ));
+        }
+        Ok(environment.command(&[]))
     }
 
     fn run(&self, args: &[&str], timeout: Duration) -> CommandResult {

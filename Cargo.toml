@@ -12,7 +12,7 @@ documentation = "https://milobeans.github.io/diskr/docs/"
 readme = "README.md"
 keywords = ["disk-usage", "storage", "tui", "macos", "apfs"]
 categories = ["command-line-utilities", "filesystem"]
-exclude = [".github/assets/", "scripts/", "site/", "Formula/"]
+exclude = [".github/assets/", "scripts/*", "!scripts/install.sh", "site/", "Formula/"]
 
 [dependencies]
 ratatui-core = { version = "0.1", features = ["std"] }
@@ -22,6 +22,7 @@ anyhow = "1"
 libc = "0.2" # macOS getattrlistbulk/open/close FFI
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+tempfile = "3"
 toml = { version = "1.1", default-features = false, features = ["parse", "std", "serde"] }
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
