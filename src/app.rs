@@ -23,6 +23,8 @@ const SORT_DEBOUNCE: Duration = Duration::from_millis(100);
 const SIZE_CACHE_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 const AUTO_SCAN_LIMIT: usize = 4;
 const TOP_FILES_LIMIT: usize = 50;
+const OPEN_PATH: &str = "/usr/bin/open";
+const PBCOPY_PATH: &str = "/usr/bin/pbcopy";
 /// Cap on directories queued by cursor movement while a scan is in flight, so a
 /// long scroll through an unsized tree cannot grow the queue without bound.
 const SCAN_QUEUE_MAX: usize = 64;
@@ -769,7 +771,7 @@ struct ExternalActionResult {
 }
 
 fn run_external_open(path: &Path, reveal: bool) -> Result<(), String> {
-    let mut command = Command::new("open");
+    let mut command = Command::new(OPEN_PATH);
     if reveal {
         command.arg("-R");
     }
@@ -5030,7 +5032,7 @@ impl App {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| self.cwd.clone())
         };
-        Command::new("open")
+        Command::new(OPEN_PATH)
             .arg("-a")
             .arg("Terminal")
             .arg(&shell_path)
@@ -5362,7 +5364,7 @@ fn c_char_array_to_string(chars: &[libc::c_char]) -> String {
 fn copy_to_clipboard(text: &str) -> Result<()> {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = Command::new("pbcopy")
+    let mut child = Command::new(PBCOPY_PATH)
         .stdin(Stdio::piped())
         .spawn()
         .context("spawn pbcopy")?;

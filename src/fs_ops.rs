@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use crate::process;
 
+const OSASCRIPT_PATH: &str = "/usr/bin/osascript";
+
 /// Rename atomically only if no directory entry already occupies the destination.
 pub fn rename_without_replacement(from: &Path, to: &Path) -> io::Result<()> {
     let from = CString::new(from.as_os_str().as_bytes())
@@ -176,12 +178,12 @@ pub fn empty_trash() -> Result<()> {
 
 /// Empty the macOS Trash using the provided command runner.
 ///
-/// The runner receives the program name and its arguments. Production code passes
-/// [`run_osascript`]; tests pass a fake that records invocations without touching
-/// the real Trash.
+/// The runner receives the absolute program path and its arguments. Production code
+/// passes [`run_osascript`]; tests pass a fake that records invocations without
+/// touching the real Trash.
 pub fn empty_trash_with(runner: fn(&str, &[&str]) -> Result<()>) -> Result<()> {
     runner(
-        "osascript",
+        OSASCRIPT_PATH,
         &["-e", "tell application \"Finder\" to empty trash"],
     )
 }
@@ -423,7 +425,7 @@ mod tests {
             let captured = c.borrow();
             assert_eq!(captured.len(), 1);
             let (prog, args) = &captured[0];
-            assert_eq!(prog, "osascript");
+            assert_eq!(prog, OSASCRIPT_PATH);
             assert_eq!(args, &["-e", "tell application \"Finder\" to empty trash"]);
         });
     }

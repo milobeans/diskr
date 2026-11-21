@@ -7,6 +7,9 @@ use std::time::Duration;
 
 use crate::process;
 
+const DISKUTIL_PATH: &str = "/usr/sbin/diskutil";
+const TMUTIL_PATH: &str = "/usr/bin/tmutil";
+
 #[derive(Clone, Debug)]
 pub struct SpaceReport {
     pub path: PathBuf,
@@ -130,7 +133,7 @@ pub fn thin_local_snapshots(path: &Path, bytes: u64) -> Result<ThinResult> {
     if bytes == 0 {
         bail!("snapshot thin amount must be greater than zero");
     }
-    let mut command = Command::new("tmutil");
+    let mut command = Command::new(TMUTIL_PATH);
     command
         .arg("thinlocalsnapshots")
         .arg(path)
@@ -247,7 +250,7 @@ fn statfs_for_path(path: &Path) -> Result<StatfsInfo> {
 }
 
 pub(crate) fn list_local_snapshots(path: &Path) -> SnapshotListing {
-    let mut command = Command::new("tmutil");
+    let mut command = Command::new(TMUTIL_PATH);
     command.arg("listlocalsnapshots").arg(path);
     let output = process::run_process(command, Duration::from_secs(15));
     match output {
@@ -276,7 +279,7 @@ fn apfs_container_with(
     mount: &Path,
     runner: fn(Command, Duration) -> process::CommandResult,
 ) -> Result<ApfsContainer, DiscoveryError> {
-    let mut command = Command::new("diskutil");
+    let mut command = Command::new(DISKUTIL_PATH);
     command.arg("info").arg("-plist").arg(mount);
     let output = runner(command, Duration::from_secs(15));
     if output.timed_out {
@@ -473,7 +476,7 @@ com.apple.os.update-MSUPrepareUpdate
 #[test]
 fn apfs_discovery_preserves_failure_categories_and_exact_mount_argument() {
     fn timeout(command: Command, duration: Duration) -> process::CommandResult {
-        assert_eq!(command.get_program(), "diskutil");
+        assert_eq!(command.get_program(), DISKUTIL_PATH);
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["info", "-plist", "/fixture volume"]
