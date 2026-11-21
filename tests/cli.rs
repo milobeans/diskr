@@ -640,6 +640,48 @@ fn native_tui_restores_terminal_after_filter_refresh_modal_and_quit() {
 }
 
 #[test]
+fn package_scan_does_not_execute_relative_path_manager() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = fixture("relative_manager_path");
+    let project = root.join("project");
+    let home = root.join("home");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let executable = project.join("cargo");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf invoked > \"$HOME/invoked\"\nprintf '[]'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_diskr"))
+        .args([
+            "--packages",
+            "--json",
+            "--manager",
+            "cargo",
+            "--no-projects",
+            ".",
+        ])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("PATH", ".:")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["system_packages"], serde_json::json!([]));
+    assert!(!home.join("invoked").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn package_scope_controls_do_not_run_unselected_managers() {
     use std::os::unix::fs::PermissionsExt;
     let root = fixture("inventory_scope");
