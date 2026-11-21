@@ -1,17 +1,17 @@
 class Diskr < Formula
   desc "Explore disk usage, packages, and cleanup candidates in the macOS terminal"
   homepage "https://milobeans.github.io/diskr/"
-  version "0.1.83"
+  version "0.1.84"
   license "MIT"
 
   on_arm do
-    url "https://github.com/milobeans/diskr/releases/download/v0.1.83/diskr-aarch64-apple-darwin.tar.gz"
-    sha256 "16d9579803894f098ef57ba3ed2e6a4165c89b6aa34ef91427b70db1f140d147"
+    url "https://github.com/milobeans/diskr/releases/download/v0.1.84/diskr-aarch64-apple-darwin.tar.gz"
+    sha256 "3b1b6dcca6bdf5c8d667c1e4b3eba5c25b5a2bbd7dd8d453db8746644319f1d8"
   end
 
   on_intel do
-    url "https://github.com/milobeans/diskr/releases/download/v0.1.83/diskr-x86_64-apple-darwin.tar.gz"
-    sha256 "18f76a6eda7e689d7349f33fd7ff27e2186b33f77989d880911ee07907386d9b"
+    url "https://github.com/milobeans/diskr/releases/download/v0.1.84/diskr-x86_64-apple-darwin.tar.gz"
+    sha256 "72bc22fee9b5554a7a0137146eb0ecb9f964501749404e0a0a7332777ed87f23"
   end
 
   depends_on :macos
