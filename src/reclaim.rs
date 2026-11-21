@@ -207,6 +207,7 @@ pub struct Finding {
     /// Number of directories rolled into this finding (1 for fixed locations).
     pub count: usize,
     pub paths: Vec<PathBuf>,
+    pub path_identities: Vec<Option<bulkstat::FileIdentity>>,
     /// True when this finding's paths are ancestors of one or more other findings'
     /// paths. Roll-up findings are shown as contextual subtotals; `report.total`
     /// is independently calculated from the union of every finding path.
@@ -477,6 +478,7 @@ fn fixed_findings(
             let mut inaccessible = 0u32;
             let mut skipped_mounts = 0u32;
             let mut paths = Vec::new();
+            let mut path_identities = Vec::new();
             let mut contributions = Vec::new();
             for rel in category.paths {
                 if cancellation.is_cancelled() {
@@ -491,6 +493,7 @@ fn fixed_findings(
                 if !candidate.starts_with(root) || !candidate.is_dir() {
                     continue;
                 }
+                path_identities.push(bulkstat::path_identity(&candidate));
                 let scope = bulkstat::ScanScope::new(root).ok().map(|s| s.fresh());
                 let scanned =
                     bulkstat::scan_dir_in_scope(&candidate, 0, cancellation, scope.as_ref())
@@ -521,6 +524,7 @@ fn fixed_findings(
                     skipped_mounts,
                     count: paths.len(),
                     paths,
+                    path_identities,
                     rollup: false,
                 },
                 contributions,
@@ -542,12 +546,14 @@ fn artifact_findings(
             let mut inaccessible = 0u32;
             let mut skipped_mounts = 0u32;
             let mut paths = Vec::new();
+            let mut path_identities = Vec::new();
             let mut contributions = Vec::new();
             for path in search.hits.iter().filter(|(hit_name, _)| hit_name == name) {
                 if cancellation.is_cancelled() {
                     return None;
                 }
                 let scope = bulkstat::ScanScope::new(root).ok().map(|s| s.fresh());
+                path_identities.push(bulkstat::path_identity(&path.1));
                 let scanned = bulkstat::scan_dir_in_scope(&path.1, 0, cancellation, scope.as_ref())
                     .unwrap_or_default();
                 size.logical = size.logical.saturating_add(scanned.size.logical);
@@ -576,6 +582,7 @@ fn artifact_findings(
                     skipped_mounts,
                     count: paths.len(),
                     paths,
+                    path_identities,
                     rollup: false,
                 },
                 contributions,

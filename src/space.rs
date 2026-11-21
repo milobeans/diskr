@@ -29,6 +29,40 @@ impl SpaceReport {
     pub fn unavailable_free(&self) -> u64 {
         self.free.saturating_sub(self.available)
     }
+
+    pub fn json(&self, utility_failures: usize) -> serde_json::Value {
+        let snapshots: Vec<_> = self
+            .local_snapshots
+            .names
+            .iter()
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect();
+        let apfs_container = self.apfs_container.as_ref().map(|container| {
+            serde_json::json!({
+                "reference": container.reference,
+                "size": container.size,
+                "free": container.free,
+            })
+        });
+        serde_json::json!({
+            "path": self.path.to_string_lossy(),
+            "mount": self.mount.to_string_lossy(),
+            "device": self.device,
+            "filesystem": self.fs_type,
+            "total": self.total,
+            "used": self.used,
+            "free": self.free,
+            "available": self.available,
+            "free_not_user_available": self.unavailable_free(),
+            "apfs_container": apfs_container,
+            "apfs_error": self.apfs_error.as_ref().map(ToString::to_string),
+            "apfs_diagnostic": self.apfs_error.as_ref().map(|error| error.json()),
+            "local_snapshots": snapshots,
+            "local_snapshot_error": self.local_snapshots.error,
+            "scope": {"policy": "owning volume statfs, APFS and snapshot utility queries", "mount": self.mount.to_string_lossy()},
+            "coverage": {"utility_failures": utility_failures},
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -104,9 +138,17 @@ pub fn report_for_path(path: &Path) -> Result<SpaceReport> {
     }
 
     let stat = statfs_for_path(path)?;
-    let local_snapshots = list_local_snapshots(&stat.mount);
+    Ok(report_with(path, stat, process::run_process))
+}
+
+fn report_with(
+    path: &Path,
+    stat: StatfsInfo,
+    runner: fn(Command, Duration) -> process::CommandResult,
+) -> SpaceReport {
+    let local_snapshots = list_local_snapshots_with(&stat.mount, runner);
     let (apfs_container, apfs_error) = if stat.fs_type == "apfs" {
-        match apfs_container_for_mount(&stat.mount) {
+        match apfs_container_with(&stat.mount, runner) {
             Ok(container) => (Some(container), None),
             Err(error) => (None, Some(error)),
         }
@@ -114,7 +156,7 @@ pub fn report_for_path(path: &Path) -> Result<SpaceReport> {
         (None, None)
     };
 
-    Ok(SpaceReport {
+    SpaceReport {
         path: path.to_path_buf(),
         mount: stat.mount,
         device: stat.device,
@@ -126,7 +168,7 @@ pub fn report_for_path(path: &Path) -> Result<SpaceReport> {
         local_snapshots,
         apfs_container,
         apfs_error,
-    })
+    }
 }
 
 pub fn thin_local_snapshots(path: &Path, bytes: u64) -> Result<ThinResult> {
@@ -250,9 +292,16 @@ fn statfs_for_path(path: &Path) -> Result<StatfsInfo> {
 }
 
 pub(crate) fn list_local_snapshots(path: &Path) -> SnapshotListing {
+    list_local_snapshots_with(path, process::run_process)
+}
+
+fn list_local_snapshots_with(
+    path: &Path,
+    runner: fn(Command, Duration) -> process::CommandResult,
+) -> SnapshotListing {
     let mut command = Command::new(TMUTIL_PATH);
     command.arg("listlocalsnapshots").arg(path);
-    let output = process::run_process(command, Duration::from_secs(15));
+    let output = runner(command, Duration::from_secs(15));
     match output {
         output if output.success => SnapshotListing {
             names: parse_tmutil_snapshot_names(&output.stdout),
@@ -367,6 +416,53 @@ fn extract_plist_scalar<'a>(plist: &'a str, key: &str, tag: &str) -> Option<&'a 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn space_report_json_uses_pinned_utilities_and_the_owning_mount() {
+        fn run(command: Command, timeout: Duration) -> process::CommandResult {
+            assert_eq!(timeout, Duration::from_secs(15));
+            let args: Vec<_> = command.get_args().collect();
+            let stdout = match command.get_program().to_str().unwrap() {
+                TMUTIL_PATH => {
+                    assert_eq!(args, ["listlocalsnapshots", "/fixture mount"]);
+                    "Snapshots for fixture:\ncom.apple.TimeMachine.fixture.local\n"
+                }
+                DISKUTIL_PATH => {
+                    assert_eq!(args, ["info", "-plist", "/fixture mount"]);
+                    "<plist><dict><key>APFSContainerReference</key><string>fixture</string><key>APFSContainerSize</key><integer>100000</integer><key>APFSContainerFree</key><integer>40000</integer></dict></plist>"
+                }
+                other => panic!("unexpected program {other}"),
+            };
+            process::CommandResult {
+                stdout: stdout.into(),
+                stderr: String::new(),
+                success: true,
+                timed_out: false,
+            }
+        }
+        let stat = StatfsInfo {
+            mount: "/fixture mount".into(),
+            device: "disk-fixture".into(),
+            fs_type: "apfs".into(),
+            total: 100000,
+            used: 60000,
+            free: 40000,
+            available: 35000,
+        };
+        let path = Path::new("/fixture mount/project");
+        let result = report_with(path, stat, run);
+        let json = result.json(0);
+        assert_eq!(json["path"], path.to_str().unwrap());
+        assert_eq!(json["scope"]["mount"], "/fixture mount");
+        assert_eq!(json["free_not_user_available"], 5000);
+        assert_eq!(json["apfs_container"]["reference"], "fixture");
+        assert_eq!(
+            json["local_snapshots"][0]["name"],
+            "com.apple.TimeMachine.fixture.local"
+        );
+        assert!(json["apfs_error"].is_null());
+        assert!(json["local_snapshot_error"].is_null());
+    }
 
     #[test]
     fn parse_byte_size_accepts_binary_units() {

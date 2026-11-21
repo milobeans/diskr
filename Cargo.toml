@@ -20,7 +20,8 @@ ratatui-widgets = { version = "0.3", default-features = false, features = ["unst
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
 anyhow = "1"
 libc = "0.2" # macOS getattrlistbulk/open/close FFI
-serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
 toml = { version = "1.1", default-features = false, features = ["parse", "std", "serde"] }
 unicode-segmentation = "1.13"
 unicode-width = "0.2"

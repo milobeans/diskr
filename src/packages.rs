@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -257,23 +258,7 @@ impl Manager {
                 vec!["uninstall".into(), "--cask".into(), name.into()],
             ),
             Manager::Npm => ("npm", vec!["uninstall".into(), "-g".into(), name.into()]),
-            Manager::Pip => {
-                if command_exists("pip3") {
-                    ("pip3", vec!["uninstall".into(), "-y".into(), name.into()])
-                } else {
-                    (
-                        "python3",
-                        vec![
-                            "-I".into(),
-                            "-m".into(),
-                            "pip".into(),
-                            "uninstall".into(),
-                            "-y".into(),
-                            name.into(),
-                        ],
-                    )
-                }
-            }
+            Manager::Pip => ("pip3", vec!["uninstall".into(), "-y".into(), name.into()]),
             Manager::Cargo => ("cargo", vec!["uninstall".into(), name.into()]),
             Manager::Bun => ("bun", vec!["remove".into(), "-g".into(), name.into()]),
         }
@@ -410,6 +395,7 @@ pub struct ManagerReport {
 #[derive(Clone, Debug)]
 pub struct ManagerEnvironment {
     pub executable: PathBuf,
+    executable_target: PathBuf,
     pub prefix_args: Vec<String>,
     pub install_root: Option<PathBuf>,
     pub package_roots: Vec<PathBuf>,
@@ -419,38 +405,66 @@ pub struct ManagerEnvironment {
 }
 
 impl ManagerEnvironment {
-    fn discover(manager: Manager) -> Option<Self> {
+    fn discover(manager: Manager) -> Result<Option<Self>, String> {
+        let paths = std::env::var_os("PATH").unwrap_or_default();
+        let home = std::env::var_os("HOME").and_then(|home| Path::new(&home).canonicalize().ok());
         let euid = unsafe { libc::geteuid() };
-        let search_path = trusted_search_path(&std::env::var_os("PATH")?, euid)?;
-        let (executable, prefix_args) = if manager == Manager::Pip {
-            match pip_command(&search_path, euid)? {
-                PipCommand::Pip3(executable) => (executable, Vec::new()),
-                PipCommand::Python3Module(executable) => {
-                    (
-                        executable,
-                        vec![String::from("-I"), String::from("-m"), String::from("pip")],
-                    )
+        let search_path = trusted_search_path(&paths, home.as_deref(), euid);
+        let resolve = |name| command_path_from(name, &search_path, home.as_deref(), euid);
+        let mut prefix_args = Vec::new();
+        let mut executable = resolve(manager.command());
+        if executable.is_none() && manager == Manager::Pip {
+            if let Some((entry, target)) = resolve("python3") {
+                let mut probe = Command::new(&target);
+                probe.arg0(&entry);
+                probe
+                    .args(["-I", "-m", "pip", "--version"])
+                    .env("PATH", &search_path)
+                    .current_dir("/");
+                let output = run_scan_process(probe, CMD_TIMEOUT);
+                if output.success && !output.stdout.trim().is_empty() {
+                    executable = Some((entry, target));
+                    prefix_args = vec!["-I".into(), "-m".into(), "pip".into()];
                 }
             }
-        } else {
-            (
-                command_path_from(manager.command(), &search_path, euid)?,
-                Vec::new(),
-            )
+        }
+        let Some((executable, executable_target)) = executable else {
+            let names: &[&str] = if manager == Manager::Pip {
+                &["pip3", "python3"]
+            } else {
+                &[manager.command()]
+            };
+            for dir in std::env::split_paths(&paths) {
+                for name in names {
+                    let candidate = dir.join(name);
+                    if std::fs::symlink_metadata(&candidate).is_ok() && resolve(name).is_none() {
+                        return Err(format!(
+                            "skipped untrusted package-manager path {}",
+                            candidate.display()
+                        ));
+                    }
+                }
+            }
+            return Ok(None);
         };
-        Some(Self {
+        Ok(Some(Self {
+            executable_target,
             executable,
             prefix_args,
             install_root: None,
             package_roots: Vec::new(),
-            cwd: std::env::current_dir().ok()?,
+            // Global inventory should not load per-project configuration from the launch directory.
+            cwd: PathBuf::from("/"),
             manager,
             search_path,
-        })
+        }))
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(&self.executable);
+        // A venv or multicall tool selects its environment by invocation name.
+        // Execute the verified target directly while retaining that name.
+        let mut command = Command::new(&self.executable_target);
+        command.arg0(&self.executable);
         command
             .args(&self.prefix_args)
             .args(args)
@@ -579,6 +593,7 @@ pub struct ProjectDeps {
     pub dep_count: DependencyCount,
     pub deps_size: Option<SizeInfo>,
     pub deps_dir: Option<PathBuf>,
+    pub deps_identity: Option<bulkstat::FileIdentity>,
     pub coverage: FootprintCoverage,
 }
 
@@ -1042,16 +1057,24 @@ fn uninstall_command(
 }
 
 fn scan_manager(manager: Manager) -> ManagerReport {
-    let Some(mut environment) = ManagerEnvironment::discover(manager) else {
-        return ManagerReport {
-            manager,
-            packages: Vec::new(),
-            total_size: SizeInfo::default(),
-            available: false,
-            warning: None,
-            state: ManagerScanState::Absent,
-            environment: None,
-        };
+    let mut environment = match ManagerEnvironment::discover(manager) {
+        Ok(Some(environment)) => environment,
+        result => {
+            let warning = result.err();
+            return ManagerReport {
+                manager,
+                packages: Vec::new(),
+                total_size: SizeInfo::default(),
+                available: false,
+                state: if warning.is_some() {
+                    ManagerScanState::Failed
+                } else {
+                    ManagerScanState::Absent
+                },
+                warning,
+                environment: None,
+            };
+        }
     };
 
     let (packages, warning, parse_failed) = match manager {
@@ -1862,6 +1885,7 @@ pub fn scan_project_deps_streamed(
     });
     let walk = ProjectWalk {
         root,
+        manifest_root: manifest::open_scan_root(root),
         options,
         cancellation,
         emit,
@@ -1928,6 +1952,7 @@ impl ProjectManifestGroup {
 }
 
 struct ProjectWalk<'a> {
+    manifest_root: io::Result<std::fs::File>,
     root: &'a Path,
     options: &'a InventoryScope,
     cancellation: &'a bulkstat::ScanCancellation,
@@ -2042,7 +2067,14 @@ fn scan_project_dir(
     }
 
     let new_deps = scan_map(groups, |group| {
-        let dep_count = manifest::count(dir, &group.manifests);
+        let dep_count = manifest::count(
+            &walk.manifest_root,
+            dir.strip_prefix(walk.root)
+                .expect("walked directory under scan root"),
+            &group.manifests,
+            cancellation,
+        );
+        let deps_identity = group.deps_path.as_deref().and_then(bulkstat::path_identity);
         let (deps_size, deps_dir, coverage) = match group.deps_path {
             Some(deps_path) => {
                 let (size, coverage) = tree_footprint_cancellable(
@@ -2060,6 +2092,7 @@ fn scan_project_dir(
             manifest: group.manifests.join(", "),
             dep_count,
             deps_size,
+            deps_identity,
             deps_dir,
             coverage,
         }
@@ -2082,10 +2115,6 @@ fn scan_project_dir(
     } else {
         coverage.lock().unwrap().depth_limited += children.len() as u32;
     }
-}
-
-fn command_exists(cmd: &str) -> bool {
-    command_path(cmd).is_some()
 }
 
 fn cargo_install_root() -> Result<PathBuf, String> {
@@ -2197,120 +2226,202 @@ fn cargo_config_install_root(
     Ok(root)
 }
 
-fn command_path(cmd: &str) -> Option<PathBuf> {
-    let euid = unsafe { libc::geteuid() };
-    let paths = std::env::var_os("PATH")?;
-    let search_path = trusted_search_path(&paths, euid)?;
-    command_path_from(cmd, &search_path, euid)
-}
-
-fn trusted_search_path(paths: &OsStr, euid: u32) -> Option<OsString> {
-    let directories: Vec<PathBuf> = std::env::split_paths(paths)
-        .filter(|dir| dir.is_absolute())
-        .filter_map(|dir| dir.canonicalize().ok())
-        .filter(|dir| is_trusted_command_directory(dir, euid))
-        .collect();
-    if directories.is_empty() {
-        return None;
+// A checkout normally has the same owner and modes as an installed tool. Require
+// installation provenance as well as safe permissions before inheriting a directory.
+fn installation_bin(dir: &Path, home: Option<&Path>) -> bool {
+    if [
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/Library/Developer/CommandLineTools/usr/bin",
+        "/Applications/Xcode.app/Contents/Developer/usr/bin",
+    ]
+    .iter()
+    .any(|root| dir == Path::new(root))
+    {
+        return true;
     }
-    std::env::join_paths(directories).ok()
+    fn parts(relative: &Path) -> Option<Vec<&str>> {
+        Some(relative.to_str()?.split('/').collect())
+    }
+    for prefix in ["/usr/local", "/opt/homebrew"] {
+        if let Ok(relative) = dir.strip_prefix(prefix) {
+            return parts(relative).is_some_and(|elements| {
+                matches!(
+                    elements.as_slice(),
+                    ["bin" | "sbin"]
+                        | ["Homebrew", "bin"]
+                        | ["Cellar", _, _, "bin" | "sbin"]
+                        | ["Cellar", _, _, "libexec", "bin"]
+                        | [
+                            "Cellar",
+                            _,
+                            _,
+                            "Frameworks",
+                            "Python.framework",
+                            "Versions",
+                            _,
+                            "bin"
+                        ]
+                )
+            });
+        }
+    }
+    if let Ok(relative) = dir.strip_prefix("/Library/Frameworks/Python.framework/Versions") {
+        return parts(relative).is_some_and(|elements| matches!(elements.as_slice(), [_, "bin"]));
+    }
+    home.and_then(|home| dir.strip_prefix(home).ok())
+        .and_then(parts)
+        .is_some_and(|elements| {
+            matches!(
+                elements.as_slice(),
+                [".local" | ".cargo" | ".bun" | ".volta", "bin"]
+                    | [".pyenv" | ".asdf", "shims"]
+                    | [".virtualenvs", _, "bin"]
+                    | ["Library", "Python", _, "bin"]
+                    | [".pyenv", "versions", _, "bin"]
+                    | [".pyenv", "versions", _, "envs", _, "bin"]
+                    | [".rustup", "toolchains", _, "bin"]
+                    | [".nvm", "versions", "node", _, "bin"]
+                    | [".asdf", "installs", _, _, "bin"]
+                    | [".local", "share", "mise", "shims"]
+                    | [".local", "share", "mise", "installs", _, _, "bin"]
+                    | [".local", "share", "virtualenvs", _, "bin"]
+                    | [".local", "share", "pipx", "venvs", _, "bin"]
+                    | [".local", "share", "uv", "tools" | "python", _, "bin"]
+            )
+        })
 }
 
-fn command_path_from(cmd: &str, paths: &OsStr, euid: u32) -> Option<PathBuf> {
-    std::env::split_paths(paths)
-        .filter(|dir| dir.is_absolute())
-        .filter_map(|dir| dir.join(cmd).canonicalize().ok())
-        .find(|path| is_trusted_executable(path, euid))
-}
-
-fn is_trusted_executable(path: &Path, euid: u32) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Ok(meta) = std::fs::metadata(path) else {
+// npm installs its launcher in a package directory and links it into bin.
+fn installed_executable(path: &Path, home: Option<&Path>) -> bool {
+    let Some(parent) = path.parent() else {
         return false;
     };
-    if !meta.is_file()
-        || meta.permissions().mode() & 0o111 == 0
-        || !trusted_command_metadata(&meta, euid, false)
-    {
-        return false;
+    if installation_bin(parent, home) {
+        return true;
     }
-    path.parent()
-        .is_some_and(|parent| is_trusted_command_directory(parent, euid))
+    let suffix = Path::new("lib/node_modules/npm/bin");
+    parent.ends_with(suffix)
+        && parent
+            .ancestors()
+            .nth(suffix.components().count())
+            .is_some_and(|prefix| installation_bin(&prefix.join("bin"), home))
+}
+
+fn trusted_search_path(paths: &OsStr, home: Option<&Path>, euid: u32) -> OsString {
+    let directories = std::env::split_paths(paths)
+        .filter(|dir| dir.is_absolute())
+        .filter_map(|dir| dir.canonicalize().ok())
+        .filter(|dir| installation_bin(dir, home) && is_trusted_command_directory(dir, euid));
+    std::env::join_paths(directories).unwrap_or_default()
+}
+
+fn command_path_from(
+    cmd: &str,
+    paths: &OsStr,
+    home: Option<&Path>,
+    euid: u32,
+) -> Option<(PathBuf, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(paths)
+        .filter(|dir| dir.is_absolute())
+        .find_map(|dir| {
+            let entry = dir.join(cmd);
+            let target = entry.canonicalize().ok()?;
+            let meta = std::fs::metadata(&target).ok()?;
+            (installed_executable(&target, home)
+                && meta.is_file()
+                && meta.permissions().mode() & 0o111 != 0
+                && trusted_command_metadata(&meta, &target, euid, false)
+                && is_trusted_command_directory(target.parent()?, euid))
+            .then_some((entry, target))
+        })
 }
 
 fn is_trusted_command_directory(path: &Path, euid: u32) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_dir() || !trusted_command_metadata(&meta, euid, false) {
-        return false;
-    }
-    path.ancestors().skip(1).all(|ancestor| {
-        std::fs::metadata(ancestor)
-            .ok()
-            .is_some_and(|meta| trusted_command_metadata(&meta, euid, true))
+    path.ancestors().all(|ancestor| {
+        std::fs::metadata(ancestor).is_ok_and(|meta| {
+            meta.is_dir() && trusted_command_metadata(&meta, ancestor, euid, ancestor != path)
+        })
     })
 }
 
 fn trusted_command_metadata(
     meta: &std::fs::Metadata,
+    path: &Path,
     euid: u32,
-    allow_root_sticky: bool,
+    ancestor: bool,
 ) -> bool {
     use std::os::unix::fs::MetadataExt;
-
-    if !matches!(meta.uid(), 0) && meta.uid() != euid {
+    if meta.uid() != 0 && meta.uid() != euid {
         return false;
     }
     let mode = meta.mode();
-    mode & 0o022 == 0
-        || (allow_root_sticky && meta.is_dir() && meta.uid() == 0 && mode & 0o1000 != 0)
+    // Homebrew's standard prefixes can grant write access to macOS administrators (gid 80).
+    let brew_admin =
+        meta.gid() == 80 && (path.starts_with("/opt/homebrew") || path.starts_with("/usr/local"));
+    let mode_trusted = (mode & 0o002 == 0 && (mode & 0o020 == 0 || brew_admin))
+        || (ancestor && meta.is_dir() && meta.uid() == 0 && mode & 0o1000 != 0);
+    mode_trusted && acl_allows_safe_access(path)
 }
 
-fn run_command(cmd: &Path, args: &[&str], search_path: &OsStr) -> CommandResult {
-    run_command_with_timeout(cmd, args, search_path, CMD_TIMEOUT)
-}
+// macOS extended ACL grants can make a mode-0755 path writable. Deny entries
+// (including the standard home-directory deny-delete entry) grant no rights.
+fn acl_allows_safe_access(path: &Path) -> bool {
+    use std::ffi::{c_int, c_void, CString};
+    use std::os::unix::ffi::OsStrExt;
+    use std::ptr;
 
-fn run_command_with_timeout(
-    cmd: &Path,
-    args: &[&str],
-    search_path: &OsStr,
-    timeout: Duration,
-) -> CommandResult {
-    let mut command = Command::new(cmd);
-    command.args(args).env("PATH", search_path);
-    run_scan_process(command, timeout)
+    unsafe extern "C" {
+        fn acl_get_file(path: *const libc::c_char, kind: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
+        fn acl_get_permset_mask_np(entry: *mut c_void, perms: *mut u64) -> c_int;
+        fn acl_free(acl: *mut c_void) -> c_int;
+    }
+    // sys/acl.h: write data, delete, append, delete child, write attributes,
+    // write extended attributes, write security, and change owner.
+    const MUTATION_RIGHTS: u64 =
+        (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 13);
+    const ACL_TYPE_EXTENDED: c_int = 0x100;
+    const ACL_EXTENDED_ALLOW: c_int = 1;
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let acl = unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        // Darwin returns ENOENT for a file with no ACL.
+        return matches!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOENT | libc::ENOTSUP)
+        );
+    }
+    let mut id = 0; // ACL_FIRST_ENTRY
+    let safe = loop {
+        let mut entry = ptr::null_mut();
+        if unsafe { acl_get_entry(acl, id, &mut entry) } != 0 {
+            // EINVAL denotes the end of the ACL on Darwin.
+            break io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL);
+        }
+        let mut tag = 0;
+        let mut perms = 0;
+        if unsafe { acl_get_tag_type(entry, &mut tag) } != 0
+            || unsafe { acl_get_permset_mask_np(entry, &mut perms) } != 0
+            || (tag == ACL_EXTENDED_ALLOW && perms & MUTATION_RIGHTS != 0)
+        {
+            break false;
+        }
+        id = -1; // ACL_NEXT_ENTRY
+    };
+    unsafe { acl_free(acl) };
+    safe
 }
 
 fn run_scan_process(command: Command, timeout: Duration) -> CommandResult {
     let cancellation = current_cancellation();
     crate::process::run_process_cancellable(command, timeout, || cancellation.is_cancelled())
-}
-
-#[derive(Clone)]
-enum PipCommand {
-    Pip3(PathBuf),
-    Python3Module(PathBuf),
-}
-
-fn pip_command(search_path: &OsStr, euid: u32) -> Option<PipCommand> {
-    if let Some(pip3) = command_path_from("pip3", search_path, euid) {
-        return Some(PipCommand::Pip3(pip3));
-    }
-    let python3 = command_path_from("python3", search_path, euid)?;
-    let has_python_pip = !run_command(
-        &python3,
-        &["-I", "-m", "pip", "--version"],
-        search_path,
-    )
-    .stdout
-    .trim()
-    .is_empty();
-    if has_python_pip {
-        return Some(PipCommand::Python3Module(python3));
-    }
-    None
 }
 
 struct PipDistIndex {
@@ -2416,9 +2527,17 @@ fn find_pip_package_size_and_path(
         );
     };
 
-    let (size, problems) = parse_pip_record_size(site_packages, dist_info_path);
-    let path = find_pip_top_level_path(site_packages, dist_info_path)
-        .or_else(|| infer_pip_package_dir(site_packages, package));
+    let (size, mut problems) = parse_pip_record_size(site_packages, dist_info_path);
+    let path = match find_pip_top_level_path(site_packages, dist_info_path) {
+        Ok(path) => path,
+        // This file is optional in installed distributions.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => {
+            problems.unreadable_manifests = problems.unreadable_manifests.saturating_add(1);
+            None
+        }
+    }
+    .or_else(|| infer_pip_package_dir(site_packages, package));
 
     (size, path, problems)
 }
@@ -2443,20 +2562,71 @@ fn find_pip_dist_info(site_packages: &Path, package: &str) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn find_pip_top_level_path(site_packages: &Path, dist_info: &Path) -> Option<PathBuf> {
-    let top_level = dist_info.join("top_level.txt");
-    let content = std::fs::read_to_string(top_level).ok()?;
-    for line in content.lines() {
-        let entry = line.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let candidate = site_packages.join(entry);
-        if candidate.exists() {
-            return Some(candidate);
-        }
+const MAX_PIP_RECORD_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_PIP_TOP_LEVEL_BYTES: u64 = 64 * 1024;
+const MAX_PIP_METADATA_ROWS: usize = 65_536;
+const MAX_PIP_ROW_BYTES: u64 = 16 * 1024;
+
+fn read_pip_metadata_rows(
+    path: &Path,
+    max_bytes: u64,
+    mut visit: impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::io::{BufRead, BufReader, Read};
+
+    let limit_error = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pip metadata exceeds parser limit",
+        )
+    };
+    let file = manifest::open_regular(path)?;
+    if file.metadata()?.len() > max_bytes {
+        return Err(limit_error());
     }
-    None
+    let cancellation = current_cancellation();
+    let mut reader = BufReader::new(file.take(max_bytes + 1));
+    let mut total = 0;
+    let mut row = String::new();
+    let mut rows = 0;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"));
+        }
+        row.clear();
+        let bytes = reader
+            .by_ref()
+            .take(MAX_PIP_ROW_BYTES + 1)
+            .read_line(&mut row)? as u64;
+        if bytes == 0 {
+            return Ok(());
+        }
+        total += bytes;
+        rows += 1;
+        if bytes > MAX_PIP_ROW_BYTES || total > max_bytes || rows > MAX_PIP_METADATA_ROWS {
+            return Err(limit_error());
+        }
+        visit(row.trim_end_matches(['\r', '\n']))?;
+    }
+}
+
+fn find_pip_top_level_path(site_packages: &Path, dist_info: &Path) -> io::Result<Option<PathBuf>> {
+    let mut path = None;
+    read_pip_metadata_rows(
+        &dist_info.join("top_level.txt"),
+        MAX_PIP_TOP_LEVEL_BYTES,
+        |row| {
+            let name = row.trim();
+            if path.is_none() && Path::new(name).file_name() == Some(OsStr::new(name)) {
+                let candidate = site_packages.join(name);
+                if candidate.exists() {
+                    path = Some(candidate);
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok(path)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2484,42 +2654,21 @@ fn parse_pip_record_size(
     site_packages: &Path,
     dist_info: &Path,
 ) -> (Option<SizeInfo>, PipRecordProblems) {
-    let record = match std::fs::read_to_string(dist_info.join("RECORD")) {
-        Ok(record) => record,
-        Err(_) => {
-            return (
-                None,
-                PipRecordProblems {
-                    unreadable_manifests: 1,
-                    ..Default::default()
-                },
-            );
-        }
-    };
-    let mut logical = 0u64;
-    let mut allocated = 0u64;
+    let mut size = SizeInfo::default();
     let mut problems = PipRecordProblems::default();
-    let cancellation = current_cancellation();
-
-    for row in record.lines().filter(|line| !line.trim().is_empty()) {
-        if cancellation.is_cancelled() {
-            problems.unreadable_files = problems.unreadable_files.saturating_add(1);
-            break;
+    let result = read_pip_metadata_rows(&dist_info.join("RECORD"), MAX_PIP_RECORD_BYTES, |row| {
+        if row.trim().is_empty() {
+            return Ok(());
         }
-        let fields = split_csv_row(row);
-        if fields.len() < 3 {
-            continue;
-        }
-        let rel_path = fields[0].trim();
-        if rel_path.is_empty() {
-            continue;
-        }
-
-        let full_path = site_packages.join(rel_path);
+        let path = pip_record_path(row)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid pip RECORD row"))?;
+        let full_path = site_packages.join(path);
         match std::fs::symlink_metadata(&full_path) {
             Ok(meta) => {
-                logical = logical.saturating_add(meta.len());
-                allocated = allocated.saturating_add(allocated_size_from_metadata(&meta));
+                size.logical = size.logical.saturating_add(meta.len());
+                size.allocated = size
+                    .allocated
+                    .saturating_add(allocated_size_from_metadata(&meta));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 problems.missing_files = problems.missing_files.saturating_add(1);
@@ -2528,32 +2677,40 @@ fn parse_pip_record_size(
                 problems.unreadable_files = problems.unreadable_files.saturating_add(1);
             }
         }
+        Ok(())
+    });
+    if result.is_err() {
+        problems.unreadable_manifests = 1;
+        return (None, problems);
     }
-
-    (Some(SizeInfo { logical, allocated }), problems)
+    (Some(size), problems)
 }
 
-fn split_csv_row(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut chars = line.chars().peekable();
+// RECORD has three CSV fields. Only the path is needed for live filesystem sizes.
+fn pip_record_path(row: &str) -> Option<String> {
+    let mut path = String::new();
+    let mut field = 0;
+    let mut quoted = false;
+    let mut chars = row.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '"' {
-            if in_quotes && matches!(chars.peek(), Some('"')) {
-                chars.next();
-                current.push('"');
-            } else {
-                in_quotes = !in_quotes;
+        match ch {
+            '"' if quoted && chars.next_if_eq(&'"').is_some() => {
+                if field == 0 {
+                    path.push('"');
+                }
             }
-        } else if ch == ',' && !in_quotes {
-            fields.push(std::mem::take(&mut current));
-        } else {
-            current.push(ch);
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                field += 1;
+                if field > 2 {
+                    return None;
+                }
+            }
+            _ if field == 0 => path.push(ch),
+            _ => {}
         }
     }
-    fields.push(current);
-    fields
+    (field == 2 && !quoted && !path.is_empty()).then_some(path)
 }
 
 fn normalize_dist_name(name: &str) -> String {
@@ -2597,27 +2754,68 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn executable_lookup_honors_macos_extended_access_grants() {
+        let root = test_root("manager_acl");
+        let bin = root.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let home = root.canonicalize().unwrap();
+        let euid = unsafe { libc::geteuid() };
+        // Use a harmless deny entry and a write grant on this disposable tree only.
+        let set_acl = |action, entry| {
+            assert!(Command::new("/bin/chmod")
+                .args([action, entry])
+                .arg(&bin)
+                .status()
+                .unwrap()
+                .success());
+        };
+        set_acl("+a", "everyone deny delete");
+        assert!(!trusted_search_path(bin.as_os_str(), Some(&home), euid).is_empty());
+        set_acl("+a", "everyone allow add_file");
+        assert!(trusted_search_path(bin.as_os_str(), Some(&home), euid).is_empty());
+        set_acl("-a", "everyone deny delete");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn manager_resolution_rejects_writable_and_accepts_safe_absolute_paths() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = test_root("trusted_manager_path");
-        let tools = root.join("tools");
+        let home = root.join("home");
+        let tools = home.join(".virtualenvs/runtime/bin");
         std::fs::create_dir_all(&tools).unwrap();
-        let executable = tools.join("cargo");
-        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = home.canonicalize().unwrap();
+        let tools = tools.canonicalize().unwrap();
+        let base = home.join(".pyenv/versions/base/bin");
+        std::fs::create_dir_all(&base).unwrap();
+        let executable = base.join("python");
+        std::fs::write(&executable, "fixture").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let entry = tools.join("python3");
+        std::os::unix::fs::symlink(&executable, &entry).unwrap();
         let euid = unsafe { libc::geteuid() };
+        let path = tools.as_os_str();
 
         std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let absolute_path = std::env::join_paths([tools.as_path()]).unwrap();
-        assert_eq!(trusted_search_path(&absolute_path, euid), None);
+        assert!(trusted_search_path(path, Some(&home), euid).is_empty());
 
         std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let search_path = trusted_search_path(&absolute_path, euid).unwrap();
+        let safe = trusted_search_path(path, Some(&home), euid);
         assert_eq!(
-            command_path_from("cargo", &search_path, euid),
-            Some(tools.join("cargo").canonicalize().unwrap())
+            command_path_from("python3", &safe, Some(&home), euid),
+            Some((entry, executable.clone()))
         );
+
+        let nested = home.join(".local/bin/checkout/bin");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(trusted_search_path(nested.as_os_str(), Some(&home), euid).is_empty());
+        let project = root.join("project/bin");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(trusted_search_path(project.as_os_str(), Some(&home), euid).is_empty());
+        std::fs::copy(&executable, project.join("python")).unwrap();
+        std::os::unix::fs::symlink(project.join("python"), tools.join("cargo")).unwrap();
+        assert_eq!(command_path_from("cargo", &safe, Some(&home), euid), None);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2770,6 +2968,7 @@ mod tests {
                 warning: None,
                 state: ManagerScanState::Complete,
                 environment: Some(ManagerEnvironment {
+                    executable_target: executable.clone(),
                     executable,
                     prefix_args: Vec::new(),
                     install_root: None,
@@ -2810,6 +3009,7 @@ mod tests {
     #[test]
     fn uninstall_does_not_inherit_inventory_cancellation() {
         let environment = ManagerEnvironment {
+            executable_target: PathBuf::from("/bin/sh"),
             executable: PathBuf::from("/bin/sh"),
             prefix_args: vec![
                 String::from("-c"),
@@ -2857,6 +3057,7 @@ fi
         )
         .unwrap();
         let mut environment = ManagerEnvironment {
+            executable_target: executable.clone(),
             executable,
             prefix_args: Vec::new(),
             install_root: None,
@@ -2981,6 +3182,7 @@ fi
     #[test]
     fn uninstall_commands_retain_the_scanned_manager_and_root() {
         let environment = |manager, executable: &str, root: &str| ManagerEnvironment {
+            executable_target: PathBuf::from(executable),
             executable: PathBuf::from(executable),
             prefix_args: Vec::new(),
             install_root: Some(PathBuf::from(root)),
@@ -3007,11 +3209,7 @@ fi
             .any(|(key, value)| key == "BUN_INSTALL_GLOBAL_DIR"
                 && value == Some(std::ffi::OsStr::new("/fixture/bun global"))));
         let mut pip = environment(Manager::Pip, "/fixture/venv/bin/python3", "/fixture/venv");
-        pip.prefix_args = vec![
-            String::from("-I"),
-            String::from("-m"),
-            String::from("pip"),
-        ];
+        pip.prefix_args = vec![String::from("-I"), String::from("-m"), String::from("pip")];
         let command = uninstall_command(Manager::Pip, "example", Some(&pip)).unwrap();
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
@@ -3068,12 +3266,8 @@ fi
         assert_eq!(args, vec!["uninstall", "ripgrep"]);
 
         let (cmd, args) = Manager::Pip.uninstall_args("ruff");
-        if cmd == "pip3" {
-            assert_eq!(args, vec!["uninstall", "-y", "ruff"]);
-        } else {
-            assert_eq!(cmd, "python3");
-            assert_eq!(args, vec!["-m", "pip", "uninstall", "-y", "ruff"]);
-        }
+        assert_eq!(cmd, "pip3");
+        assert_eq!(args, vec!["uninstall", "-y", "ruff"]);
 
         let (cmd, args) = Manager::Npm.uninstall_args("typescript");
         assert_eq!(cmd, "npm");
@@ -3102,7 +3296,7 @@ fi
 
         assert_eq!(find_pip_dist_info(&root, "PyYAML"), Some(dist_info.clone()));
         assert_eq!(
-            find_pip_top_level_path(&root, &dist_info),
+            find_pip_top_level_path(&root, &dist_info).unwrap(),
             Some(root.join("yaml"))
         );
 
@@ -3202,11 +3396,65 @@ fi
     }
 
     #[test]
-    fn splits_csv_fields_with_quoted_values() {
-        let fields = split_csv_row("path,to,script.py,sha256=abc,12");
-        assert_eq!(fields, vec!["path", "to", "script.py", "sha256=abc", "12"]);
-        let fields = split_csv_row("\"hello,world\",sha256=abc,7");
-        assert_eq!(fields, vec!["hello,world", "sha256=abc", "7"]);
+    fn pip_record_requires_three_fields_and_preserves_quoted_paths() {
+        assert!(pip_record_path("path,to,script.py,sha256=abc,12").is_none());
+        assert_eq!(
+            pip_record_path(r#""hello,""world"".py",sha256=abc,7"#).as_deref(),
+            Some(r#"hello,"world".py"#)
+        );
+    }
+
+    #[test]
+    fn pip_metadata_limits_and_cancellation_preserve_incomplete_coverage() {
+        let root = test_root("pip_metadata_limits");
+        let dist = root.join("sample-1.0.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        let record = dist.join("RECORD");
+        let top = dist.join("top_level.txt");
+        let index = PipDistIndex::build(&root).unwrap();
+
+        std::fs::File::create(&top)
+            .unwrap()
+            .set_len(MAX_PIP_TOP_LEVEL_BYTES + 1)
+            .unwrap();
+        std::fs::File::create(&record)
+            .unwrap()
+            .set_len(MAX_PIP_RECORD_BYTES + 1)
+            .unwrap();
+        let (size, _, problems) = find_pip_package_size_and_path(&index, "sample", "1.0");
+        assert!(size.is_none());
+        assert_eq!(problems.unreadable_manifests, 2);
+
+        for contents in [
+            vec![b'x'; MAX_PIP_ROW_BYTES as usize + 1],
+            vec![b'\n'; MAX_PIP_METADATA_ROWS + 1],
+        ] {
+            std::fs::write(&record, contents).unwrap();
+            assert_eq!(
+                parse_pip_record_size(&root, &dist).1.unreadable_manifests,
+                1
+            );
+        }
+        std::fs::write(&record, b"package.py,,\n").unwrap();
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        with_scan_cancellation(&bulkstat::ScanCancellation::new(generation, 0), || {
+            let error = read_pip_metadata_rows(&record, MAX_PIP_RECORD_BYTES, |_| {
+                panic!("cancelled scan read a row")
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        });
+
+        std::fs::remove_file(&record).unwrap();
+        std::os::unix::fs::symlink(&top, &record).unwrap();
+        assert!(manifest::open_regular(&record).is_err());
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        assert_eq!(
+            parse_pip_record_size(&root, &dist).1.unreadable_manifests,
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

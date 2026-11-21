@@ -131,6 +131,28 @@ pub fn sanitize(text: &str) -> Cow<'_, str> {
     Cow::Owned(safe)
 }
 
+/// JSON serialization escapes C0 controls. Escape the remaining terminal control
+/// characters as JSON code units, preserving field names, values and layout.
+pub fn write_json_line(
+    output: &mut impl std::io::Write,
+    json: &str,
+    is_terminal: bool,
+) -> std::io::Result<()> {
+    let mut start = 0;
+    if is_terminal {
+        for (offset, ch) in json
+            .char_indices()
+            .filter(|(_, ch)| ('\u{7f}'..='\u{9f}').contains(ch))
+        {
+            output.write_all(&json.as_bytes()[start..offset])?;
+            write!(output, "\\u{:04x}", ch as u32)?;
+            start = offset + ch.len_utf8();
+        }
+    }
+    output.write_all(&json.as_bytes()[start..])?;
+    output.write_all(b"\n")
+}
+
 /// Buffer cells already have fixed terminal geometry, so replace each control
 /// with one printable column instead of expanding it to a visible escape.
 pub fn sanitize_cell(text: &str) -> Cow<'_, str> {
@@ -254,6 +276,27 @@ mod tests {
         }
         cursor.edit(&mut text.clone(), InputEdit::Home);
         assert!(cursor.viewport(&text, 6).starts_with('|'));
+    }
+
+    #[test]
+    fn json_controls_round_trip_on_terminals_and_pipes() {
+        let controls: String = ('\u{7f}'..='\u{9f}').collect();
+        let value = serde_json::json!({ &controls: format!("界\\{controls}\n") });
+        let json = serde_json::to_string_pretty(&value).unwrap();
+        let mut output = Vec::new();
+        write_json_line(&mut output, &json, true).unwrap();
+        let displayed = std::str::from_utf8(&output).unwrap();
+        assert!(!displayed
+            .chars()
+            .any(|ch| ('\u{7f}'..='\u{9f}').contains(&ch)));
+        assert!(displayed.contains("\\u009f"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+            value
+        );
+        output.clear();
+        write_json_line(&mut output, &json, false).unwrap();
+        assert_eq!(output, format!("{json}\n").as_bytes());
     }
 
     #[test]

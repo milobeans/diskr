@@ -17,12 +17,6 @@ A fast, macOS-native disk explorer for the terminal, written in Rust.
 
 </div>
 
-> **Upcoming release:** This README describes 0.1.84. The latest published
-> release is 0.1.83; the new `g` chooser and native installer await 0.1.84
-> publication. For currently available installation options and features, see
-> the [0.1.83 README](https://github.com/milobeans/diskr/blob/v0.1.83/README.md)
-> and [latest release](https://github.com/milobeans/diskr/releases/latest).
-
 ## Why diskr
 
 Finder sucks. diskr was built as a simpler and more direct way to manage the files and storage on your mac.
@@ -451,13 +445,24 @@ subtrees, not shell globs; absolute paths and `..` are rejected. Exclusions
 affect discovery, not the footprint of an included project's dependency tree.
 The selected scope is included in JSON and human output.
 
+Package managers run from standard macOS and Homebrew installation directories
+or recognized user locations such as `~/.cargo/bin`, `~/.local/bin`, pyenv
+versions and `~/.virtualenvs/<name>/bin`. If the only candidate is in a
+project or an unsupported custom directory, the report marks the manager
+unavailable and names the skipped path.
+
 </details>
 
 <details>
 <summary>Named baselines and saved inventory profiles</summary>
 
 The default `--save`/`--diff` pair keeps one latest baseline per root, retaining
-up to 512 roots. Named captures are separate, immutable and never silently
+up to 512 roots. A capture accepts up to 16,384 immediate entries and 4 MiB
+of encoded baseline data. If a save would push the latest-root history file
+over 16 MiB, the previous baselines stay intact. Opening an older history file
+over that limit moves it to a sibling backup and reports the backup path.
+
+Named captures are separate, immutable and never silently
 replace that latest baseline. Names use 1-80 ASCII letters, digits, `.`, `_` or
 `-`. Capture a new name for each comparison point:
 
@@ -587,7 +592,9 @@ Sizes count regular-file content only -- symlink targets and directories' own
 metadata blocks are not added, so totals run slightly under `du`/Finder, and
 directories or entries that cannot be read are flagged as lower bounds rather
 than counted as zero. Human terminal output escapes control characters from
-filenames and external tools; JSON retains normal structured escaping.
+filenames and external tools. JSON printed to a terminal also escapes DEL and C1
+control characters as Unicode escapes. Redirected JSON retains its original UTF-8
+representation, and both forms decode to the same values.
 
 The reclaimable-space detector runs two passes: a fixed-location pass that
 checks well-known paths (`~/Library/Caches`, Xcode DerivedData, Homebrew,
@@ -766,15 +773,23 @@ keeps the site's key reference in sync with the keymap.
 
 Releases are automated through GitHub Actions and appear in the GitHub Releases tab.
 
-One-time setup:
+Configure the release boundaries in GitHub before pushing release tags.
 
-1. Add a repository secret named `CARGO_REGISTRY_TOKEN` with a crates.io API token that has publish access for `diskr`.
+1. Restrict updates to `main` and creation of `v*` tags to the maintainer.
+   Protect existing release tags from updates and deletions.
+2. Create the `release-signing` and `crates-io` environments with deployment
+   limited to the `main` **branch**. Require maintainer approval on
+   `release-signing`. A single-maintainer repository must allow the
+   maintainer to approve their own signing deployment.
+3. Configure a crates.io trusted publisher for `milobeans/diskr`, workflow
+   `release.yml`, and environment `crates-io`. Remove and revoke the previous
+   registry token after migrating. For token-based publishing, keep a
+   `diskr`-scoped `CARGO_REGISTRY_TOKEN` in the `crates-io` environment.
+   A repository-scoped token is accessible to workflows outside that environment.
 
-Developer ID signing and notarization are optional and disabled until the
-required credentials are provisioned. Apple Developer Program membership or
-an Apple Development certificate alone does not configure distribution
-signing. To enable it, set the repository variable `MACOS_SIGNING_ENABLED`
-to `true` and configure these repository secrets:
+For Developer ID signing and notarization, set the repository variable
+`MACOS_SIGNING_ENABLED` to `true` and configure the following secrets
+**only in the protected `release-signing` environment**.
 
 | Secret | Value |
 | --- | --- |
@@ -785,11 +800,12 @@ to `true` and configure these repository secrets:
 | `APPLE_NOTARY_KEY_ID` | API key ID |
 | `APPLE_NOTARY_ISSUER_ID` | Team API issuer ID |
 
-When enabled, the workflow signs the executable and produces notarized,
-stapled DMGs alongside the archives containing the signed executable. It
-requires valid credentials and successful notarization; enabling the setting
-does not itself establish that a release is signed. Keep credentials in
-GitHub Secrets and never in the repository.
+When enabled, signing must succeed before publication. The release includes
+notarized, stapled DMGs and archives containing signed executables. To make a
+one-release exception, a maintainer can set the repository variable
+`MACOS_UNSIGNED_RELEASE_TAG` to the exact version tag before pushing it.
+Remove the exception after publication. The release notes and distribution
+metadata identify unsigned archives.
 
 Release flow:
 
@@ -804,10 +820,11 @@ git tag -a v0.1.14 -m "v0.1.14"
 git push origin v0.1.14
 ```
 
-When that tag is pushed, the `Release` workflow will:
+Pushing a tag starts the read-only `Release tag` workflow. Its completion
+starts `Release` from the default branch. The release workflow will:
 
-1. Verify the tag matches the crate version.
-2. Verify the tagged commit is reachable from `main`.
+1. Verify the tag was requested by the repository owner and matches the crate version.
+2. Verify the live tag names the exact requested commit and is reachable from `main`.
 3. Run the full release validation set.
 4. Publish the crate to crates.io if that version is not already published.
 5. Download the published crate and verify it was built from the exact tag commit.

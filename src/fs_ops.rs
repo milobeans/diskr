@@ -1,8 +1,12 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::ffi::{CStr, CString};
+use std::fs::File;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+
+use crate::bulkstat::FileIdentity;
 use std::process::Command;
 use std::time::Duration;
 
@@ -25,17 +29,140 @@ pub fn rename_without_replacement(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-/// Delete by moving to the macOS Trash (reversible).
+/// The decision shown in the confirmation dialog, including the directory entry
+/// that was selected when the scan produced the row.
+pub struct TrashTarget {
+    pub path: PathBuf,
+    parent: FileIdentity,
+    item: FileIdentity,
+    link_id: u64,
+}
+
+impl TrashTarget {
+    pub fn capture(path: &Path, expected: Option<FileIdentity>) -> Result<Self> {
+        let (parent, item) = open_trash_entry(path)?;
+        let item_id = crate::bulkstat::metadata_identity(&item.metadata()?);
+        anyhow::ensure!(
+            expected == Some(item_id),
+            "item changed since scan; rescan before moving it to Trash"
+        );
+        Ok(Self {
+            path: path.to_owned(),
+            parent: crate::bulkstat::metadata_identity(&parent.metadata()?),
+            item: item_id,
+            link_id: link_id(&item)
+                .context("filesystem cannot identify the selected directory entry")?,
+        })
+    }
+
+    pub fn move_with(&self, move_item: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+        let (parent, item) = open_trash_entry(&self.path)?;
+        anyhow::ensure!(
+            crate::bulkstat::metadata_identity(&parent.metadata()?) == self.parent
+                && crate::bulkstat::metadata_identity(&item.metadata()?) == self.item
+                && link_id(&item)? == self.link_id,
+            "item or parent changed since confirmation; rescan before moving it to Trash"
+        );
+        // Darwin volfs addresses this exact directory entry by persistent link ID,
+        // including for hard links and symlink leaves. Keep the opened objects alive
+        // throughout the call so their IDs cannot be recycled under the worker.
+        let reference = PathBuf::from(format!("/.vol/{}/{}", self.item.0, self.link_id));
+        let name = CString::new(reference.as_os_str().as_bytes())?;
+        let resolved = open_event_fd(libc::AT_FDCWD, &name, libc::O_SYMLINK)?;
+        anyhow::ensure!(
+            crate::bulkstat::metadata_identity(&resolved.metadata()?) == self.item
+                && link_id(&resolved)? == self.link_id,
+            "cannot resolve the selected item by identity"
+        );
+        move_item(&reference)
+    }
+}
+
+fn open_trash_entry(path: &Path) -> Result<(File, File)> {
+    anyhow::ensure!(
+        path.is_absolute() && !path.components().any(|c| c == Component::ParentDir),
+        "expected an absolute path without parent traversal"
+    );
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("cannot move a filesystem root to Trash"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("missing item name"))?;
+    // These root-owned macOS aliases also occur in the system temporary directory.
+    let parent = if ["/tmp", "/var", "/etc"]
+        .iter()
+        .any(|alias| parent.starts_with(alias))
+    {
+        Path::new("/private").join(parent.strip_prefix("/")?)
+    } else {
+        parent.to_owned()
+    };
+    let parent = CString::new(parent.as_os_str().as_bytes())?;
+    let name = CString::new(name.as_bytes())?;
+    let dir = open_event_fd(
+        libc::AT_FDCWD,
+        &parent,
+        libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY,
+    )?;
+    let item = open_event_fd(dir.as_raw_fd(), &name, libc::O_SYMLINK)?;
+    Ok((dir, item))
+}
+
+fn open_event_fd(dir: libc::c_int, path: &CStr, flags: libc::c_int) -> io::Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            path.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_EVTONLY,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn link_id(file: &File) -> io::Result<u64> {
+    let mut attrs = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: libc::ATTR_CMNEXT_LINKID,
+    };
+    // getattrlist packs the eight-byte link ID directly after a four-byte length.
+    let mut buf = [0u8; 12];
+    if unsafe {
+        libc::fgetattrlist(
+            file.as_raw_fd(),
+            (&raw mut attrs).cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::FSOPT_ATTR_CMN_EXTENDED,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if u32::from_ne_bytes(buf[..4].try_into().unwrap()) != buf.len() as u32 {
+        return Err(io::Error::other(
+            "filesystem did not return a link identifier",
+        ));
+    }
+    Ok(u64::from_ne_bytes(buf[4..].try_into().unwrap()))
+}
+
+/// Resolve the identity-based volfs path to a Foundation file reference for Trash.
 pub fn delete_to_trash(path: &Path) -> Result<()> {
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| anyhow!("path contains a null byte"))?;
+    let path = CString::new(path.as_os_str().as_bytes())?;
 
     unsafe {
         let _pool = AutoreleasePool::new()?;
-        let url = file_url(path.as_ptr())?;
-        if url.is_null() {
-            return Err(anyhow!("could not create file URL for path"));
-        }
+        let url = file_reference_url(path.as_ptr())?;
 
         let manager = msg_send_id(class(c"NSFileManager")?, selector(c"defaultManager"));
         if manager.is_null() {
@@ -128,6 +255,16 @@ unsafe fn file_url(path: *const libc::c_char) -> Result<Id> {
         0,
         std::ptr::null_mut(),
     ))
+}
+
+unsafe fn file_reference_url(path: *const libc::c_char) -> Result<Id> {
+    let url = file_url(path)?;
+    let reference = msg_send_id(url, selector(c"fileReferenceURL"));
+    anyhow::ensure!(
+        !reference.is_null(),
+        "filesystem does not support a stable Trash reference"
+    );
+    Ok(reference)
 }
 
 unsafe fn msg_send_bool_with_trash_args(
@@ -390,6 +527,63 @@ mod tests {
     }
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn trash_reference_preserves_each_directory_entry() {
+        use std::os::unix::fs::symlink;
+        let root = RenameFixture::new();
+        let directory = root.0.canonicalize().unwrap();
+        fs::write(directory.join("original"), "data").unwrap();
+        fs::hard_link(directory.join("original"), directory.join("second")).unwrap();
+        symlink("original", directory.join("symlink")).unwrap();
+        symlink("missing", directory.join("dangling")).unwrap();
+        fs::create_dir(directory.join("subdir")).unwrap();
+        for name in ["original", "second", "symlink", "dangling", "subdir"] {
+            let path = directory.join(name);
+            let target =
+                TrashTarget::capture(&path, crate::bulkstat::path_identity(&path)).unwrap();
+            target
+                .move_with(|reference| {
+                    let reference = CString::new(reference.as_os_str().as_bytes())?;
+                    unsafe {
+                        let _pool = AutoreleasePool::new()?;
+                        let url = file_reference_url(reference.as_ptr())?;
+                        let resolved = msg_send_id(url, selector(c"filePathURL"));
+                        let bytes =
+                            msg_send_const_char(resolved, selector(c"fileSystemRepresentation"));
+                        assert!(!bytes.is_null());
+                        assert_eq!(
+                            CStr::from_ptr(bytes).to_bytes(),
+                            path.as_os_str().as_bytes()
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn trash_requires_the_scanned_leaf_and_confirmed_parent() {
+        let root = RenameFixture::new();
+        let parent = root.0.join("parent");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("file");
+        fs::write(&path, "data").unwrap();
+        let scanned = crate::bulkstat::path_identity(&path);
+        let target = TrashTarget::capture(&path, scanned).unwrap();
+        fs::rename(&parent, root.0.join("before")).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::hard_link(root.0.join("before/file"), &path).unwrap();
+        assert!(target.move_with(|_| panic!("changed parent")).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "replacement").unwrap();
+        assert!(TrashTarget::capture(&path, scanned).is_err());
+        fs::remove_dir_all(&parent).unwrap();
+        std::os::unix::fs::symlink(root.0.join("before"), &parent).unwrap();
+        assert!(TrashTarget::capture(&path, scanned).is_err());
+        assert!(target.move_with(|_| panic!("symlink ancestor")).is_err());
+    }
 
     #[test]
     fn rejects_paths_with_null_bytes() {

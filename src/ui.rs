@@ -4112,6 +4112,7 @@ mod tests {
             manifest: String::from("Cargo.toml"),
             dep_count: 1usize.into(),
             deps_size: Some(size),
+            deps_identity: None,
             deps_dir: Some(root.join("target")),
             coverage: Default::default(),
         }];
@@ -4590,6 +4591,7 @@ mod tests {
                     inaccessible: 0,
                     skipped_mounts: 0,
                     count,
+                    path_identities: Vec::new(),
                     paths: vec![root.join("cache"); count],
                     rollup: false,
                 }],

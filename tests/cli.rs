@@ -656,28 +656,33 @@ fn package_scan_does_not_execute_relative_path_manager() {
     .unwrap();
     std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_diskr"))
-        .args([
-            "--packages",
-            "--json",
-            "--manager",
-            "cargo",
-            "--no-projects",
-            ".",
-        ])
-        .current_dir(&project)
-        .env("HOME", &home)
-        .env("PATH", ".:")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["system_packages"], serde_json::json!([]));
-    assert!(!home.join("invoked").exists());
+    for path in [std::ffi::OsStr::new(".:"), project.as_os_str()] {
+        let output = Command::new(env!("CARGO_BIN_EXE_diskr"))
+            .args([
+                "--packages",
+                "--json",
+                "--manager",
+                "cargo",
+                "--no-projects",
+                ".",
+            ])
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let manager = &report["system_packages"][0];
+        assert_eq!(manager["available"], false);
+        assert_eq!(manager["scan_state"], "failed");
+        assert!(manager["warning"].as_str().unwrap().contains("cargo"));
+        assert!(!home.join("invoked").exists());
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -686,7 +691,7 @@ fn package_scope_controls_do_not_run_unselected_managers() {
     use std::os::unix::fs::PermissionsExt;
     let root = fixture("inventory_scope");
     let scan = root.join("scan");
-    let tools = root.join("tools");
+    let tools = root.join("home/.local/bin");
     std::fs::create_dir_all(&tools).unwrap();
     for relative in ["", "keep", "keep/deep", "archive"] {
         let dir = scan.join(relative);
@@ -752,7 +757,6 @@ fn package_scope_controls_do_not_run_unselected_managers() {
 
 #[test]
 fn reports_share_a_versioned_contract_and_keep_filters_separate_from_totals() {
-    use std::os::unix::fs::PermissionsExt;
     let root = fixture("report_contract");
     let scan = root.join("scan");
     let tools = root.join("tools");
@@ -766,14 +770,6 @@ fn reports_share_a_versioned_contract_and_keep_filters_separate_from_totals() {
         "[package]\nname='fixture'\nversion='1.0.0'\n",
     )
     .unwrap();
-    for (name, content) in [
-        ("tmutil", "#!/bin/sh\n[ \"$1\" = listlocalsnapshots ] && [ -d \"$2\" ] || exit 42\nprintf 'Snapshots for fixture:\\n'\n"),
-        ("diskutil", "#!/bin/sh\n[ \"$1\" = info ] && [ \"$2\" = -plist ] && [ -d \"$3\" ] || exit 42\nprintf '<plist><dict><key>APFSContainerReference</key><string>fixture</string><key>APFSContainerSize</key><integer>100000</integer><key>APFSContainerFree</key><integer>40000</integer></dict></plist>'\n"),
-    ] {
-        let executable = tools.join(name);
-        std::fs::write(&executable, content).unwrap();
-        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
     let run = |arguments: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_diskr"))
             .args(arguments)
@@ -788,7 +784,6 @@ fn reports_share_a_versioned_contract_and_keep_filters_separate_from_totals() {
         ("reclaim", vec!["--reclaim", "--json"]),
         ("save", vec!["--save", "--json"]),
         ("diff", vec!["--diff", "--json"]),
-        ("space", vec!["--space", "--json"]),
         ("packages", vec!["--packages", "--json"]),
     ] {
         let output = run(&arguments);
@@ -909,7 +904,7 @@ fn package_json_retains_custom_manager_root_and_footprint_scope() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = fixture("package_environment");
-    let tools = root.join("tools");
+    let tools = root.join("home/.local/bin");
     let install = root.join("custom install");
     std::fs::create_dir_all(&tools).unwrap();
     std::fs::create_dir_all(install.join("bin")).unwrap();

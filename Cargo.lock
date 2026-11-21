@@ -128,6 +128,7 @@ dependencies = [
  "libc",
  "ratatui-core",
  "ratatui-widgets",
+ "serde",
  "serde_json",
  "toml",
  "unicode-segmentation",

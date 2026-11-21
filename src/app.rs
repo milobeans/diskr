@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bulkstat::{self, DirScan, SizeInfo};
+use crate::fs_ops::TrashTarget;
 use crate::packages::{self, DepGraph, ManagerReport, ProjectDeps};
 use crate::scanner::{ScanId, ScanMsg, Scanner};
 use crate::terminal_text::{InputEdit, TextCursor};
@@ -161,6 +162,7 @@ fn enumerate_listing(
             device: meta.as_ref().map(|meta| meta.dev()),
             class,
             entry: Entry {
+                identity: meta.as_ref().map(bulkstat::metadata_identity),
                 name_lower: name.to_lowercase(),
                 name,
                 path,
@@ -217,6 +219,7 @@ pub enum InputAction {
 
 #[derive(Clone)]
 pub struct Entry {
+    pub identity: Option<bulkstat::FileIdentity>,
     pub name: String,
     pub name_lower: String,
     pub path: PathBuf,
@@ -619,6 +622,7 @@ pub struct App {
     pub reclaim_page_rows: usize,
 
     pending_delete: Option<DeleteTarget>,
+    pending_trash: Vec<TrashTarget>,
     marked: HashSet<PathBuf>,
     size_cache: HashMap<PathBuf, SizeInfo>,
     session_growth: SessionGrowth,
@@ -955,6 +959,7 @@ impl App {
             package_page_rows: 1,
             reclaim_page_rows: 1,
             pending_delete: None,
+            pending_trash: Vec::new(),
             marked: HashSet::new(),
             size_cache,
             session_growth,
@@ -1275,6 +1280,7 @@ impl App {
             let idx = self.entries.len();
             self.entry_index.insert(path.clone(), idx);
             self.entries.push(Entry {
+                identity: meta.as_ref().map(bulkstat::metadata_identity),
                 name,
                 name_lower,
                 path,
@@ -2752,12 +2758,26 @@ impl App {
 
     pub fn request_delete_reclaim_path(&mut self) {
         if let Some((name, path)) = self.selected_reclaim_path() {
-            self.pending_delete = Some(DeleteTarget::ReclaimPath {
-                finding_index: self.reclaim_paths_finding,
-                name,
-                path,
-            });
-            self.confirming_delete = true;
+            let (finding_index, path_index) = if self.reclaim_paths_open {
+                (self.reclaim_paths_finding, self.reclaim_paths_selected)
+            } else {
+                (self.selected_reclaim, 0)
+            };
+            let identity = self
+                .reclaim_report
+                .as_ref()
+                .and_then(|report| report.findings.get(finding_index))
+                .and_then(|finding| finding.path_identities.get(path_index))
+                .copied()
+                .flatten();
+            self.arm_delete(
+                DeleteTarget::ReclaimPath {
+                    finding_index,
+                    name,
+                    path,
+                },
+                identity,
+            );
             return;
         }
         self.status = String::from("no reclaim path selected");
@@ -2784,11 +2804,18 @@ impl App {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("top file");
-        self.pending_delete = Some(DeleteTarget::TopFile {
-            name: name.to_string(),
-            path,
-        });
-        self.confirming_delete = true;
+        let identity = self
+            .top_files_scan
+            .as_ref()
+            .and_then(|scan| scan.largest_files.get(self.top_files_selected))
+            .and_then(|file| file.identity);
+        self.arm_delete(
+            DeleteTarget::TopFile {
+                name: name.to_string(),
+                path,
+            },
+            identity,
+        );
     }
 
     pub fn close_top_files(&mut self) {
@@ -2874,8 +2901,7 @@ impl App {
             if self.batch_delete_rx.is_some() {
                 self.status = String::from("another Trash operation is already in progress");
             } else {
-                self.pending_delete = Some(DeleteTarget::FileEntry(entry));
-                self.confirming_delete = true;
+                self.arm_delete(DeleteTarget::FileEntry(entry), None);
             }
         }
     }
@@ -3266,8 +3292,7 @@ impl App {
             Focus::Files => {
                 if let Some(entry_idx) = self.visible_entry_index(self.selected) {
                     if let Some(entry) = self.entries.get(entry_idx).cloned() {
-                        self.pending_delete = Some(DeleteTarget::FileEntry(entry));
-                        self.confirming_delete = true;
+                        self.arm_delete(DeleteTarget::FileEntry(entry), None);
                     }
                 }
             }
@@ -3305,16 +3330,18 @@ impl App {
                             .unwrap_or(usize::MAX);
                         if let Some(dep) = self.project_deps.get(real_idx) {
                             if let Some(deps_dir) = &dep.deps_dir {
-                                self.pending_delete = Some(DeleteTarget::Package {
-                                    name: format!(
-                                        "{} dependency dir ({})",
-                                        dep.manager_label,
-                                        deps_dir.display()
-                                    ),
-                                    path: deps_dir.clone(),
-                                    is_project_dep: true,
-                                });
-                                self.confirming_delete = true;
+                                self.arm_delete(
+                                    DeleteTarget::Package {
+                                        name: format!(
+                                            "{} dependency dir ({})",
+                                            dep.manager_label,
+                                            deps_dir.display()
+                                        ),
+                                        path: deps_dir.clone(),
+                                        is_project_dep: true,
+                                    },
+                                    dep.deps_identity,
+                                );
                             } else {
                                 self.status = format!(
                                     "no local dependency directory to delete for {}",
@@ -3328,7 +3355,46 @@ impl App {
         }
     }
 
+    fn arm_delete(&mut self, target: DeleteTarget, identity: Option<bulkstat::FileIdentity>) {
+        let capture = |path: &Path, expected| {
+            TrashTarget::capture(path, expected)
+                .with_context(|| format!("cannot verify {}", path.display()))
+        };
+        let targets = match &target {
+            DeleteTarget::FileEntry(entry) => {
+                capture(&entry.path, entry.identity).map(|item| vec![item])
+            }
+            DeleteTarget::TopFile { path, .. }
+            | DeleteTarget::ReclaimPath { path, .. }
+            | DeleteTarget::Package { path, .. } => capture(path, identity).map(|item| vec![item]),
+            DeleteTarget::Batch => self
+                .marked
+                .iter()
+                .map(|path| {
+                    let identity = self
+                        .entry_index
+                        .get(path)
+                        .and_then(|&i| self.entries.get(i))
+                        .and_then(|entry| entry.identity);
+                    capture(path, identity)
+                })
+                .collect(),
+        };
+        match targets {
+            Ok(items) => {
+                self.pending_trash = items;
+                self.pending_delete = Some(target);
+                self.confirming_delete = true;
+            }
+            Err(error) => {
+                self.cancel_delete();
+                self.status = format!("Trash unavailable: {error:#}");
+            }
+        }
+    }
+
     pub fn cancel_delete(&mut self) {
+        self.pending_trash.clear();
         self.confirming_delete = false;
         self.pending_delete = None;
     }
@@ -3340,13 +3406,7 @@ impl App {
         }
         self.confirming_delete = false;
         if let Some(target) = self.pending_delete.take() {
-            let paths = match &target {
-                DeleteTarget::FileEntry(entry) => vec![entry.path.clone()],
-                DeleteTarget::TopFile { path, .. }
-                | DeleteTarget::ReclaimPath { path, .. }
-                | DeleteTarget::Package { path, .. } => vec![path.clone()],
-                DeleteTarget::Batch => self.marked.iter().cloned().collect(),
-            };
+            let paths = std::mem::take(&mut self.pending_trash);
             if self.start_delete_with(target.clone(), paths, crate::fs_ops::delete_to_trash)
                 && matches!(target, DeleteTarget::Batch)
             {
@@ -3359,7 +3419,7 @@ impl App {
     fn start_delete_with(
         &mut self,
         target: DeleteTarget,
-        paths: Vec<PathBuf>,
+        paths: Vec<TrashTarget>,
         delete: fn(&Path) -> Result<()>,
     ) -> bool {
         if paths.is_empty() {
@@ -3384,10 +3444,10 @@ impl App {
         thread::spawn(move || {
             let mut deleted = Vec::new();
             let mut failures = Vec::new();
-            for path in paths {
-                match delete(&path) {
-                    Ok(()) => deleted.push(path),
-                    Err(err) => failures.push((path, err.to_string())),
+            for item in paths {
+                match item.move_with(delete) {
+                    Ok(()) => deleted.push(item.path),
+                    Err(err) => failures.push((item.path, err.to_string())),
                 }
             }
             let _ = tx.send(DeleteJobMsg {
@@ -5005,8 +5065,7 @@ impl App {
             String::new()
         };
         self.status = format!("Trash {} items{}? (y/n)", self.marked.len(), size_str);
-        self.confirming_delete = true;
-        self.pending_delete = Some(DeleteTarget::Batch);
+        self.arm_delete(DeleteTarget::Batch, None);
     }
 
     pub fn copy_path_to_clipboard(&mut self) {
@@ -5456,6 +5515,7 @@ pub fn trash_only_report(root: &Path, allocated: u64) -> reclaim::ReclaimReport 
             inaccessible: 0,
             skipped_mounts: 0,
             count: 1,
+            path_identities: Vec::new(),
             paths: vec![root.join(".Trash")],
             rollup: false,
         }],
@@ -5682,6 +5742,7 @@ mod tests {
                 manifest: String::from("Cargo.toml"),
                 dep_count: 0usize.into(),
                 deps_size: None,
+                deps_identity: None,
                 deps_dir: None,
                 coverage: Default::default(),
             }],
@@ -6079,6 +6140,26 @@ mod tests {
     }
 
     #[test]
+    fn trash_rejects_stale_rows_before_single_and_batch_confirmation() {
+        let root = test_root("changed_before_confirmation");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("selected");
+        fs::write(&path, b"first").unwrap();
+        let mut app = App::new(root.clone()).unwrap();
+        fs::rename(&path, root.join("original")).unwrap();
+        fs::write(&path, b"new").unwrap();
+        app.request_delete();
+        assert!(!app.confirming_delete);
+        assert!(app.status.contains("changed since scan"));
+        app.toggle_mark();
+        app.request_delete();
+        assert!(!app.confirming_delete);
+        assert!(app.status.contains("changed since scan"));
+        assert!(app.is_marked(&path));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn delete_request_is_pinned_to_original_entry() {
         let root = test_root("delete_modal");
         fs::create_dir_all(&root).unwrap();
@@ -6127,6 +6208,7 @@ mod tests {
                     inaccessible: 0,
                     skipped_mounts: 0,
                     count: 1,
+                    path_identities: Vec::new(),
                     paths: vec![root.join("first-path")],
                     rollup: false,
                 },
@@ -6138,6 +6220,7 @@ mod tests {
                     inaccessible: 0,
                     skipped_mounts: 0,
                     count: 1,
+                    path_identities: Vec::new(),
                     paths: vec![root.join("second-path")],
                     rollup: false,
                 },
@@ -6334,7 +6417,11 @@ mod tests {
         fs::write(&path, b"item").unwrap();
         let mut app = App::new(root.clone()).unwrap();
         app.size_cache.insert(path.clone(), SizeInfo::new(4, 4096));
-        assert!(app.start_delete_with(DeleteTarget::Batch, vec![path.clone()], simulated_trash));
+        assert!(app.start_delete_with(
+            DeleteTarget::Batch,
+            vec![TrashTarget::capture(&path, bulkstat::path_identity(&path)).unwrap()],
+            simulated_trash
+        ));
         let (uninstall_tx, uninstall_rx) = channel();
         app.uninstall_rx = Some(uninstall_rx);
         app.begin_shutdown();
@@ -6457,6 +6544,7 @@ mod tests {
                     inaccessible: 0,
                     skipped_mounts: 0,
                     count: 1,
+                    path_identities: Vec::new(),
                     paths: vec![root.join(format!("reclaim-{idx}"))],
                     rollup: false,
                 })
@@ -6519,7 +6607,7 @@ mod tests {
     #[test]
     fn delete_request_applies_to_package_deps() {
         let root = test_root("delete_pkg_deps");
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
 
         let mut app = App::new(root.clone()).unwrap();
         app.project_deps = vec![ProjectDeps {
@@ -6528,6 +6616,7 @@ mod tests {
             manifest: String::from("Cargo.toml"),
             dep_count: 5usize.into(),
             deps_size: None,
+            deps_identity: bulkstat::path_identity(&root.join("target")),
             deps_dir: Some(root.join("target")),
             coverage: Default::default(),
         }];
@@ -6957,6 +7046,7 @@ mod tests {
                 manifest: String::from("Cargo.toml"),
                 dep_count: 4usize.into(),
                 deps_size: Some(SizeInfo::new(100, 100)),
+                deps_identity: None,
                 deps_dir: Some(root.join("target")),
                 coverage: Default::default(),
             },
@@ -6966,6 +7056,7 @@ mod tests {
                 manifest: String::from("package.json"),
                 dep_count: 8usize.into(),
                 deps_size: Some(SizeInfo::new(200, 200)),
+                deps_identity: None,
                 deps_dir: Some(root.join("node_modules")),
                 coverage: Default::default(),
             },
@@ -7483,6 +7574,7 @@ mod tests {
                 manifest: String::from("Cargo.toml"),
                 dep_count: 1usize.into(),
                 deps_size: None,
+                deps_identity: None,
                 deps_dir: Some(root_a.join("target")),
                 coverage: Default::default(),
             }],
@@ -8488,6 +8580,7 @@ mod tests {
         let mut app = App::new(root.clone()).unwrap();
         app.entries = vec![
             Entry {
+                identity: None,
                 name: String::from("dir_a"),
                 name_lower: String::from("dir_a"),
                 path: dir_a.clone(),
@@ -8503,6 +8596,7 @@ mod tests {
                 size_delta: None,
             },
             Entry {
+                identity: None,
                 name: String::from("dir_b"),
                 name_lower: String::from("dir_b"),
                 path: dir_b.clone(),
@@ -8518,6 +8612,7 @@ mod tests {
                 size_delta: None,
             },
             Entry {
+                identity: None,
                 name: String::from("todo.py"),
                 name_lower: String::from("todo.py"),
                 path: todo.clone(),
@@ -8709,6 +8804,7 @@ mod tests {
             manifest: String::from("Cargo.toml"),
             dep_count: 3usize.into(),
             deps_size: None,
+            deps_identity: None,
             deps_dir: None,
             coverage: Default::default(),
         }];
@@ -8749,6 +8845,7 @@ mod tests {
                 manifest: String::from("Cargo.toml"),
                 dep_count: 3usize.into(),
                 deps_size: None,
+                deps_identity: None,
                 deps_dir: Some(root.join("target")),
                 coverage: Default::default(),
             },
@@ -8758,6 +8855,7 @@ mod tests {
                 manifest: String::from("package.json"),
                 dep_count: 10usize.into(),
                 deps_size: None,
+                deps_identity: None,
                 deps_dir: Some(root.join("node_modules")),
                 coverage: Default::default(),
             },
@@ -8809,6 +8907,7 @@ mod tests {
             manifest: String::from("Cargo.toml"),
             dep_count: 2usize.into(),
             deps_size: None,
+            deps_identity: None,
             deps_dir: None,
             coverage: Default::default(),
         }];

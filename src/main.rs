@@ -201,8 +201,7 @@ fn run_main() -> Result<()> {
                     warnings,
                 )
             } else {
-                cli_println!("{}", serde_json::to_string_pretty(&value)?);
-                Ok(())
+                print_json_line(&serde_json::to_string_pretty(&value)?)
             }
         }
         CliAction::ThinSnapshots {
@@ -843,7 +842,13 @@ fn emit_report(
     value["filters"] = serde_json::json!({"min_allocated_bytes": options.min_bytes, "class": options.class.map(|class| class.label())});
     value["scope"]["totals"] =
         serde_json::json!("unfiltered requested scope; filters affect rows only");
-    cli_println!("{}", serde_json::to_string_pretty(&value)?);
+    print_json_line(&serde_json::to_string_pretty(&value)?)
+}
+
+fn print_json_line(json: &str) -> Result<()> {
+    CLI_OUTPUT.with(|output| {
+        terminal_text::write_json_line(&mut *output.borrow_mut(), json, io::stdout().is_terminal())
+    })?;
     Ok(())
 }
 
@@ -1310,37 +1315,7 @@ fn print_space(path: PathBuf, json: bool) -> Result<()> {
     let complete = warnings.is_empty();
     note_report_completeness(complete);
     if json {
-        let snapshots: Vec<_> = report
-            .local_snapshots
-            .names
-            .iter()
-            .map(|name| serde_json::json!({ "name": name }))
-            .collect();
-        let apfs_container = report.apfs_container.as_ref().map(|container| {
-            serde_json::json!({
-                "reference": container.reference,
-                "size": container.size,
-                "free": container.free,
-            })
-        });
-        let value = serde_json::json!({
-            "path": report.path.to_string_lossy(),
-            "mount": report.mount.to_string_lossy(),
-            "device": report.device,
-            "filesystem": report.fs_type,
-            "total": report.total,
-            "used": report.used,
-            "free": report.free,
-            "available": report.available,
-            "free_not_user_available": report.unavailable_free(),
-            "apfs_container": apfs_container,
-            "apfs_error": report.apfs_error.as_ref().map(ToString::to_string),
-            "apfs_diagnostic": report.apfs_error.as_ref().map(|error| error.json()),
-            "local_snapshots": snapshots,
-            "local_snapshot_error": report.local_snapshots.error,
-            "scope": {"policy": "owning volume statfs, APFS and snapshot utility queries", "mount": report.mount.to_string_lossy()},
-            "coverage": {"utility_failures": warnings.len()},
-        });
+        let value = report.json(warnings.len());
         return emit_report("space", &path, value, complete, warnings);
     }
 
@@ -1560,7 +1535,8 @@ fn print_packages(path: PathBuf, json: bool, scope: packages::InventoryScope) ->
     }
 
     cli_println!("Package report");
-    cli_println!("Inventory scope: {}", scope.json());
+    cli_print!("Inventory scope: ");
+    print_json_line(&scope.json().to_string())?;
     print_filter_notice()?;
     cli_println!();
 
@@ -3141,6 +3117,7 @@ mod tests {
             manifest: String::from("Cargo.toml"),
             dep_count: 3usize.into(),
             deps_size: None,
+            deps_identity: None,
             deps_dir: Some(root.join("target")),
             coverage: Default::default(),
         }];

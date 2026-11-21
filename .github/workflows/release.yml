@@ -1,12 +1,12 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_run:
+    workflows: ["Release tag"]
+    types: [completed]
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 permissions:
@@ -16,7 +16,64 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  authorize:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.tag.outputs.sha }}
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      signing: ${{ steps.tag.outputs.signing }}
+    steps:
+      - name: Check release request identity
+        env:
+          REQUEST: ${{ toJSON(github.event.workflow_run) }}
+          OWNER_ID: ${{ github.repository_owner_id }}
+          REPO_ID: ${{ github.repository_id }}
+          RERUN_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          jq -e --arg repo "$REPO_ID" --arg owner "$OWNER_ID" '
+            .event == "push" and .conclusion == "success"
+            and .path == ".github/workflows/release-tag.yml"
+            and (.head_repository.id | tostring) == $repo
+            and (.actor.id | tostring) == $owner
+            and (.triggering_actor.id | tostring) == $owner
+          ' <<< "$REQUEST" >/dev/null
+          [[ "$GITHUB_REF" == refs/heads/main ]] || exit 1
+          if [[ "$GITHUB_RUN_ATTEMPT" != 1 ]]; then [[ "$RERUN_ACTOR" == "$GITHUB_REPOSITORY_OWNER" ]] || exit 1; fi
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release tag and crate version without running tagged code
+        id: tag
+        env:
+          TAG: ${{ github.event.workflow_run.head_branch }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          SIGNING: ${{ vars.MACOS_SIGNING_ENABLED || 'false' }}
+          UNSIGNED_TAG: ${{ vars.MACOS_UNSIGNED_RELEASE_TAG }}
+        run: |
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$(git rev-parse --verify "refs/tags/${TAG}^{commit}")" == "$SHA" ]] || exit 1
+          git merge-base --is-ancestor "$SHA" "$GITHUB_SHA"
+          git show "$SHA:Cargo.toml" > "$RUNNER_TEMP/manifest.toml"
+          python3 - <<'PYTHON'
+          import os, tomllib
+          from pathlib import Path
+          package = tomllib.loads((Path(os.environ["RUNNER_TEMP"]) / "manifest.toml").read_text())["package"]
+          if package["name"] != "diskr" or "v" + package["version"] != os.environ["TAG"]:
+              raise SystemExit("tag must match the diskr crate version")
+          PYTHON
+          case "$SIGNING" in true|false) ;; *) echo "invalid signing configuration" >&2; exit 1 ;; esac
+          if [[ "$TAG" == "$UNSIGNED_TAG" ]]; then
+            echo "Applying configured unsigned release exception for $TAG"
+            SIGNING=false
+          fi
+          printf 'sha=%s\ntag=%s\nversion=%s\nsigning=%s\n' "$SHA" "$TAG" "${TAG#v}" "$SIGNING" >> "$GITHUB_OUTPUT"
+
   binaries:
+    needs: authorize
     strategy:
       fail-fast: false
       matrix:
@@ -28,30 +85,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
-      MACOS_SIGNING_ENABLED: ${{ vars.MACOS_SIGNING_ENABLED || 'false' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Validate distribution tooling and signing configuration
-        env:
-          MACOS_DEVELOPER_ID_P12: ${{ secrets.MACOS_DEVELOPER_ID_P12 }}
-          MACOS_DEVELOPER_ID_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_PASSWORD }}
-          MACOS_DEVELOPER_ID_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_IDENTITY }}
-          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+          persist-credentials: false
+      - name: Validate distribution tooling
         run: |
-          case "$MACOS_SIGNING_ENABLED" in
-            true)
-              for name in MACOS_DEVELOPER_ID_P12 MACOS_DEVELOPER_ID_PASSWORD MACOS_DEVELOPER_ID_IDENTITY APPLE_NOTARY_KEY_P8 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
-                if [ -z "${!name}" ]; then
-                  echo "$name is required when MACOS_SIGNING_ENABLED is true" >&2
-                  exit 1
-                fi
-              done
-              ;;
-            false) ;;
-            *) echo "MACOS_SIGNING_ENABLED must be true or false" >&2; exit 1 ;;
-          esac
           python3 -m unittest discover -s scripts/distribution -p 'test_*.py'
           sh -n scripts/install.sh
           sh -n scripts/distribution/sign.sh
@@ -90,51 +130,30 @@ jobs:
               index.append({"package": package["name"], "version": package["version"], "license": package["license"], "repository": package["repository"], "notice_files": [entry.name for entry in files]})
           (destination / "index.json").write_text(json.dumps(index, indent=2) + "\n")
           PY
-      - name: Sign and notarize the distribution
-        if: env.MACOS_SIGNING_ENABLED == 'true'
-        env:
-          TARGET: ${{ matrix.target }}
-          MACOS_DEVELOPER_ID_P12: ${{ secrets.MACOS_DEVELOPER_ID_P12 }}
-          MACOS_DEVELOPER_ID_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_PASSWORD }}
-          MACOS_DEVELOPER_ID_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_IDENTITY }}
-          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: |
-          sh scripts/distribution/sign.sh --binary-dir "$RUNNER_TEMP/binary" \
-            --target "$TARGET" --output-dir "$RUNNER_TEMP"
-      - name: Package the verified executable
+      - name: Archive the verified executable
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          "$RUNNER_TEMP/binary/diskr" --version
-          tar -czf "$RUNNER_TEMP/diskr-$TARGET.tar.gz" -C "$RUNNER_TEMP/binary" diskr LICENSE licenses
           cd "$RUNNER_TEMP"
+          tar -czf "diskr-$TARGET.tar.gz" -C binary diskr LICENSE licenses
           shasum -a 256 "diskr-$TARGET.tar.gz" > "$TARGET.sha256"
-          if [ "$MACOS_SIGNING_ENABLED" = true ]; then
-            shasum -a 256 "diskr-$TARGET.dmg" >> "$TARGET.sha256"
-          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: diskr-${{ matrix.target }}
+          name: unsigned-${{ matrix.target }}
           path: |
             ${{ runner.temp }}/diskr-${{ matrix.target }}.tar.gz
-            ${{ runner.temp }}/diskr-${{ matrix.target }}.dmg
             ${{ runner.temp }}/${{ matrix.target }}.sha256
           if-no-files-found: error
           retention-days: 7
 
-  publish:
-    needs: binaries
+  validate:
+    needs: authorize
     runs-on: macos-26
-    permissions:
-      contents: write
-
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          fetch-depth: 0
-
+          ref: ${{ needs.authorize.outputs.sha }}
+          persist-credentials: false
       - name: Verify private maintenance docs stay untracked
         run: |
           for path in AGENTS.md CLAUDE.md docs/AUDIT.md docs/ISSUES.md; do
@@ -158,59 +177,95 @@ jobs:
 
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
-      - name: Read crate metadata
-        id: meta
-        run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          import subprocess
-
-          metadata = json.loads(
-              subprocess.check_output(
-                  ["cargo", "metadata", "--no-deps", "--format-version", "1"],
-                  text=True,
-              )
-          )
-          package = metadata["packages"][0]
-          print(f"name={package['name']}")
-          print(f"version={package['version']}")
-          PY
-
-      - name: Verify tag matches crate version
-        env:
-          CRATE_VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          if [ "$tag_version" != "$CRATE_VERSION" ]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $CRATE_VERSION" >&2
-            exit 1
-          fi
-
-      - name: Verify release tag points to main
-        run: |
-          git fetch origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "release tags must point to a commit reachable from origin/main" >&2
-            exit 1
-          fi
-
       - run: cargo fmt -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
       - run: cargo package --locked
       - run: cargo publish --dry-run --locked
 
+  sign:
+    needs: [authorize, binaries, validate]
+    if: needs.authorize.outputs.signing == 'true'
+    environment: release-signing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/distribution
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: unsigned-${{ matrix.target }}
+          path: ${{ runner.temp }}
+      - name: Unpack verified binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd "$RUNNER_TEMP"
+          shasum -a 256 -c "$TARGET.sha256"
+          mkdir binary
+          tar -xzf "diskr-$TARGET.tar.gz" -C binary
+      - name: Sign and notarize the distribution
+        env:
+          TARGET: ${{ matrix.target }}
+          MACOS_DEVELOPER_ID_P12: ${{ secrets.MACOS_DEVELOPER_ID_P12 }}
+          MACOS_DEVELOPER_ID_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_PASSWORD }}
+          MACOS_DEVELOPER_ID_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_IDENTITY }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          sh scripts/distribution/sign.sh --binary-dir "$RUNNER_TEMP/binary" \
+            --target "$TARGET" --output-dir "$RUNNER_TEMP"
+      - name: Archive signed binary and checksum the disk image
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd "$RUNNER_TEMP"
+          tar -czf "diskr-$TARGET.tar.gz" -C binary diskr LICENSE licenses
+          shasum -a 256 "diskr-$TARGET.tar.gz" "diskr-$TARGET.dmg" > "$TARGET.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/diskr-${{ matrix.target }}.tar.gz
+            ${{ runner.temp }}/diskr-${{ matrix.target }}.dmg
+            ${{ runner.temp }}/${{ matrix.target }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  assets:
+    needs: [authorize, binaries, validate, sign]
+    if: >-
+      !cancelled() && needs.authorize.result == 'success' && needs.binaries.result == 'success'
+      && needs.validate.result == 'success' && (needs.sign.result == 'success'
+      || (needs.authorize.outputs.signing == 'false' && needs.sign.result == 'skipped'))
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+          persist-credentials: false
       - name: Download release binaries
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: diskr-*
+          pattern: ${{ needs.authorize.outputs.signing == 'true' && 'signed-*' || 'unsigned-*' }}
           merge-multiple: true
           path: ${{ runner.temp }}/release-assets
 
       - name: Prepare verified installation assets
         env:
-          CRATE_VERSION: ${{ steps.meta.outputs.version }}
-          MACOS_SIGNING_ENABLED: ${{ vars.MACOS_SIGNING_ENABLED || 'false' }}
+          CRATE_VERSION: ${{ needs.authorize.outputs.version }}
+          MACOS_SIGNING_ENABLED: ${{ needs.authorize.outputs.signing }}
         run: |
           args=()
           if [ "$MACOS_SIGNING_ENABLED" = true ]; then args+=(--signed); fi
@@ -221,11 +276,31 @@ jobs:
           sh -n install-diskr.sh
           ruby -c diskr.rb
 
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-crate:
+    needs: [authorize, assets]
+    if: "!cancelled() && needs.assets.result == 'success'"
+    runs-on: macos-26
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+          persist-credentials: false
       - name: Check crates.io for existing version
         id: crates
         env:
-          CRATE_NAME: ${{ steps.meta.outputs.name }}
-          CRATE_VERSION: ${{ steps.meta.outputs.version }}
+          CRATE_NAME: diskr
+          CRATE_VERSION: ${{ needs.authorize.outputs.version }}
         run: |
           status_code="$(
             curl -s -o /dev/null -w "%{http_code}" \
@@ -242,22 +317,26 @@ jobs:
             exit 1
           fi
 
-      - name: Publish to crates.io
+      - name: Select registry authentication
+        if: steps.crates.outputs.already_published != 'true'
+        id: registry
+        env:
+          HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+        run: echo "has_token=$HAS_TOKEN" >> "$GITHUB_OUTPUT"
+      - name: Authenticate to crates.io
+        if: steps.crates.outputs.already_published != 'true' && steps.registry.outputs.has_token != 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+      - name: Publish the validated source to crates.io
         if: steps.crates.outputs.already_published != 'true'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "CARGO_REGISTRY_TOKEN secret is not configured" >&2
-            exit 1
-          fi
-          cargo publish --locked
-
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked --no-verify
       - name: Download published crate
         id: published
         env:
-          CRATE_NAME: ${{ steps.meta.outputs.name }}
-          CRATE_VERSION: ${{ steps.meta.outputs.version }}
+          CRATE_NAME: diskr
+          CRATE_VERSION: ${{ needs.authorize.outputs.version }}
         run: |
           crate_archive="$RUNNER_TEMP/${CRATE_NAME}-${CRATE_VERSION}.crate"
           for attempt in $(seq 1 12); do
@@ -278,7 +357,7 @@ jobs:
 
       - name: Verify published crate provenance
         env:
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ needs.authorize.outputs.sha }}
           CRATE_ARCHIVE: ${{ steps.published.outputs.crate_archive }}
         run: |
           python - <<'PY'
@@ -306,10 +385,27 @@ jobs:
               )
           PY
 
+  publish:
+    needs: [authorize, publish-crate]
+    if: "!cancelled() && needs.publish-crate.result == 'success'"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release-assets
       - name: Publish release notes and verified binaries
         env:
           GH_TOKEN: ${{ github.token }}
-          CRATE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_TAG: ${{ needs.authorize.outputs.tag }}
+          RELEASE_SHA: ${{ needs.authorize.outputs.sha }}
+          CRATE_VERSION: ${{ needs.authorize.outputs.version }}
         run: |
           python3 - <<'PY'
           import os, re
@@ -333,18 +429,20 @@ jobs:
           if [ -f diskr-aarch64-apple-darwin.dmg ]; then
             assets+=(diskr-aarch64-apple-darwin.dmg diskr-x86_64-apple-darwin.dmg)
           fi
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release already exists; refusing to overwrite published assets" >&2
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" \
+          test "$(git ls-remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" | tail -1 | cut -f1)" = "$RELEASE_SHA"
+          gh release create "$RELEASE_TAG" --verify-tag \
             --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
+            --title "$RELEASE_TAG" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             "${assets[@]}"
 
   refresh-site:
     needs: publish
+    if: "!cancelled() && needs.publish.result == 'success'"
     runs-on: ubuntu-24.04
     permissions:
       actions: write

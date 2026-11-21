@@ -1,7 +1,15 @@
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::fmt;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use crate::bulkstat::ScanCancellation;
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
@@ -42,7 +50,13 @@ struct Declarations {
 
 impl Declarations {
     fn warn(&mut self, warning: impl Into<String>) {
-        self.warnings.push(warning.into());
+        match self.warnings.len() {
+            0..64 => self.warnings.push(warning.into()),
+            64 => self
+                .warnings
+                .push(String::from("additional manifest warnings omitted")),
+            _ => {}
+        }
     }
 
     fn python_name(&mut self, requirement: &str) {
@@ -73,8 +87,61 @@ impl Declarations {
     }
 }
 
+fn require_regular(file: File) -> io::Result<File> {
+    if file.metadata()?.is_file() {
+        Ok(file)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a regular file",
+        ))
+    }
+}
+
+pub(crate) fn open_scan_root(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)
+        .open(path)
+}
+
+pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
+    require_regular(
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY)
+            .open(path)?,
+    )
+}
+
+// Resolve the entire relative name under a held directory without traversing
+// symlinks, including intermediate components. macOS supports O_NOFOLLOW_ANY.
+fn open_beneath(dir: &File, path: &Path, flags: i32) -> io::Result<File> {
+    if path
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path outside project",
+        ));
+    }
+    let name = CString::new(path.as_os_str().as_bytes())?;
+    let flags = flags
+        | libc::O_RDONLY
+        | libc::O_NOFOLLOW_ANY
+        | libc::O_NONBLOCK
+        | libc::O_NOCTTY
+        | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 pub(crate) fn bounded_text(path: &Path) -> Result<String, String> {
-    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let file = open_regular(path).map_err(|error| error.to_string())?;
     let mut text = String::new();
     file.take(MAX_MANIFEST_BYTES + 1)
         .read_to_string(&mut text)
@@ -85,15 +152,95 @@ pub(crate) fn bounded_text(path: &Path) -> Result<String, String> {
     Ok(text)
 }
 
-pub fn count(dir: &Path, manifests: &[&str]) -> DependencyCount {
+struct ManifestReader<'a> {
+    root: File,
+    cancellation: &'a ScanCancellation,
+    deadline: Instant,
+    remaining_bytes: usize,
+    requirements_files: usize,
+}
+
+impl ManifestReader<'_> {
+    fn check(&self) -> Result<(), &'static str> {
+        if self.cancellation.is_cancelled() {
+            Err("manifest scan cancelled")
+        } else if Instant::now() >= self.deadline {
+            Err("manifest scan deadline reached")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read(&mut self, path: &Path) -> Result<String, String> {
+        self.check()?;
+        if self.remaining_bytes == 0 {
+            return Err(String::from("combined manifest byte limit reached"));
+        }
+        let mut file = open_beneath(&self.root, path, 0)
+            .and_then(require_regular)
+            .map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 16 * 1024];
+        loop {
+            self.check()?;
+            let n = file.read(&mut buffer).map_err(|error| error.to_string())?;
+            if n == 0 {
+                break;
+            }
+            if n > self.remaining_bytes {
+                self.remaining_bytes = 0;
+                return Err(String::from("combined manifest byte limit reached"));
+            }
+            self.remaining_bytes -= n;
+            if bytes.len() + n > MAX_MANIFEST_BYTES as usize {
+                return Err(String::from("file exceeds 1 MiB parser limit"));
+            }
+            bytes.extend_from_slice(&buffer[..n]);
+        }
+        String::from_utf8(bytes).map_err(|error| error.to_string())
+    }
+}
+
+pub fn count(
+    scan_root: &io::Result<File>,
+    project: &Path,
+    manifests: &[&str],
+    cancellation: &ScanCancellation,
+) -> DependencyCount {
+    let project = if project.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        project
+    };
+    let root = match scan_root
+        .as_ref()
+        .map_err(|err| io::Error::from(err.kind()))
+        .and_then(|root| open_beneath(root, project, libc::O_DIRECTORY))
+    {
+        Ok(root) => root,
+        Err(err) => {
+            return DependencyCount {
+                known: 0,
+                complete: false,
+                warnings: vec![format!("project directory unavailable: {err}")],
+            }
+        }
+    };
+    let mut reader = ManifestReader {
+        root,
+        cancellation,
+        deadline: Instant::now() + Duration::from_secs(5),
+        remaining_bytes: 4 * MAX_MANIFEST_BYTES as usize,
+        requirements_files: 0,
+    };
     let mut declarations = Declarations::default();
     for manifest in manifests {
-        let path = dir.join(manifest);
+        let path = Path::new(manifest);
         if *manifest == "requirements.txt" {
-            requirements_file(&path, &mut HashSet::new(), &mut 0, 0, &mut declarations);
+            requirements_file(path, &mut reader, &mut HashSet::new(), &mut declarations);
             continue;
         }
-        let content = match bounded_text(&path) {
+        let content = match reader.read(path) {
             Ok(content) => content,
             Err(error) => {
                 declarations.warn(format!("{manifest}: {error}"));
@@ -334,33 +481,48 @@ fn python_dependencies(content: &str, declarations: &mut Declarations) {
     }
 }
 
+fn included_path(parent: &Path, include: &str) -> Option<PathBuf> {
+    let mut path = parent.to_path_buf();
+    for component in Path::new(include).components() {
+        match component {
+            Component::Normal(part) => path.push(part),
+            Component::CurDir => {}
+            Component::ParentDir if path.pop() => {}
+            _ => return None,
+        }
+    }
+    Some(path)
+}
+
 fn requirements_file(
     path: &Path,
+    reader: &mut ManifestReader<'_>,
     visiting: &mut HashSet<PathBuf>,
-    files: &mut usize,
-    depth: usize,
     declarations: &mut Declarations,
 ) {
-    if depth > 8 || *files >= 128 {
+    if visiting.len() > 8 || reader.requirements_files >= 128 {
         declarations.warn("requirements include limit reached");
         return;
     }
-    let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !visiting.insert(identity.clone()) {
+    if !visiting.insert(path.to_path_buf()) {
         declarations.warn("cyclic requirements include");
         return;
     }
-    *files += 1;
-    let content = match bounded_text(path) {
+    reader.requirements_files += 1;
+    let content = match reader.read(path) {
         Ok(content) => content,
         Err(error) => {
             declarations.warn(format!("requirements file unavailable: {error}"));
-            visiting.remove(&identity);
+            visiting.remove(path);
             return;
         }
     };
     let mut logical = String::new();
     for raw in content.lines() {
+        if let Err(error) = reader.check() {
+            declarations.warn(error);
+            break;
+        }
         let raw = raw.trim();
         if raw.starts_with('#') || raw.is_empty() {
             continue;
@@ -384,14 +546,12 @@ fn requirements_file(
             let include = include.trim().trim_matches(['\'', '"']);
             if include.is_empty() || include.contains("://") || include.contains('$') {
                 declarations.warn("unsupported requirements include path");
+            } else if let Some(include) =
+                included_path(path.parent().unwrap_or(Path::new("")), include)
+            {
+                requirements_file(&include, reader, visiting, declarations);
             } else {
-                requirements_file(
-                    &path.parent().unwrap_or(Path::new(".")).join(include),
-                    visiting,
-                    files,
-                    depth + 1,
-                    declarations,
-                );
+                declarations.warn("requirements include outside project");
             }
         } else if line.starts_with("-c")
             || line.starts_with("--constraint")
@@ -427,7 +587,7 @@ fn requirements_file(
     if !logical.is_empty() {
         declarations.warn("unterminated requirements continuation");
     }
-    visiting.remove(&identity);
+    visiting.remove(path);
 }
 
 fn go_dependencies(content: &str, declarations: &mut Declarations) {
@@ -508,7 +668,12 @@ mod tests {
         }
 
         fn count(&self, names: &[&str]) -> DependencyCount {
-            count(&self.0, names)
+            count(
+                &open_scan_root(&self.0),
+                Path::new("."),
+                names,
+                &ScanCancellation::never(),
+            )
         }
     }
 
@@ -612,6 +777,89 @@ requires = ["setuptools>=61"]
             .warnings
             .iter()
             .any(|warning| warning.contains("cyclic")));
+    }
+
+    #[test]
+    fn includes_stay_within_the_open_project_directory() {
+        let fixture = Fixture::new();
+        let other = Fixture::new();
+        other.write("deps.txt", "outside\n");
+        std::fs::create_dir(fixture.0.join("sub")).unwrap();
+        fixture.write("common.txt", "inside\n");
+        fixture.write("sub/nested.txt", "-r ../common.txt\n");
+        std::os::unix::fs::symlink(&other.0, fixture.0.join("linked")).unwrap();
+        std::os::unix::fs::symlink(other.0.join("deps.txt"), fixture.0.join("leaf")).unwrap();
+        for include in [
+            "../deps.txt",
+            other.0.join("deps.txt").to_str().unwrap(),
+            "linked/deps.txt",
+            "leaf",
+        ] {
+            fixture.write(
+                "requirements.txt",
+                &format!("-r sub/nested.txt\n-r {include}\n"),
+            );
+            let result = fixture.count(&["requirements.txt"]);
+            assert_eq!(result.known, 1);
+            assert!(!result.complete, "{include}");
+        }
+    }
+
+    #[test]
+    fn nonregular_requirements_are_skipped_without_waiting_for_a_writer() {
+        let fixture = Fixture::new();
+        let path = CString::new(fixture.0.join("pipe").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        fixture.write("requirements.txt", "known\n-r pipe\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(fixture.count(&["requirements.txt"])).ok();
+        });
+        let count = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(count.known, 1);
+        assert!(count.warnings.iter().any(|w| w.contains("regular file")));
+    }
+
+    #[test]
+    fn requirements_share_byte_deadline_and_cancellation_limits_across_includes() {
+        let fixture = Fixture::new();
+        let body = "first\n-r second.txt\n";
+        fixture.write("requirements.txt", body);
+        fixture.write("second.txt", "second\n");
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancellation = ScanCancellation::new(generation.clone(), 0);
+        let mut reader = ManifestReader {
+            root: open_scan_root(&fixture.0).unwrap(),
+            cancellation: &cancellation,
+            deadline: Instant::now() + Duration::from_secs(5),
+            remaining_bytes: body.len(),
+            requirements_files: 0,
+        };
+        let mut declarations = Declarations::default();
+        requirements_file(
+            Path::new("requirements.txt"),
+            &mut reader,
+            &mut HashSet::new(),
+            &mut declarations,
+        );
+        assert_eq!(declarations.names, HashSet::from([String::from("first")]));
+        assert!(declarations
+            .warnings
+            .iter()
+            .any(|w| w.contains("byte limit")));
+        reader.deadline = Instant::now();
+        assert!(reader
+            .read(Path::new("second.txt"))
+            .unwrap_err()
+            .contains("deadline"));
+        generation.store(1, std::sync::atomic::Ordering::Relaxed);
+        let count = count(
+            &open_scan_root(&fixture.0),
+            Path::new("."),
+            &["requirements.txt"],
+            &cancellation,
+        );
+        assert!(count.warnings.iter().any(|w| w.contains("cancelled")));
     }
 
     #[test]

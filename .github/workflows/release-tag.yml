@@ -1,0 +1,14 @@
+name: Release tag
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  request:
+    if: github.event.created && !github.event.deleted
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Release tag received"

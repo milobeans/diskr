@@ -48,6 +48,19 @@ All notable changes to diskr are documented here. The format follows
 
 ### Fixed
 
+- Package inventory resolves tools from trusted installation directories, reports
+  rejected managers, and keeps the selected environment for uninstall. System
+  utilities use fixed macOS paths.
+- Trash actions verify that the selected item and its location still match the
+  confirmed target. A changed target requires a fresh selection.
+- Saved directory history has bounded reads and writes, including recovery
+  from oversized legacy state.
+- Terminal JSON reports escape C1 control characters while preserving the
+  original values for JSON consumers.
+- Package scans bound pip metadata and requirements-file reads, reject unsafe
+  includes and special files, and report incomplete dependency information.
+- Release builds verify the tag, source commit and release actor before signing
+  or publishing. Signing uses a protected deployment environment.
 - CI reports Rust dependency advisories in the job log with read-only access.
   The lockfile now uses rustix 1.1.6, which fixes an extended-attribute handling bug.
 - Renames atomically refuse existing destinations, including dangling symlinks

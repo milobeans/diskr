@@ -80,6 +80,7 @@ impl SizeInfo {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LargeFile {
+    pub identity: Option<FileIdentity>,
     pub path: PathBuf,
     pub size: SizeInfo,
 }
@@ -769,7 +770,18 @@ impl ScanScope {
     }
 }
 
-type FileIdentity = (u64, u64);
+pub(crate) type FileIdentity = (u64, u64);
+
+pub(crate) fn metadata_identity(meta: &std::fs::Metadata) -> FileIdentity {
+    (meta.dev(), meta.ino())
+}
+
+pub(crate) fn path_identity(path: &Path) -> Option<FileIdentity> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .as_ref()
+        .map(metadata_identity)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ScanPolicy {
@@ -1185,6 +1197,7 @@ fn parse_bulk_batch(
                         &mut partial.largest_files,
                         top_file_limit,
                         size,
+                        devid.zip(fileid),
                         || dir.join(OsStr::from_bytes(name_bytes)),
                     );
                 }
@@ -1274,7 +1287,13 @@ fn scan_open_dir_fallback(
             }
             partial.size.add_file(size);
             if top_file_limit > 0 {
-                push_largest_file(&mut partial.largest_files, top_file_limit, path, size);
+                push_largest_file(
+                    &mut partial.largest_files,
+                    top_file_limit,
+                    path,
+                    size,
+                    Some(metadata_identity(&metadata)),
+                );
             }
         } else if metadata.is_dir() {
             if should_skip_subdir(&path, Some(metadata.dev()), &context.policy) {
@@ -1336,6 +1355,7 @@ struct FileCandidate {
     allocated: u64,
     logical: u64,
     path: PathBuf,
+    identity: Option<FileIdentity>,
 }
 
 fn candidate_may_enter(
@@ -1354,10 +1374,11 @@ fn push_largest_file_lazy(
     heap: &mut BinaryHeap<Reverse<FileCandidate>>,
     limit: usize,
     size: SizeInfo,
+    identity: Option<FileIdentity>,
     path: impl FnOnce() -> PathBuf,
 ) {
     if candidate_may_enter(heap, limit, size) {
-        push_largest_file(heap, limit, path(), size);
+        push_largest_file(heap, limit, path(), size, identity);
     }
 }
 
@@ -1366,6 +1387,7 @@ fn push_largest_file(
     limit: usize,
     path: PathBuf,
     size: SizeInfo,
+    identity: Option<FileIdentity>,
 ) {
     if limit == 0 {
         return;
@@ -1378,6 +1400,7 @@ fn push_largest_file(
             allocated: size.allocated,
             logical: size.logical,
             path,
+            identity,
         },
     );
 }
@@ -1408,6 +1431,7 @@ fn sorted_largest_files(heap: BinaryHeap<Reverse<FileCandidate>>) -> Vec<LargeFi
         .into_iter()
         .map(|Reverse(file)| LargeFile {
             path: file.path,
+            identity: file.identity,
             size: SizeInfo::new(file.logical, file.allocated),
         })
         .collect();
@@ -1711,14 +1735,20 @@ mod tests {
             let mut times = Vec::new();
             for _ in 0..12 {
                 let mut heap = BinaryHeap::new();
-                push_largest_file(&mut heap, 1, root.join("largest"), SizeInfo::new(100, 8192));
+                push_largest_file(
+                    &mut heap,
+                    1,
+                    root.join("largest"),
+                    SizeInfo::new(100, 8192),
+                    None,
+                );
                 let started = Instant::now();
                 for _ in 0..200_000 {
                     let size = std::hint::black_box(SizeInfo::new(1, 4096));
                     if lazy {
-                        push_largest_file_lazy(&mut heap, 1, size, || parent.join("file"));
+                        push_largest_file_lazy(&mut heap, 1, size, None, || parent.join("file"));
                     } else {
-                        push_largest_file(&mut heap, 1, parent.join("file"), size);
+                        push_largest_file(&mut heap, 1, parent.join("file"), size, None);
                     }
                 }
                 times.push(started.elapsed());
@@ -1975,6 +2005,7 @@ mod tests {
             1,
             PathBuf::from("first"),
             SizeInfo::new(12, 4096),
+            None,
         );
         assert!(!candidate_may_enter(&heap, 1, SizeInfo::new(8, 4096)));
         assert!(!candidate_may_enter(&heap, 1, SizeInfo::new(100, 0)));
@@ -1983,13 +2014,13 @@ mod tests {
         assert!(!candidate_may_enter(&heap, 0, SizeInfo::new(8, 8192)));
         let builds = std::cell::Cell::new(0);
         for _ in 0..10_000 {
-            push_largest_file_lazy(&mut heap, 1, SizeInfo::new(8, 4096), || {
+            push_largest_file_lazy(&mut heap, 1, SizeInfo::new(8, 4096), None, || {
                 builds.set(builds.get() + 1);
                 PathBuf::from("rejected")
             });
         }
         assert_eq!(builds.get(), 0);
-        push_largest_file_lazy(&mut heap, 1, SizeInfo::new(12, 4096), || {
+        push_largest_file_lazy(&mut heap, 1, SizeInfo::new(12, 4096), None, || {
             builds.set(builds.get() + 1);
             PathBuf::from("path tie")
         });

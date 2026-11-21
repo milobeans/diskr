@@ -7,7 +7,11 @@
 //! touching the filesystem.
 
 use anyhow::{bail, Context, Result};
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use serde_json::value::RawValue;
 use std::collections::HashMap;
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,6 +22,9 @@ use crate::{
 };
 
 pub(crate) const HISTORY_MAX_RECORDS: usize = 512;
+const BASELINE_MAX_ENTRIES: usize = 16_384;
+const BASELINE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const HISTORY_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// One immediate child of a scanned directory, with its recursive size.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -302,9 +309,11 @@ pub(crate) fn scan_record_with_cancellation(
     let mut enumeration_errors = 0u32;
     let read =
         std::fs::read_dir(&canonical).with_context(|| format!("read {}", canonical.display()))?;
-    let mut read: Vec<_> = read.collect();
-    read.sort_by_key(|entry| entry.as_ref().ok().map(|e| e.file_name()));
-    for entry in read {
+    let Some(mut entries) = collect_baseline_entries(read, cancellation)? else {
+        return Ok(None);
+    };
+    entries.sort_by_key(|entry| entry.as_ref().ok().map(|e| e.file_name()));
+    for entry in entries {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
@@ -362,6 +371,23 @@ pub(crate) fn scan_record_with_cancellation(
     }))
 }
 
+fn collect_baseline_entries(
+    read: impl Iterator<Item = io::Result<std::fs::DirEntry>>,
+    cancellation: &bulkstat::ScanCancellation,
+) -> Result<Option<Vec<io::Result<std::fs::DirEntry>>>> {
+    let mut entries = Vec::new();
+    for entry in read {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if entries.len() == BASELINE_MAX_ENTRIES {
+            bail!("baseline exceeds the {BASELINE_MAX_ENTRIES} immediate-entry limit; scan a narrower directory");
+        }
+        entries.push(entry);
+    }
+    Ok(Some(entries))
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -373,31 +399,60 @@ fn history_file() -> PathBuf {
     state::state_dir().join("history.json")
 }
 
-fn load_history_from_path(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(serde_json::Map::new()),
-        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
-    };
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parse {} (delete it to reset history)", path.display()))?;
-    match value {
-        serde_json::Value::Object(mut map) => {
-            if let Some(version) = map.remove("version") {
-                if version.as_u64() != Some(1) {
-                    bail!("unsupported history schema version");
+#[derive(Deserialize)]
+struct HistoryEnvelope<'a> {
+    #[serde(default, deserialize_with = "history_version")]
+    version: Option<u64>,
+    #[serde(borrow)]
+    records: Option<&'a RawValue>,
+}
+
+fn history_version<'de, D: Deserializer<'de>>(de: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(de).map(Some)
+}
+
+struct HistoryRecords;
+
+impl<'de> Visitor<'de> for HistoryRecords {
+    type Value = (HashMap<PathBuf, ScanRecord>, usize);
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a map of saved baselines")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut records = HashMap::new();
+        let mut rejected = 0;
+        while let Some((key, raw)) = map.next_entry::<String, &'de RawValue>()? {
+            let record = (|| -> Result<ScanRecord> {
+                if raw.get().len() > BASELINE_MAX_BYTES {
+                    bail!("saved baseline exceeds 4 MiB");
                 }
-                return map
-                    .remove("records")
-                    .and_then(|v| v.as_object().cloned())
-                    .context("history schema missing records");
+                let path = state::decode_path(&key).context("invalid baseline path encoding")?;
+                if !path.is_absolute() {
+                    bail!("baseline path is not absolute");
+                }
+                let value: serde_json::Value = serde_json::from_str(raw.get())?;
+                if value["children"]
+                    .as_array()
+                    .is_some_and(|c| c.len() > BASELINE_MAX_ENTRIES)
+                {
+                    bail!("saved baseline exceeds the child limit");
+                }
+                record_from_json(&path, &value)
+            })();
+            match record {
+                Ok(record) => {
+                    records.insert(record.path.clone(), record);
+                    if records.len() >= HISTORY_MAX_RECORDS * 2 {
+                        prune_records(&mut records);
+                    }
+                }
+                Err(_) => rejected += 1,
             }
-            Ok(map)
         }
-        _ => bail!(
-            "unexpected history format in {} (delete it to reset history)",
-            path.display()
-        ),
+        prune_records(&mut records);
+        Ok((records, rejected))
     }
 }
 
@@ -410,7 +465,7 @@ pub fn load_records() -> Result<HashMap<PathBuf, ScanRecord>> {
 /// silently presenting "no baselines", mirroring how the size cache surfaces
 /// its own load errors.
 pub fn load_records_with_warning() -> (HashMap<PathBuf, ScanRecord>, Option<String>) {
-    match load_records_report(&history_file()) {
+    match load_records_recovering(&history_file()) {
         Ok((records, rejected)) => (
             records,
             (rejected > 0).then(|| {
@@ -424,33 +479,79 @@ pub fn load_records_with_warning() -> (HashMap<PathBuf, ScanRecord>, Option<Stri
 }
 
 fn load_records_from_path(path: &Path) -> Result<HashMap<PathBuf, ScanRecord>> {
-    Ok(load_records_report(path)?.0)
+    Ok(load_records_recovering(path)?.0)
+}
+
+fn load_records_recovering(path: &Path) -> Result<(HashMap<PathBuf, ScanRecord>, usize)> {
+    let oversized = |err: &anyhow::Error| {
+        err.downcast_ref::<io::Error>()
+            .is_some_and(|err| err.kind() == io::ErrorKind::FileTooLarge)
+    };
+    match load_records_report(path) {
+        Err(err) if oversized(&err) => state::with_exclusive_lock(path, || {
+            // Another writer may already have replaced the file.
+            match load_records_report(path) {
+                Err(err) if oversized(&err) => {
+                    let backup = history_backup_path(path);
+                    crate::fs_ops::rename_without_replacement(path, &backup)?;
+                    bail!(
+                        "oversized history moved to {}; history reset",
+                        backup.display()
+                    );
+                }
+                result => result,
+            }
+        }),
+        result => result,
+    }
+}
+
+fn history_backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(format!(".corrupt-{}", state::next_epoch()));
+    backup.into()
 }
 
 fn load_records_report(path: &Path) -> Result<(HashMap<PathBuf, ScanRecord>, usize)> {
-    let history = load_history_from_path(path)?;
-    let mut records = HashMap::new();
-    let mut rejected = 0;
-    for (path, value) in history {
-        let parsed = (|| -> Result<(PathBuf, ScanRecord)> {
-            let path = state::decode_path(&path).context("invalid baseline path encoding")?;
-            if !path.is_absolute() {
-                bail!("baseline path is not absolute");
-            }
-            let record = record_from_json(&path, &value)?;
-            Ok((path, record))
-        })();
-        match parsed {
-            Ok((path, record)) => {
-                records.insert(path, record);
-            }
-            Err(_) => {
-                rejected += 1;
-            }
-        }
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((HashMap::new(), 0)),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "history must be a regular file",
+        )
+        .into());
     }
-    prune_records(&mut records);
-    Ok((records, rejected))
+    if metadata.len() > HISTORY_MAX_BYTES as u64 {
+        return Err(io::Error::from(io::ErrorKind::FileTooLarge).into());
+    }
+    let mut bytes = Vec::new();
+    file.take(HISTORY_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > HISTORY_MAX_BYTES {
+        return Err(io::Error::from(io::ErrorKind::FileTooLarge).into());
+    }
+    let envelope: HistoryEnvelope<'_> =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    let body = match envelope.version {
+        Some(1) => envelope
+            .records
+            .context("history schema missing records")?
+            .get()
+            .as_bytes(),
+        Some(_) => bail!("unsupported history schema version"),
+        None => &bytes,
+    };
+    Ok(serde_json::Deserializer::from_slice(body).deserialize_map(HistoryRecords)?)
 }
 
 /// Load the saved baseline for a path if one exists.
@@ -497,16 +598,19 @@ fn store_record_guarded(
         if cancellation.is_cancelled() {
             return Ok(false);
         }
-        let mut records = match load_records_report(path) {
-            Ok((records, 0)) => records,
-            Ok((records, _)) => {
-                state::backup_corrupt_state(path)?;
-                records
+        if record.children.len() > BASELINE_MAX_ENTRIES {
+            bail!("baseline exceeds the {BASELINE_MAX_ENTRIES} immediate-entry limit");
+        }
+        let (mut records, needs_backup) = match load_records_report(path) {
+            Ok((records, rejected)) => (records, rejected > 0),
+            Err(err)
+                if err
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|io| io.kind() != io::ErrorKind::FileTooLarge) =>
+            {
+                return Err(err)
             }
-            Err(_) => {
-                state::backup_corrupt_state(path)?;
-                HashMap::new()
-            }
+            Err(_) => (HashMap::new(), true),
         };
         if records.get(&record.path).is_some_and(|old| {
             (old.timestamp, old.generation) > (record.timestamp, record.generation)
@@ -515,7 +619,14 @@ fn store_record_guarded(
         }
         records.insert(record.path.clone(), record.clone());
         prune_records(&mut records);
-        store_records_to_path(path, &records)?;
+        let text = encode_history(&records)?;
+        if needs_backup {
+            // The atomic write replaces the inode, so a hard link preserves the
+            // original (even an oversized file) without reading or copying it.
+            std::fs::hard_link(path, history_backup_path(path))
+                .context("back up invalid history")?;
+        }
+        state::atomic_write(path, &text)?;
         Ok(true)
     })
 }
@@ -535,20 +646,32 @@ pub(crate) fn prune_records(records: &mut HashMap<PathBuf, ScanRecord>) -> bool 
     true
 }
 
-fn store_records_to_path(path: &Path, records: &HashMap<PathBuf, ScanRecord>) -> Result<()> {
+fn encode_history(records: &HashMap<PathBuf, ScanRecord>) -> Result<String> {
     let mut ordered: Vec<_> = records.iter().collect();
     ordered.sort_by(|(path_a, a), (path_b, b)| {
         b.timestamp
             .cmp(&a.timestamp)
             .then_with(|| path_a.cmp(path_b))
     });
-    let mut history = serde_json::Map::with_capacity(ordered.len());
-    for (path, record) in ordered {
-        history.insert(state::encode_path(path), record_to_json(record));
+    let mut text = String::from(r#"{"version":1,"records":{"#);
+    for (index, (key, record)) in ordered.into_iter().enumerate() {
+        let entry = serde_json::to_string(&record_to_json(record))?;
+        if entry.len() > BASELINE_MAX_BYTES {
+            bail!("baseline exceeds the 4 MiB limit; scan a narrower directory");
+        }
+        let key = serde_json::to_string(&state::encode_path(key))?;
+        if text.len() + key.len() + entry.len() + usize::from(index > 0) + 3 > HISTORY_MAX_BYTES {
+            bail!("saved history would exceed 16 MiB; archive history.json before saving more baselines");
+        }
+        if index > 0 {
+            text.push(',');
+        }
+        text.push_str(&key);
+        text.push(':');
+        text.push_str(&entry);
     }
-    let text =
-        serde_json::to_string_pretty(&serde_json::json!({"version": 1, "records": history}))?;
-    state::atomic_write(path, &text)
+    text.push_str("}}");
+    Ok(text)
 }
 
 fn record_to_json(record: &ScanRecord) -> serde_json::Value {
@@ -583,7 +706,8 @@ fn record_from_json(path: &Path, value: &serde_json::Value) -> Result<ScanRecord
     let children = value
         .get("children")
         .and_then(|v| v.as_array())
-        .context("baseline missing children")?
+        .context("baseline missing children")?;
+    let children = children
         .iter()
         .map(|item| -> Result<ChildSize> {
             let name = item
@@ -888,6 +1012,11 @@ pub fn save_named_baseline(name: &str, record: &ScanRecord) -> Result<()> {
 
 fn save_named_baseline_to(path: &Path, name: &str, record: &ScanRecord) -> Result<()> {
     validate_library_name(name)?;
+    if record.children.len() > BASELINE_MAX_ENTRIES
+        || serde_json::to_vec(&record_to_json(record))?.len() > BASELINE_MAX_BYTES
+    {
+        bail!("named baseline too large; scan a narrower directory");
+    }
     update_library(path, |library| {
         if library.baselines.contains_key(name) {
             bail!("baseline name already exists; choose a new name");
@@ -1396,6 +1525,61 @@ mod tests {
             original
         );
         assert_eq!(load_records_report(&path).unwrap().1, 0);
+    }
+
+    #[test]
+    fn oversized_history_is_quarantined_and_future_saves_work() {
+        let path = history_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let size = HISTORY_MAX_BYTES as u64 + 1;
+        std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+        let (records, warning) = load_records_with_warning();
+        assert!(records.is_empty());
+        assert!(warning.unwrap().contains("oversized history moved"));
+        assert!(!path.exists());
+        let backup = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|ent| ent.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".corrupt-")
+            })
+            .unwrap();
+        assert_eq!(backup.metadata().unwrap().len(), size);
+        assert!(store_record(&record(vec![])).unwrap());
+        assert_eq!(load_records().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn wide_directory_enumeration_stops_before_collecting_the_entire_listing() {
+        let mut consumed = 0;
+        let entries = std::iter::from_fn(|| {
+            consumed += 1;
+            assert!(consumed <= BASELINE_MAX_ENTRIES + 1);
+            Some(Err(io::Error::from(io::ErrorKind::NotFound)))
+        });
+        assert!(collect_baseline_entries(entries, &bulkstat::ScanCancellation::never()).is_err());
+        assert_eq!(consumed, BASELINE_MAX_ENTRIES + 1);
+    }
+
+    #[test]
+    fn oversized_capture_does_not_replace_a_valid_baseline() {
+        let path = history_file();
+        let original = record(vec![child("small", 1)]);
+        assert!(store_record_to_path(&path, &original).unwrap());
+        let too_many = record(vec![child("entry", 1); BASELINE_MAX_ENTRIES + 1]);
+        assert!(store_record_to_path(&path, &too_many)
+            .unwrap_err()
+            .to_string()
+            .contains("immediate-entry limit"));
+        let too_big = record(vec![child(&"a".repeat(BASELINE_MAX_BYTES), 1)]);
+        assert!(store_record_to_path(&path, &too_big)
+            .unwrap_err()
+            .to_string()
+            .contains("4 MiB"));
+        assert_eq!(load_records().unwrap().get(&original.path), Some(&original));
     }
 
     #[test]
