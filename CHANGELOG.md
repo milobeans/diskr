@@ -6,6 +6,8 @@ All notable changes to diskr are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.84] - 2026-11-21
+
 ### Added
 
 - `g` opens an asynchronous folder and saved-profile chooser. Common locations,
